@@ -60,7 +60,7 @@ The heredoc delimiter is quoted (`<<'CMO_TASK_EOF'`) on purpose: unquoted, the
 shell expands `$VAR` and backticks inside the task and silently corrupts it.
 
 If `cmo` is not on your PATH, say so and stop — do not fall back to doing the
-work yourself. The fix is `npm install -g github:matthew-locastro/cross-model-orchestrate`.
+work yourself. The fix is `npm install -g cross-model-orchestrate`.
 
 ## What to return
 
