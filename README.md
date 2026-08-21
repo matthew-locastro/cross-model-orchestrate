@@ -10,10 +10,14 @@ session keeps its own headroom, and — the part that changes output quality —
 **always grades work on the vendor that didn't produce it.**
 
 ```bash
-npm install -g cross-model-orchestrate
+npm install -g github:matthew-locastro/cross-model-orchestrate
 cmo install     # wires the skill into Claude Code, Codex, Kilo, OpenCode
 cmo doctor      # checks both CLIs, auth, model IDs, headroom
 ```
+
+Not on the npm registry yet, so install from GitHub. Global, not `npx`: the
+`codex-runner` shim needs `cmo` on `PATH`, and paying npx's unpack cost once per
+subagent across a 250-agent fan-out is not free.
 
 Then, in Claude Code:
 
