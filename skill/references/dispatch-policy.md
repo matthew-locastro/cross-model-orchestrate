@@ -49,10 +49,15 @@ via `--pin claude --model fable`, and only when you can say why.
 Strict precedence:
 
 1. **`--pin`** — you forced it.
-2. **`--independent-of <vendor>`** — cross-model review. The other vendor is the
-   only candidate, and there is no fallback: if that side is out of headroom the
-   call **defers**. A review that quietly self-judges is worse than a review
-   that did not happen.
+2. **`--independent-of <vendor>`** — cross-model review. The other vendor is
+   preferred. If it is out of headroom the call **degrades** to a fresh agent on
+   the producer's vendor, marks the result `independence: same-vendor`, raises a
+   tier, and warns the agent that it shares the producer's priors. That is
+   strictly better than no review — a same-vendor independent grader rejected 38
+   of 57 candidates on the run this tool came from. The hazard was never that a
+   same-vendor verdict is weak; it is that an *unlabelled* one is
+   indistinguishable from a real cross-vendor verdict. `--strict-independence`
+   restores the refuse-instead behaviour.
 3. **Headroom** — a provider at ≥95% used, or flagged `rate_limit_reached`, is
    not a candidate.
 4. **Preferred vendor first** — Codex by default. Deliberate load-balancing: the

@@ -145,9 +145,23 @@ with the producer shares its blind spots: it has already decided that the thing
 in front of it is correct. This is the single largest quality lever in the
 pattern, and it is why the dispatcher exists rather than a hardcoded model name.
 
-If the required side is out of headroom, the dispatcher **defers** rather than
-falling back to the producer's vendor. Honour that: report the deferral, do not
-route the review back to the producer.
+If the required side is out of headroom, the dispatcher **degrades rather than
+refuses**: a fresh agent on the producer's own vendor still did not make the
+thing, which is the larger half of independence, and a good review beats no
+review. It is labelled `independence: same-vendor`, raised a tier (a grader
+sharing the producer's priors needs the headroom), and told about its own
+handicap in the prompt.
+
+Two obligations follow, and they are the whole reason degrading is safe:
+
+- **Report it.** Say how many verdicts were cross-vendor and how many were
+  same-vendor. An unlabelled fallback is the actual hazard — it looks exactly
+  like a real cross-vendor verdict.
+- **Consider re-running them.** A same-vendor verdict is provisional. When the
+  other vendor's window reopens, re-grading the degraded ones is cheap.
+
+Pass `--strict-independence` when a verdict must be cross-vendor or absent —
+then it defers as before.
 
 ## 3 — Run
 

@@ -453,6 +453,13 @@ export async function runAgent(decision, prompt, opts = {}) {
             provider: target.provider,
             model: target.model,
             tier: target.tier,
+            // How independent this verdict actually is. A caller that branches
+            // on a review must be able to tell a cross-vendor one from a
+            // same-vendor fallback.
+            ...(decision.independence ? {
+              independence: decision.independence,
+              degradedReview: Boolean(decision.degradedReview),
+            } : {}),
             ...(target.effort ? { effort: target.effort } : {}),
             ...(target.reasoning ? { reasoning: target.reasoning } : {}),
             failedOver: rung > 0,

@@ -111,10 +111,13 @@ weight < 0.30 → fast       weight < 0.62 → balanced       else → frontier
 Vendor, in strict precedence:
 
 1. `--pin` — you forced it.
-2. `--independent-of <vendor>` — cross-model review. The *other* vendor is the
-   only candidate, and there is **no fallback**: if that side is out of headroom
-   the call defers, because a review that quietly self-judges is worse than a
-   review that didn't happen.
+2. `--independent-of <vendor>` — cross-model review. The *other* vendor is
+   preferred; if it's out of headroom the call **degrades** to a fresh agent on
+   the producer's vendor, labels the verdict `same-vendor`, raises a tier, and
+   tells the agent it shares the producer's blind spots. A same-vendor
+   independent grader is still worth having — one rejected 38 of 57 candidates
+   on the run this came from. What's dangerous is an *unlabelled* fallback, so
+   it's always labelled. `--strict-independence` refuses instead.
 3. Headroom — a provider ≥95% used, or flagged `rate_limit_reached`, isn't a
    candidate.
 4. Preferred vendor (Codex by default), then whichever is genuinely emptier.

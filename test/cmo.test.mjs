@@ -190,13 +190,64 @@ test('adversarial review is forced onto the other vendor', () => {
   assert.equal(reviewClaude.fallback, null, 'a cross-model review must not fail over to the producer');
 });
 
-test('a cross-model review whose only allowed vendor is spent defers, it does not silently self-judge', () => {
+test('a cross-model review degrades to the producer\'s vendor rather than not happening', () => {
+  // A fresh same-vendor agent still did not make the thing, which is the larger
+  // half of independence. Refusing outright trades a good review for none.
   const d = decide(
     { role: 'review', complexity: 3, length: 's', independentOf: 'codex' },
     { codex: healthy(), claude: spent() },
   );
+  assert.equal(d.ok, true);
+  assert.equal(d.provider, 'codex', 'falls back to the vendor that produced it');
+  assert.equal(d.independence, 'same-vendor');
+  assert.equal(d.degradedReview, true, 'and says so, because the hazard is an unlabelled verdict');
+  assert.ok(d.notes.some((n) => /DEGRADED REVIEW/.test(n)));
+});
+
+test('a healthy cross-model review is labelled cross-vendor', () => {
+  const d = decide(
+    { role: 'review', complexity: 3, length: 's', independentOf: 'codex' },
+    { codex: healthy(), claude: healthy() },
+  );
+  assert.equal(d.provider, 'claude');
+  assert.equal(d.independence, 'cross-vendor');
+  assert.equal(d.degradedReview, false);
+});
+
+test('a degraded grader is given MORE model, not less', () => {
+  // It has to catch what it is predisposed to miss, so this is the one place
+  // a constrained provider gets spent up rather than down.
+  const strong = decide(
+    { role: 'review', complexity: 3, length: 's', independentOf: 'codex' },
+    { codex: healthy(), claude: healthy() },
+  );
+  const weak = decide(
+    { role: 'review', complexity: 3, length: 's', independentOf: 'codex' },
+    { codex: healthy(), claude: spent() },
+  );
+  const rank = (t) => ['fast', 'balanced', 'frontier'].indexOf(t);
+  assert.ok(rank(weak.tier) > rank(strong.tier), `${weak.tier} should outrank ${strong.tier}`);
+});
+
+test('--strict-independence still refuses rather than degrading', () => {
+  // For verdicts that must be cross-vendor or absent.
+  const d = decide(
+    { role: 'review', complexity: 3, length: 's', independentOf: 'codex', strictIndependence: true },
+    { codex: healthy(), claude: spent() },
+  );
   assert.equal(d.ok, false);
   assert.equal(d.defer, true);
+  assert.equal(d.independence, 'none');
+  assert.match(d.reason, /strict-independence/);
+});
+
+test('with both vendors spent even a degraded review cannot run', () => {
+  const d = decide(
+    { role: 'review', complexity: 3, length: 's', independentOf: 'codex' },
+    { codex: spent(), claude: spent() },
+  );
+  assert.equal(d.ok, false);
+  assert.equal(d.independence, 'none');
   assert.equal(d.resumeAfter, '2026-08-22T00:00:00.000Z');
 });
 

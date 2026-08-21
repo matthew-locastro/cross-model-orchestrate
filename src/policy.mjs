@@ -209,6 +209,8 @@ export function decide(task = {}, limits = {}) {
     independentOf: task.independentOf === 'codex' || task.independentOf === 'claude'
       ? task.independentOf
       : null,
+    // Opt out of degrading: refuse rather than review on the producer's vendor.
+    strictIndependence: Boolean(task.strictIndependence),
     pin: task.pin === 'codex' || task.pin === 'claude' ? task.pin : null,
     pinModel: typeof task.pinModel === 'string' && task.pinModel ? task.pinModel : null,
   };
@@ -235,12 +237,36 @@ export function decide(task = {}, limits = {}) {
   let ranked = rankProviders(normalized, states);
 
   // Adversarial independence outranks everything except an explicit pin: a
-  // review of codex's work must be judged by claude and vice versa, so the
+  // review of codex's work should be judged by claude and vice versa, so the
   // failure modes of one vendor are not also the failure modes of its grader.
+  //
+  // When the required vendor has no headroom we DEGRADE rather than refuse.
+  // A fresh same-vendor agent still did not make the thing, and that is the
+  // larger half of independence — it is what rejected 38 of 57 candidates on
+  // the run this tool came from. Refusing outright trades a good review for no
+  // review, which is worse.
+  //
+  // The real hazard was never that a same-vendor verdict is weak. It is that it
+  // is INDISTINGUISHABLE from a cross-vendor one. So it is labelled, the caller
+  // can branch on it, and the agent is told about its own handicap.
+  let independence = normalized.independentOf ? 'cross-vendor' : null;
+  let degraded = false;
+
   if (normalized.independentOf && !normalized.pin) {
     const required = otherProvider(normalized.independentOf);
-    ranked = ranked.filter((c) => c.provider === required);
-    notes.push(`cross-model review: forced onto ${required} because the artifact came from ${normalized.independentOf}`);
+    const requiredState = states[required].state;
+    if (requiredState === 'exhausted' && !normalized.strictIndependence) {
+      independence = 'same-vendor';
+      degraded = true;
+      ranked = ranked.filter((c) => c.provider === normalized.independentOf);
+      notes.push(
+        `DEGRADED REVIEW: ${required} is exhausted, so this runs on ${normalized.independentOf} —`
+        + ' the same vendor that produced the artifact. Fresh context, shared blind spots.',
+      );
+    } else {
+      ranked = ranked.filter((c) => c.provider === required);
+      notes.push(`cross-model review: forced onto ${required} because the artifact came from ${normalized.independentOf}`);
+    }
   }
 
   if (normalized.pin) {
@@ -259,8 +285,11 @@ export function decide(task = {}, limits = {}) {
       ok: false,
       defer: true,
       reason: normalized.independentOf
-        ? `the only provider allowed for this cross-model review is exhausted`
+        ? (normalized.strictIndependence
+          ? 'the only provider allowed for this cross-model review is exhausted, and --strict-independence forbids degrading to the producer\'s vendor'
+          : 'both providers are out of headroom, so not even a degraded review can run')
         : 'both providers are out of headroom',
+      ...(normalized.independentOf ? { independence: 'none' } : {}),
       resumeAfter: soonest,
       weight,
       tier,
@@ -272,6 +301,14 @@ export function decide(task = {}, limits = {}) {
   }
 
   const chosen = usable[0];
+
+  // A same-vendor grader is handicapped by construction, so give it more
+  // capability rather than less — it has to catch what it is predisposed to
+  // miss. This is the one place we spend UP on a constrained provider.
+  if (degraded && tier !== 'frontier') {
+    tier = shiftTier(tier, 1);
+    notes.push('degraded review raised a tier — a grader sharing the producer\'s priors needs the headroom');
+  }
 
   // A provider we are only using because it is all that is left gets a cheaper
   // model, so the last of the quota goes further.
@@ -295,6 +332,7 @@ export function decide(task = {}, limits = {}) {
     ok: true,
     defer: false,
     ...primary,
+    ...(independence ? { independence, degradedReview: degraded } : {}),
     weight,
     reason: [
       `${normalized.role} · complexity ${normalized.complexity}/5 · length ${normalized.length} → ${tier}`,

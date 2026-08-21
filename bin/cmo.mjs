@@ -51,6 +51,7 @@ function taskFromArgs(args) {
     needsSchema: Boolean(args.schema),
     needsRepoWrite: Boolean(args.write),
     independentOf: args['independent-of'] || null,
+    strictIndependence: Boolean(args['strict-independence']),
     pin: args.pin || null,
     pinModel: args.model || null,
   };
@@ -150,7 +151,13 @@ task options (plan, run)
   --length          xs|s|m|l|xl                (default m)
   --context-tokens  rough input size the agent must read
   --write           the agent edits files in the working tree
-  --independent-of  codex|claude — force the OTHER vendor (adversarial review)
+  --independent-of  codex|claude — prefer the OTHER vendor (adversarial review).
+                    If that vendor is spent it degrades to a fresh agent on the
+                    producer's own vendor and LABELS the verdict same-vendor,
+                    because a flagged review beats no review.
+  --strict-independence
+                    never degrade: defer instead of reviewing on the producer's
+                    vendor. For verdicts that must be cross-vendor or absent.
   --pin             codex|claude — override provider selection
   --model           exact model id, bypassing the tier map
 
@@ -248,8 +255,12 @@ async function main() {
       }
       const eff = decision.effort ? ` effort=${decision.effort}` : '';
       const reasoning = decision.reasoning ? ` reasoning=${decision.reasoning}` : '';
+      const indep = decision.independence
+        ? `independence: ${decision.independence}${decision.degradedReview ? '  ← DEGRADED, verdict is not cross-vendor' : ''}\n`
+        : '';
       process.stdout.write(
         `${decision.provider} ${decision.model}${eff}${reasoning} (tier ${decision.tier}, weight ${decision.weight})\n`
+        + indep
         + `why: ${decision.reason}\n`
         + (decision.notes.length ? `notes:\n${decision.notes.map((n) => `  - ${n}`).join('\n')}\n` : '')
         + (decision.fallback ? `fallback: ${decision.fallback.provider} ${decision.fallback.model}\n` : ''),
