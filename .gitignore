@@ -1,3 +1,6 @@
 node_modules/
 *.log
 .DS_Store
+
+# Workflow commands for other repos leak in via tooling; this repo has none.
+.claude/

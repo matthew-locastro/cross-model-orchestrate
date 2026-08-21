@@ -118,14 +118,14 @@ test('a box that dies mid-run releases its headroom on the lease', () => {
 test('the fleet view says where the work is, not just how much', () => {
   const s = summary({
     reservations: [
-      { provider: 'codex', cost: 1, node: 'vps-a', project: 'hell-water' },
-      { provider: 'codex', cost: 1, node: 'vps-a', project: 'hell-water' },
+      { provider: 'codex', cost: 1, node: 'vps-a', project: 'checkout-flow' },
+      { provider: 'codex', cost: 1, node: 'vps-a', project: 'checkout-flow' },
       { provider: 'codex', cost: 1, node: 'vps-b', project: 'termroam' },
       { provider: 'claude', cost: 1, node: 'vps-b', project: 'termroam' },
     ],
   });
   assert.equal(s.codex.agents, 3);
-  assert.equal(s.codex.nodes['vps-a:hell-water'], 2);
+  assert.equal(s.codex.nodes['vps-a:checkout-flow'], 2);
   assert.equal(s.codex.nodes['vps-b:termroam'], 1);
   assert.equal(s.claude.agents, 1);
 });

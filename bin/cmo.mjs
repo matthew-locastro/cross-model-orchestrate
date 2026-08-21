@@ -90,7 +90,7 @@ function renderLimits(limits) {
     : `${flight} dispatch(es) in flight across ${scope} — effective figures include them`);
   if (limits.fleet && limits.summary) {
     // Where the work actually is. "37 in flight" is not actionable;
-    // "22 on vps-2, project hell-water" is.
+    // "22 on vps-2, project checkout-flow" is.
     for (const [provider, info] of Object.entries(limits.summary)) {
       const where = Object.entries(info.nodes ?? {})
         .sort((a, b) => b[1] - a[1])

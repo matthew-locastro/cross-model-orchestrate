@@ -18,7 +18,7 @@
 //
 //   identity Entries record which node and which project made them, because
 //            "37 agents in flight" is not actionable and "22 on vps-2, project
-//            hell-water" is.
+//            checkout-flow" is.
 //
 // Auth is a bearer token and is NOT optional. An open endpoint here lets anyone
 // on the network stall every orchestrator you own by reserving 100% headroom.

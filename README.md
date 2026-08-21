@@ -18,9 +18,17 @@ cmo doctor      # checks both CLIs, auth, model IDs, headroom
 Global, not `npx`: the `codex-runner` shim needs `cmo` on `PATH`, and paying
 npx's unpack cost once per subagent across a 250-agent fan-out is not free.
 
-Then, in Claude Code:
+Two steps, both needed. The npm install puts `cmo` on your path and nothing
+else; `cmo install` is what wires the skill and the `codex-runner` subagent into
+your agent tools, which is what makes the command below exist.
+
+**The orchestration runs from Claude Code, and only from Claude Code.** Codex is
+a worker here, not a driver — it executes subagents, it does not run the
+workflow. (The `cmo` CLI itself works anywhere with a shell; see
+[what's portable](#whats-portable-and-what-isnt).)
 
 ```
+claude --model opus --effort high
 /cross-model-orchestrate build me X, fan it out
 ```
 
@@ -239,7 +247,7 @@ codex   ok        plan=pro
         in-flight 2 agent(s) across the fleet · reported 6% → effective 8%
 
 2 dispatch(es) in flight across the fleet — effective figures include them
-  codex: vps-alpha:hell-water×1  vps-beta:termroam×1
+  codex: vps-alpha:checkout-flow×1  vps-beta:termroam×1
 ```
 
 - **A box is a machine.** `hostname()` by default, override with `CMO_NODE_ID`.
