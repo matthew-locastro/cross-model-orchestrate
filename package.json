@@ -1,0 +1,47 @@
+{
+  "name": "cross-model-orchestrate",
+  "version": "0.1.0",
+  "description": "Run agent fan-outs across two AI subscriptions at once: pick each subagent's model by complexity, length and token efficiency against live usage limits, spend Codex before Claude, and always grade work on the vendor that did not produce it.",
+  "type": "module",
+  "bin": {
+    "cmo": "bin/cmo.mjs",
+    "cross-model-orchestrate": "bin/cmo.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "skill",
+    "agents",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "selftest": "node bin/cmo.mjs selftest",
+    "doctor": "node bin/cmo.mjs doctor"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "orchestration",
+    "claude",
+    "claude-code",
+    "codex",
+    "subagents",
+    "multi-agent",
+    "rate-limits",
+    "llm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matthew-locastro/cross-model-orchestrate.git"
+  },
+  "homepage": "https://github.com/matthew-locastro/cross-model-orchestrate#readme",
+  "bugs": {
+    "url": "https://github.com/matthew-locastro/cross-model-orchestrate/issues"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}
