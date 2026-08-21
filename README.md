@@ -363,6 +363,21 @@ an injectable spawn, so the policy is fully testable without spending anything.
 
 ---
 
+## Releasing
+
+Published via npm [Trusted Publishing](https://docs.npmjs.com/trusted-publishers)
+from `.github/workflows/release.yml` — GitHub mints a short-lived OIDC token at
+run time, so no npm credential exists in this repo, in Actions secrets, or on
+any machine.
+
+```bash
+npm version patch
+git push --follow-tags origin main
+```
+
+The tag push runs the tests and publishes. The workflow refuses to publish if
+the tag and `package.json` disagree.
+
 ## License
 
 MIT.

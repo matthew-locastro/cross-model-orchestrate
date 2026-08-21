@@ -1,0 +1,66 @@
+name: release
+
+# Publishing to npm from a laptop or a VPS is no longer practical for this
+# account: npm enforces 2FA on publish, the only enrollable factor is a
+# security key, and `npm publish` accepts a TOTP code and nothing else. There
+# is no code a passkey can produce.
+#
+# Trusted Publishing solves it properly. npmjs.com is told to trust THIS
+# workflow in THIS repository; GitHub mints a short-lived OIDC token at run
+# time and npm accepts it. No credential is stored anywhere — not in the repo,
+# not in Actions secrets, not on any machine — so there is nothing to leak,
+# rotate, or lose.
+#
+# Release flow:
+#   npm version patch    (bumps package.json, commits, tags)
+#   git push --follow-tags origin main
+# The tag push triggers this, tests run, and it publishes.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # required: this is what mints the OIDC token
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing needs a recent npm; the one bundled with Node is
+      # usually older than the OIDC support.
+      - name: Use an npm new enough for trusted publishing
+        run: npm install -g npm@latest
+
+      # No dependencies to install — that is the point.
+      - name: Test
+        run: npm test
+
+      - name: Decision table
+        run: node bin/cmo.mjs selftest
+
+      # Refuse to publish a tag that disagrees with package.json, which is the
+      # easiest way to ship the wrong version by accident.
+      - name: Tag must match package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p 'require("./package.json").version')"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "tag v$TAG does not match package.json $PKG" >&2
+            exit 1
+          fi
+          echo "publishing $PKG"
+
+      - name: Publish
+        run: npm publish --provenance
