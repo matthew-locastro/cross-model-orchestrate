@@ -70,10 +70,20 @@ function renderLimits(limits) {
       const reset = w.resetsAt ? ` resets ${w.resetsAt.replace('T', ' ').slice(0, 16)}Z` : '';
       lines.push(`        ${w.label.padEnd(6)} ${bar(w.percentUsed)}${reset}`);
     }
+    // What the vendor reported vs what this machine has already committed.
+    // Under several concurrent orchestrators the gap is the whole story.
+    if (p.committedPoints > 0) {
+      lines.push(`        ${'in-flight'.padEnd(6)} ${p.inFlightAgents} agent(s) on this machine`
+        + ` · reported ${p.reportedPercent}% → effective ${p.worstPercent}%`);
+    }
   }
   lines.push('');
   const bands = pressure();
   lines.push(`bands: tight ≥${bands.tight}%  critical ≥${bands.critical}%  exhausted ≥${bands.exhausted}%`);
+  const flight = (limits.inFlight?.codex ?? 0) + (limits.inFlight?.claude ?? 0);
+  lines.push(flight === 0
+    ? 'no dispatches in flight from this machine'
+    : `${flight} dispatch(es) in flight from this machine — effective figures include them`);
   return lines.join('\n');
 }
 

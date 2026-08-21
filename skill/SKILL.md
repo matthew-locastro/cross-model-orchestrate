@@ -65,6 +65,15 @@ This costs nothing: Codex is read from local session logs, Claude from an OAuth
 usage endpoint that runs no inference. Report both numbers to the user in your
 first message, because they decide how big a run you are allowed to plan.
 
+**Those numbers are contended, and they lag.** Other orchestrators on other
+projects are draining the same two windows right now, and the vendor's figure
+only reflects spend already billed — not the agents someone else launched thirty
+seconds ago. So treat step 0 as a snapshot for *sizing the plan*, never as a
+budget you own, and never cache it in your head: `cmo run` re-reads shared,
+machine-wide state at the moment of every dispatch, and that reading is the one
+that decides. When the effective figure sits well above the reported one, other
+runs are in flight — plan smaller and say so.
+
 - Either provider **exhausted** (≥95%) — plan the run for the other one alone
   and say so. Halve the fan-out width.
 - Both **tight** (≥65%) — propose the smaller version of the run and let the
@@ -191,7 +200,13 @@ Patterns and worked scripts: `references/workflow-patterns.md`.
 ### Keep watching the meter
 
 Re-run `cmo limits` between phases, and at least every ~25 agents in a long
-fan-out. Codex readings refresh themselves for free after every Codex subagent,
+fan-out. On a busy machine it reports two figures per provider: what the vendor
+said, and the effective figure once dispatches already committed by every
+orchestrator on this box are counted. Plan against the effective one — a run
+that looks affordable on the reported number and impossible on the effective one
+is competing with something else, so shrink it or wait.
+
+Codex readings refresh themselves for free after every Codex subagent,
 so this is nearly free.
 
 React to what you see:

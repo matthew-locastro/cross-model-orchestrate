@@ -29,17 +29,13 @@
 // Both are cached on disk with a TTL so hundreds of dispatch decisions share one
 // probe.
 
-import { readFile, readdir, writeFile, mkdir, stat } from 'node:fs/promises';
+import { readFile, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { CACHE_DIR, loadConfig } from './config.mjs';
+import { applyCommitted, freshProbe, inFlight, mutate, snapshot } from './ledger.mjs';
 
 export { CACHE_DIR };
-export const CACHE_FILE = join(CACHE_DIR, 'limits.json');
-
-/** Claude needs a network round trip, so cache it longer than the local read. */
-export const CLAUDE_TTL_MS = 5 * 60_000;
-export const CODEX_TTL_MS = 60_000;
 
 const OAUTH_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const FETCH_TIMEOUT_MS = 5_000;
@@ -341,58 +337,63 @@ export async function readClaudeLimits({ credentialsPath, fetchImpl } = {}) {
   }
 }
 
-// ── cache ─────────────────────────────────────────────────────────────────
-
-async function readCache() {
-  try {
-    return JSON.parse(await readFile(CACHE_FILE, 'utf8'));
-  } catch {
-    return {};
-  }
-}
-
-async function writeCache(cache) {
-  try {
-    await mkdir(CACHE_DIR, { recursive: true });
-    await writeFile(CACHE_FILE, `${JSON.stringify(cache, null, 2)}\n`, 'utf8');
-  } catch {
-    // A read-only or full disk must not fail a dispatch decision.
-  }
-}
-
-function fresh(entry, ttlMs, now) {
-  return entry && typeof entry.storedAt === 'number' && now - entry.storedAt < ttlMs;
-}
+// ── shared state ──────────────────────────────────────────────────────────
+//
+// The cache lives in ledger.mjs because it is not this process's cache — it is
+// the machine's. Several orchestrators read and write it, so it is locked,
+// written atomically, and single-flighted: a hundred concurrent dispatches
+// produce one probe, not a hundred.
 
 /**
- * Read both providers, honouring the on-disk cache.
- * `refresh: true` bypasses the cache (use on the orchestrator's periodic check).
+ * Read both providers, honouring a SHORT shared freshness window, and fold in
+ * headroom this machine has already committed but not yet been billed for.
+ *
+ * `refresh: true` forces a probe regardless of age.
+ *
+ * The committed-spend adjustment is the important part under concurrency: the
+ * vendor's number describes work that has already landed, and says nothing
+ * about the agents other orchestrators launched thirty seconds ago.
  */
-export async function readLimits({ refresh = false, now = Date.now(), readers } = {}) {
-  const cache = await readCache();
+export async function readLimits({ refresh = false, now = Date.now(), readers, includeCommitted = true } = {}) {
+  const cfg = loadConfig();
+  const nowFn = () => now;
   const readCodex = readers?.codex ?? readCodexLimits;
   const readClaude = readers?.claude ?? readClaudeLimits;
 
-  const useCodexCache = !refresh && fresh(cache.codex, CODEX_TTL_MS, now);
-  const useClaudeCache = !refresh && fresh(cache.claude, CLAUDE_TTL_MS, now);
-
-  const [codex, claude] = await Promise.all([
-    useCodexCache ? cache.codex.value : readCodex(),
-    useClaudeCache ? cache.claude.value : readClaude(),
+  const [codexProbe, claudeProbe] = await Promise.all([
+    freshProbe('codex', refresh ? -1 : cfg.freshness.codex, readCodex, { now: nowFn }),
+    freshProbe('claude', refresh ? -1 : cfg.freshness.claude, readClaude, { now: nowFn }),
   ]);
 
-  if (!useCodexCache || !useClaudeCache) {
-    await writeCache({
-      codex: useCodexCache ? cache.codex : { storedAt: now, value: codex },
-      claude: useClaudeCache ? cache.claude : { storedAt: now, value: claude },
-    });
-  }
+  const state = await snapshot({ now: nowFn });
+  const codex = includeCommitted ? applyCommitted(codexProbe.value, state, 'codex') : codexProbe.value;
+  const claude = includeCommitted ? applyCommitted(claudeProbe.value, state, 'claude') : claudeProbe.value;
 
   return {
     codex,
     claude,
-    cached: { codex: useCodexCache, claude: useClaudeCache },
+    cached: { codex: codexProbe.cached, claude: claudeProbe.cached },
+    inFlight: {
+      codex: inFlight(state, 'codex'),
+      claude: inFlight(state, 'claude'),
+    },
   };
+}
+
+/**
+ * Re-read Codex headroom from disk and store it, returning the value.
+ *
+ * `codex exec --json` does NOT carry rate limits in its event stream — that
+ * lives in the session rollout, which the run has just finished writing. So
+ * after a dispatch we read the rollout rather than the stream.
+ */
+export async function refreshCodexLimits({ now = Date.now() } = {}) {
+  const value = await readCodexLimits();
+  if (value.available !== true) return null;
+  await mutate((st) => {
+    st.probes.codex = { storedAt: now, value };
+  }, { now: () => now });
+  return value;
 }
 
 /**
@@ -409,19 +410,18 @@ export async function recordCodexRateLimits(rl, { now = Date.now() } = {}) {
     plan: parsed.plan,
     source: 'codex exec --json token_count',
   });
-  const cache = await readCache();
-  cache.codex = { storedAt: now, value };
-  await writeCache(cache);
+  await mutate((st) => {
+    st.probes.codex = { storedAt: now, value };
+  }, { now: () => now });
   return value;
 }
 
 /** Mark a provider spent after it returned an explicit rate-limit error. */
 export async function markExhausted(provider, { now = Date.now(), resetsAt = null } = {}) {
-  const cache = await readCache();
-  const previous = cache[provider]?.value ?? unavailable(provider, 'exhausted');
-  cache[provider] = {
-    storedAt: now,
-    value: {
+  let value = null;
+  await mutate((st) => {
+    const previous = st.probes[provider]?.value ?? unavailable(provider, 'exhausted');
+    value = {
       ...previous,
       available: true,
       hardBlocked: true,
@@ -429,8 +429,8 @@ export async function markExhausted(provider, { now = Date.now(), resetsAt = nul
       nextResetAt: resetsAt ?? previous.nextResetAt,
       source: 'provider rate-limit error',
       checkedAt: new Date(now).toISOString(),
-    },
-  };
-  await writeCache(cache);
-  return cache[provider].value;
+    };
+    st.probes[provider] = { storedAt: now, value };
+  }, { now: () => now });
+  return value;
 }

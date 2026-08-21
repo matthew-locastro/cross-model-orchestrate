@@ -4,6 +4,7 @@
 // resolution (their model IDs, their preferred vendor) and install (their
 // existing skill directories, which must never be clobbered).
 
+import './isolate.mjs'; // MUST be first — see the file
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';

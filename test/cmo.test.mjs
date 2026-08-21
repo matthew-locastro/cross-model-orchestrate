@@ -4,6 +4,7 @@
 // policy is a pure function and the runner takes an injectable spawn, so the
 // parts that decide where quota goes are testable without spending any.
 
+import './isolate.mjs'; // MUST be first — see the file
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';

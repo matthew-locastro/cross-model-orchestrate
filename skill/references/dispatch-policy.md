@@ -117,8 +117,31 @@ token from `~/.claude/.credentials.json`. No inference, so no token cost. Claude
 Code does not persist the rolling-window snapshot locally, so there is no
 offline alternative.
 
-Cached in `~/.cache/cross-model-orchestrate/limits.json` — 60s codex, 5 minutes
-claude — so a large fan-out shares one probe. `--refresh` bypasses it.
+### Contention
+
+Both readings live in one machine-wide file, `~/.cache/cross-model-orchestrate/state.json`,
+locked and written atomically so concurrent orchestrators cannot clobber each
+other. Freshness windows are deliberately short — 10s codex, 45s claude — and
+single-flighted: a hundred simultaneous dispatches produce one probe, not a
+hundred. `--refresh` forces one.
+
+Short freshness is still not enough on its own, because **the vendor's number is
+a lagging indicator**. It describes spend that has already been billed and says
+nothing about agents other orchestrators launched moments ago. Two runs both
+read 80%, both see room, and both sail through the limit.
+
+So every dispatch **reserves** against its provider for the duration of the call
+and releases afterwards. Effective headroom is what the vendor reported plus what
+this machine has committed but not yet been billed for, and that is the number
+`decide()` sees. Reservations carry a pid and a lease, so a crashed run cannot
+hold headroom hostage — entries are collected once the process is gone or the
+lease expires.
+
+The per-agent cost of a reservation starts at a deliberately conservative
+configured default (1.0 percentage point) and is replaced by a measured median
+once there is evidence: every Codex dispatch rewrites its session rollout, which
+gives a free before/after sample. Overestimating stops a run early with its work
+cached; underestimating gets it killed mid-flight. Prefer the former.
 
 ## Verifying the live path
 

@@ -24,13 +24,20 @@
 //                headroom off disk after every subagent — no extra probe, and
 //                a run burning quota fast is visible within one agent rather
 //                than one cache TTL.
+//   reserve      Subscriptions are contended. Before a dispatch runs it claims
+//                headroom in the machine-wide ledger and releases it after, so
+//                every OTHER orchestrator on the box can see spend that has
+//                been committed but not yet billed. Without it, two
+//                orchestrators both read 80%, both see room, and both sail
+//                straight through the limit.
 
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { markExhausted, recordCodexRateLimits } from './limits.mjs';
+import { markExhausted, recordCodexRateLimits, refreshCodexLimits } from './limits.mjs';
+import { recordSample, releaseReservation, reserve, snapshot } from './ledger.mjs';
 
 export const DEFAULT_TIMEOUT_MS = 20 * 60_000;
 const KILL_GRACE_MS = 5_000;
@@ -288,6 +295,17 @@ export function schemaContract(schema) {
   ].join('\n');
 }
 
+/** The provider's last reported percentage, ignoring committed reservations. */
+async function percentFor(provider) {
+  try {
+    const state = await snapshot();
+    const v = state.probes?.[provider]?.value;
+    return typeof v?.worstPercent === 'number' ? v.worstPercent : null;
+  } catch {
+    return null;
+  }
+}
+
 // ── the runner ────────────────────────────────────────────────────────────
 
 /**
@@ -349,14 +367,24 @@ export async function runAgent(decision, prompt, opts = {}) {
           allowedTools,
         });
 
-        const result = await spawnImpl({
-          binary,
-          args,
-          cwd,
-          prompt: fullPrompt,
-          timeoutMs,
-          env: childEnv(),
-        });
+        // Claim headroom for the duration of the call, so concurrent
+        // orchestrators can see this dispatch before it reaches the meter.
+        const before = await percentFor(target.provider);
+        const ticket = await reserve(target.provider, { label: target.model }).catch(() => null);
+
+        let result;
+        try {
+          result = await spawnImpl({
+            binary,
+            args,
+            cwd,
+            prompt: fullPrompt,
+            timeoutMs,
+            env: childEnv(),
+          });
+        } finally {
+          if (ticket) await releaseReservation(ticket).catch(() => {});
+        }
 
         let text = '';
         let usage = null;
@@ -364,9 +392,17 @@ export async function runAgent(decision, prompt, opts = {}) {
         if (target.provider === 'codex') {
           const stream = parseCodexStream(result.stdout);
           usage = stream.usage;
-          if (stream.rateLimits) {
-            // Free headroom refresh — every codex agent updates the cache.
-            await recordCodexRateLimits(stream.rateLimits).catch(() => {});
+          // Free headroom refresh. The exec stream does not carry rate limits
+          // (they live in the session rollout this run just wrote), so prefer
+          // the stream when a build does inline them and re-read the rollout
+          // otherwise. Getting this wrong is silent: the measurement below
+          // simply never happens and the conservative default stands forever.
+          const after = stream.rateLimits
+            ? await recordCodexRateLimits(stream.rateLimits).catch(() => null)
+            : await refreshCodexLimits().catch(() => null);
+          // A free measurement of what one agent actually costs.
+          if (after && typeof before === 'number' && typeof after.worstPercent === 'number') {
+            await recordSample('codex', after.worstPercent - before).catch(() => {});
           }
           try {
             text = (await readFile(lastMessageFile, 'utf8')).trim();

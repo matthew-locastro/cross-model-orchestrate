@@ -173,8 +173,48 @@ doesn't persist the rolling-window snapshot locally, so there's no offline
 alternative. If you're not comfortable with that call, `cmo` degrades gracefully:
 an unavailable probe reports `unknown` and is treated as usable.
 
-Cached in `~/.cache/cross-model-orchestrate/limits.json` (60s Codex, 5min Claude)
-so a 250-agent fan-out shares one probe.
+---
+
+## Many orchestrators, two subscriptions
+
+The case this is really built for: several orchestrators, on several projects,
+draining the same two windows at once, none of them aware of the others.
+
+Both readings live in one machine-wide file, locked and written atomically so
+concurrent processes cannot clobber each other. Freshness windows are short —
+10s Codex, 45s Claude — and single-flighted, so a hundred simultaneous
+dispatches produce one probe, not a hundred.
+
+Short freshness is still not enough, because **the vendor's number is a lagging
+indicator.** It describes spend already billed and says nothing about the forty
+agents another orchestrator launched thirty seconds ago. Two runs both read 80%,
+both see room, both sail through the limit.
+
+So every dispatch **reserves** against its provider for the duration of the call
+and releases afterwards. Effective headroom is what the vendor reported plus what
+this machine has committed but not yet been billed for — and that is the number
+the decision sees:
+
+```
+codex   ok        plan=pro
+        Wkly   █·········   5% resets 2026-08-28 07:35Z
+        in-flight 3 agent(s) on this machine · reported 5% → effective 8%
+
+3 dispatch(es) in flight from this machine — effective figures include them
+```
+
+Reservations carry a pid and a lease, so a crashed run cannot hold headroom
+hostage. The per-agent cost starts at a conservative 1.0 percentage point and is
+replaced by a measured average once there is evidence — every Codex dispatch
+rewrites its session rollout, which gives a free before/after sample. Vendors
+report whole percents, so one small agent usually measures as zero; the average
+over many samples recovers the sub-resolution cost, floored, because "too small
+to measure" is not "free".
+
+Overestimating stops a run early with its work cached. Underestimating gets it
+killed mid-flight. This errs toward the first.
+
+Everything lives in `~/.cache/cross-model-orchestrate/state.json`.
 
 ---
 
