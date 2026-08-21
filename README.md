@@ -216,6 +216,56 @@ killed mid-flight. This errs toward the first.
 
 Everything lives in `~/.cache/cross-model-orchestrate/state.json`.
 
+### Across machines
+
+One box's file only knows about one box. If you run orchestrators on several
+machines against the *same* subscriptions, run a coordinator and point them all
+at it:
+
+```bash
+# on whichever machine is always up
+export CMO_FLEET_TOKEN=$(head -c 32 /dev/urandom | base64 | tr -d '=+/')
+cmo serve --host 0.0.0.0          # or a tailnet address
+
+# on every box, including that one
+export CMO_FLEET_URL=http://<reachable-host>:7867
+export CMO_FLEET_TOKEN=<the same token>
+```
+
+Now `cmo limits` is a fleet view:
+
+```
+codex   ok        plan=pro
+        Wkly   █·········   6% resets 2026-08-28 07:35Z
+        in-flight 2 agent(s) across the fleet · reported 6% → effective 8%
+
+2 dispatch(es) in flight across the fleet — effective figures include them
+  codex: vps-alpha:hell-water×1  vps-beta:termroam×1
+```
+
+- **A box is a machine.** `hostname()` by default, override with `CMO_NODE_ID`.
+  Directories, terminal sessions and agent sessions are not units of
+  coordination — every dispatch on one machine already shares its ledger.
+- **Projects need no registration.** The project label is derived from each
+  dispatch's working directory, so a directory created five minutes from now
+  appears in the fleet view with no configuration.
+- **One coordinator per account pair, not per company.** Boxes logged into
+  *different* Codex or Claude accounts are not contending for the same windows,
+  and sharing a coordinator would make them throttle each other over nothing.
+- **Liveness is a lease, not a pid.** One machine cannot ask another whether a
+  process is alive, so each reservation carries its own expiry, set from the
+  dispatch's timeout. A box that dies mid-run releases its headroom when the
+  lease runs out. No heartbeat to get wrong.
+- **The token is required** and there is no way to start without one. An open
+  coordinator lets anyone who can reach it reserve 100% of your headroom and
+  stall every orchestrator you own. Bind to a private interface — a tailnet
+  address, not `0.0.0.0` on a public IP.
+- **An unreachable coordinator degrades to single-box.** Dispatches keep
+  running against the local ledger and `cmo limits` says the view is local only.
+  `cmo doctor` reports "configured but unreachable" as a failure, because that
+  is worse than not configuring it: every box silently reverts to seeing only
+  itself, which is exactly when they overrun.
+
 ---
 
 ## Using it from a Claude Code workflow

@@ -19,6 +19,8 @@ import { decide, providerState, pressure } from '../src/policy.mjs';
 import { runAgent, DEFAULT_TIMEOUT_MS } from '../src/run.mjs';
 import { doctor } from '../src/doctor.mjs';
 import { install, uninstall } from '../src/install.mjs';
+import { createCoordinator, DEFAULT_PORT } from '../src/server.mjs';
+import { fleetConfig, health } from '../src/remote.mjs';
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -73,7 +75,8 @@ function renderLimits(limits) {
     // What the vendor reported vs what this machine has already committed.
     // Under several concurrent orchestrators the gap is the whole story.
     if (p.committedPoints > 0) {
-      lines.push(`        ${'in-flight'.padEnd(6)} ${p.inFlightAgents} agent(s) on this machine`
+      lines.push(`        ${'in-flight'.padEnd(6)} ${p.inFlightAgents} agent(s) across `
+        + `${limits.fleet ? 'the fleet' : 'this machine'}`
         + ` · reported ${p.reportedPercent}% → effective ${p.worstPercent}%`);
     }
   }
@@ -81,9 +84,25 @@ function renderLimits(limits) {
   const bands = pressure();
   lines.push(`bands: tight ≥${bands.tight}%  critical ≥${bands.critical}%  exhausted ≥${bands.exhausted}%`);
   const flight = (limits.inFlight?.codex ?? 0) + (limits.inFlight?.claude ?? 0);
+  const scope = limits.fleet ? 'the fleet' : 'this machine';
   lines.push(flight === 0
-    ? 'no dispatches in flight from this machine'
-    : `${flight} dispatch(es) in flight from this machine — effective figures include them`);
+    ? `no dispatches in flight across ${scope}`
+    : `${flight} dispatch(es) in flight across ${scope} — effective figures include them`);
+  if (limits.fleet && limits.summary) {
+    // Where the work actually is. "37 in flight" is not actionable;
+    // "22 on vps-2, project hell-water" is.
+    for (const [provider, info] of Object.entries(limits.summary)) {
+      const where = Object.entries(info.nodes ?? {})
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, n]) => `${k}×${n}`)
+        .join('  ');
+      if (where) lines.push(`  ${provider}: ${where}`);
+    }
+  }
+  if (!limits.fleet && fleetConfig()) {
+    lines.push('WARNING: a fleet coordinator is configured but unreachable — '
+      + 'this decision sees only the local machine.');
+  }
   return lines.join('\n');
 }
 
@@ -101,7 +120,8 @@ const USAGE = `cmo <command> [options]   —   cross-model orchestrate
 setup
   install     install the skill into every agent host, and the Claude subagent
   uninstall   remove what install put there
-  doctor      check CLIs, auth, model IDs, headroom and skill install
+  doctor      check CLIs, auth, model IDs, headroom, skill install and fleet
+  serve       run the fleet coordinator so several machines share one view
 
 dispatch
   limits      report remaining subscription headroom for codex and claude
@@ -113,6 +133,16 @@ install options
   --skill-name  install the skill under a different directory name
   --copy        copy instead of symlinking (automatic under npx)
   --hosts       comma-separated subset: claude,codex,agents,kilo,opencode
+
+serve options
+  --port        listen port (default ${DEFAULT_PORT})
+  --host        bind address (default 127.0.0.1 — use 0.0.0.0 or a tailnet IP
+                to accept other machines)
+  --token       shared secret; or set CMO_FLEET_TOKEN. Required, min 16 chars.
+  --state       where to persist fleet state
+
+Clients join by setting CMO_FLEET_URL and CMO_FLEET_TOKEN, or the "fleet"
+block in the config file. Without them, everything is single-box.
 
 task options (plan, run)
   --role            mechanical|research|implement|review|judge|architecture|synthesis
@@ -155,6 +185,28 @@ async function main() {
       ...(typeof args.hosts === 'string' ? { hosts: args.hosts.split(',').map((h) => h.trim()) } : {}),
     };
     await (command === 'install' ? install(opts) : uninstall(opts));
+    return 0;
+  }
+
+  if (command === 'serve') {
+    const token = args.token ?? process.env.CMO_FLEET_TOKEN;
+    if (!token || String(token).length < 16) {
+      process.stderr.write(
+        'cmo serve: a shared token of at least 16 characters is required.\n'
+        + 'An open coordinator lets anyone on the network stall every orchestrator\n'
+        + 'you own by reserving 100% of your headroom.\n\n'
+        + `  export CMO_FLEET_TOKEN=$(head -c 32 /dev/urandom | base64 | tr -d '=+/')\n`
+        + '  cmo serve --host 0.0.0.0\n',
+      );
+      return 2;
+    }
+    const port = Number(args.port ?? DEFAULT_PORT);
+    const host = String(args.host ?? '127.0.0.1');
+    const server = createCoordinator({ token: String(token), statePath: args.state ? String(args.state) : undefined });
+    await new Promise((resolve) => server.listen(port, host, resolve));
+    process.stdout.write(`cross-model-orchestrate coordinator on http://${host}:${port}\n`);
+    process.stdout.write('clients: export CMO_FLEET_URL=http://<reachable-host>:' + port + ' CMO_FLEET_TOKEN=<token>\n');
+    await new Promise(() => {}); // run until killed
     return 0;
   }
 

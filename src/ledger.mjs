@@ -34,6 +34,9 @@ import { open, mkdir, readFile, rename, writeFile, rm, stat } from 'node:fs/prom
 import { join } from 'node:path';
 
 import { CACHE_DIR, loadConfig } from './config.mjs';
+import {
+  fleetConfig, identity, remoteRelease, remoteReserve, remoteSample, remoteState, remoteProbe,
+} from './remote.mjs';
 
 export const STATE_FILE = join(CACHE_DIR, 'state.json');
 const LOCK_FILE = join(CACHE_DIR, 'state.lock');
@@ -143,9 +146,32 @@ export async function mutate(fn, { now = Date.now } = {}) {
   }
 }
 
-export async function snapshot({ now = Date.now } = {}) {
+/**
+ * The state a decision should be made against.
+ *
+ * With a coordinator configured this is the FLEET's state — every box's
+ * in-flight work, not just this one's. Without it, or when the coordinator
+ * cannot be reached, it is this machine's file. The fallback is deliberate: a
+ * coordination outage must degrade to single-box behaviour, never stall a run.
+ */
+export async function snapshot({ now = Date.now, local = false } = {}) {
+  if (!local && fleetConfig()) {
+    const remote = await remoteState();
+    if (remote) {
+      return {
+        probes: remote.probes ?? {},
+        // The coordinator expires by lease, since it cannot test a pid on
+        // another machine. No local GC pass here — these are not our processes.
+        reservations: Array.isArray(remote.reservations) ? remote.reservations : [],
+        samples: remote.samples ?? {},
+        fleet: true,
+        summary: remote.summary ?? {},
+      };
+    }
+  }
   const state = await readState();
   state.reservations = gcReservations(state.reservations, now());
+  state.fleet = false;
   return state;
 }
 
@@ -159,18 +185,33 @@ export async function snapshot({ now = Date.now } = {}) {
  * everyone else finds the fresh answer already there.
  */
 export async function freshProbe(provider, maxAgeMs, read, { now = Date.now } = {}) {
-  const state = await readState();
-  const entry = state.probes?.[provider];
-  if (entry && now() - entry.storedAt < maxAgeMs) return { value: entry.value, cached: true };
+  const fleet = fleetConfig();
+
+  // A reading taken on any box is a reading for the whole fleet — the windows
+  // are per-subscription, not per-machine — so check the coordinator first and
+  // let one probe serve everyone.
+  if (fleet) {
+    const remote = await remoteState();
+    const entry = remote?.probes?.[provider];
+    if (entry && now() - entry.storedAt < maxAgeMs) {
+      return { value: entry.value, cached: true, from: entry.node ?? 'fleet' };
+    }
+  }
+
+  const local = await readState();
+  const localEntry = local.probes?.[provider];
+  if (!fleet && localEntry && now() - localEntry.storedAt < maxAgeMs) {
+    return { value: localEntry.value, cached: true };
+  }
 
   const value = await read();
+  const storedAt = now();
+  // Write through to both: local keeps working if the coordinator goes away.
   await mutate((s) => {
     const current = s.probes[provider];
-    // Someone else may have probed while we were waiting; keep the newer one.
-    if (!current || current.storedAt < now()) {
-      s.probes[provider] = { storedAt: now(), value };
-    }
+    if (!current || current.storedAt < storedAt) s.probes[provider] = { storedAt, value };
   }, { now });
+  if (fleet) await remoteProbe(provider, value, storedAt);
   return { value, cached: false };
 }
 
@@ -187,20 +228,26 @@ let counter = 0;
  * enough evidence. Being directionally right about committed spend beats being
  * precisely right about spend that already landed.
  */
-export async function reserve(provider, { label = null, cost = null, now = Date.now } = {}) {
+export async function reserve(provider, { label = null, cost = null, leaseMs = null, cwd = undefined, now = Date.now } = {}) {
   counter += 1;
-  const id = `${process.pid}-${now()}-${counter}`;
+  const who = identity(cwd);
+  const id = `${who.node}-${process.pid}-${now()}-${counter}`;
   const points = cost ?? (await perAgentCost(provider, { now }));
   await mutate((s) => {
     s.reservations.push({
-      id,
-      provider,
-      pid: process.pid,
-      startedAt: now(),
-      cost: points,
-      label,
+      id, provider, pid: process.pid, startedAt: now(), cost: points, label,
+      node: who.node, project: who.project,
     });
   }, { now });
+  // The coordinator cannot test a pid on another box, so the entry carries its
+  // own expiry. A box that dies mid-run releases its headroom on the lease,
+  // with no heartbeat machinery to get wrong.
+  if (fleetConfig()) {
+    await remoteReserve({
+      id, provider, cost: points, label, node: who.node, project: who.project,
+      leaseMs: leaseMs ?? RESERVATION_LEASE_MS,
+    });
+  }
   return id;
 }
 
@@ -208,6 +255,7 @@ export async function releaseReservation(id, { now = Date.now } = {}) {
   await mutate((s) => {
     s.reservations = s.reservations.filter((r) => r.id !== id);
   }, { now });
+  if (fleetConfig()) await remoteRelease(id);
 }
 
 /** Percentage points already committed on a provider but not yet reported. */
@@ -238,6 +286,9 @@ export async function recordSample(provider, deltaPoints, { now = Date.now } = {
     list.push(Math.round(d * 100) / 100);
     s.samples[provider] = list.slice(-MAX_SAMPLES);
   }, { now });
+  // Cost is a property of the subscription, not the machine, so the whole
+  // fleet learns from every box's measurements.
+  if (fleetConfig()) await remoteSample(provider, d);
 }
 
 /**

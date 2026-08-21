@@ -143,6 +143,17 @@ export function loadConfig({ file = CONFIG_FILE, reload = false } = {}) {
       ...(fromFile.preference ?? {}),
       ...(process.env.CMO_PREFER ? { first: process.env.CMO_PREFER } : {}),
     },
+    /**
+     * Fleet coordination. Set `url` + `token` and every box points at one
+     * coordinator, so a run here can see the forty agents box B just launched.
+     * Unset means single-box behaviour, which is also the fallback whenever the
+     * coordinator cannot be reached.
+     */
+    fleet: {
+      url: process.env.CMO_FLEET_URL ?? fromFile.fleet?.url ?? null,
+      token: process.env.CMO_FLEET_TOKEN ?? fromFile.fleet?.token ?? null,
+      nodeId: process.env.CMO_NODE_ID ?? fromFile.fleet?.nodeId ?? null,
+    },
     // Where the two providers keep their state. Overridable mostly for tests.
     codexSessionsRoot: process.env.CMO_CODEX_SESSIONS
       ?? fromFile.codexSessionsRoot

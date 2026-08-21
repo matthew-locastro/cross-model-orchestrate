@@ -13,6 +13,7 @@ import { promisify } from 'node:util';
 import { loadConfig, TIERS } from './config.mjs';
 import { readLimits } from './limits.mjs';
 import { AGENT_DIR, SKILL_HOSTS } from './install.mjs';
+import { health } from './remote.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -102,6 +103,18 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
     } else line(OK, 'claude oauth', config.claudeCredentials);
   } catch {
     line(WARN, 'claude oauth', `unreadable: ${config.claudeCredentials}`);
+  }
+
+  log('\nfleet');
+  const fleet = await health();
+  if (!fleet.configured) {
+    line(OK, 'coordination', 'single machine (set CMO_FLEET_URL + CMO_FLEET_TOKEN to share)');
+  } else if (fleet.reachable) {
+    line(OK, 'coordinator', fleet.url);
+  } else {
+    // Configured but down is worse than not configured: every box silently
+    // reverts to seeing only itself, which is exactly when they overrun.
+    line(FAIL, 'coordinator', `${fleet.url} unreachable — ${fleet.error ?? 'no response'}`);
   }
 
   log('\nheadroom');

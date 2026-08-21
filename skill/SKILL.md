@@ -74,6 +74,11 @@ machine-wide state at the moment of every dispatch, and that reading is the one
 that decides. When the effective figure sits well above the reported one, other
 runs are in flight — plan smaller and say so.
 
+If a fleet coordinator is configured, those figures cover every machine, and
+`cmo limits` names which box and project the in-flight work belongs to. If it
+warns that the coordinator is unreachable, you are seeing only this machine —
+say so before planning a large run, because the real number is higher.
+
 - Either provider **exhausted** (≥95%) — plan the run for the other one alone
   and say so. Halve the fan-out width.
 - Both **tight** (≥65%) — propose the smaller version of the run and let the

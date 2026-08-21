@@ -377,6 +377,11 @@ export async function readLimits({ refresh = false, now = Date.now(), readers, i
       codex: inFlight(state, 'codex'),
       claude: inFlight(state, 'claude'),
     },
+    // Whether these figures cover the whole fleet or only this machine, and
+    // where the in-flight work actually is. The caller needs to know which,
+    // because a single-box view during a coordinator outage is a weaker claim.
+    fleet: Boolean(state.fleet),
+    summary: state.summary ?? null,
   };
 }
 

@@ -370,7 +370,13 @@ export async function runAgent(decision, prompt, opts = {}) {
         // Claim headroom for the duration of the call, so concurrent
         // orchestrators can see this dispatch before it reaches the meter.
         const before = await percentFor(target.provider);
-        const ticket = await reserve(target.provider, { label: target.model }).catch(() => null);
+        const ticket = await reserve(target.provider, {
+          label: target.model,
+          cwd,
+          // The coordinator cannot test a pid on another machine, so the entry
+          // expires on its own. One timeout of slack covers a retry.
+          leaseMs: timeoutMs * 2 + 60_000,
+        }).catch(() => null);
 
         let result;
         try {
