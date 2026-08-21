@@ -167,7 +167,8 @@ export async function install(opts = {}) {
     log(`${skipped.length} location(s) skipped — remove them by hand, or pass --skill-name`);
     log('to install under a different name.');
   }
-  log('next: run `cmo doctor` to check both providers are reachable.');
+  const { nextSteps } = await import('./banner.mjs');
+  log(nextSteps({ done: 1 }).trimEnd());
   return results;
 }
 

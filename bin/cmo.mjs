@@ -174,6 +174,18 @@ async function main() {
   const command = args._[0];
 
   if (!command || args.help || command === 'help') {
+    // Bare `cmo` is the first thing someone runs after installing, and npm
+    // hides the postinstall banner by default, so lead with the three steps.
+    if (!command && !args.help) {
+      const { nextSteps } = await import('../src/banner.mjs');
+      const { createRequire } = await import('node:module');
+      let version = '';
+      try {
+        version = createRequire(import.meta.url)('../package.json').version;
+      } catch { /* decoration */ }
+      process.stdout.write(nextSteps({ version }));
+      process.stdout.write('\n');
+    }
     process.stdout.write(USAGE);
     return 0;
   }

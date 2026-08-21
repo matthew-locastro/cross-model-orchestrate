@@ -20,7 +20,10 @@ npx's unpack cost once per subagent across a 250-agent fan-out is not free.
 
 Two steps, both needed. The npm install puts `cmo` on your path and nothing
 else; `cmo install` is what wires the skill and the `codex-runner` subagent into
-your agent tools, which is what makes the command below exist.
+your agent tools, which is what makes the command below exist. Running `cmo`
+with no arguments reprints these steps at any time. (There is a postinstall
+banner too, but npm 7+ hides lifecycle output unless you pass
+`--foreground-scripts`, so do not rely on seeing it.)
 
 **The orchestration runs from Claude Code, and only from Claude Code.** Codex is
 a worker here, not a driver — it executes subagents, it does not run the

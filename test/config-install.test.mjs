@@ -130,7 +130,12 @@ test('install wires the skill into every host and the agent into Claude', () => 
       assert.ok(existsSync(join(dir, 'SKILL.md')), `${dir} should hold a readable skill`);
     }
     assert.ok(existsSync(join(home, '.claude/agents/codex-runner.md')));
-    assert.match(out, /next: run `cmo doctor`/);
+    // Installing is step 1 of 3; the output has to say what the other two are,
+    // because npm hides the postinstall banner by default.
+    assert.match(out, /cmo install/);
+    assert.match(out, /claude --model opus --effort high/);
+    assert.match(out, /\/cross-model-orchestrate <what you want built>/);
+    assert.match(out, /runs from Claude Code only/);
   });
 });
 

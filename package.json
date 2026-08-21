@@ -18,7 +18,8 @@
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "selftest": "node bin/cmo.mjs selftest",
-    "doctor": "node bin/cmo.mjs doctor"
+    "doctor": "node bin/cmo.mjs doctor",
+    "postinstall": "node bin/postinstall.mjs"
   },
   "keywords": [
     "ai",
