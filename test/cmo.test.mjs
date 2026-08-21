@@ -504,6 +504,47 @@ test('the schema contract reaches the agent even on the vendor with no schema fl
   assert.match(spawnImpl.calls[0].prompt, /RETURN FORMAT \(hard requirement\)/);
 });
 
+test('a degraded review is TOLD it is degraded', async () => {
+  // The label alone is for the caller. This is the mitigation for the agent,
+  // and it shipped missing once because nothing asserted the prompt.
+  const spawnImpl = fakeSpawn([{ code: 0, stdout: claudeOut('3/5, here is why') }]);
+  await runAgent(
+    { provider: 'claude', model: 'sonnet', tier: 'balanced', fallback: null,
+      independence: 'same-vendor', degradedReview: true },
+    'grade this',
+    { spawnImpl, sleep: async () => {} },
+  );
+  const sent = spawnImpl.calls[0].prompt;
+  assert.match(sent, /INDEPENDENCE NOTICE/);
+  assert.match(sent, /resolve it AGAINST the artifact/);
+  assert.match(sent, /^grade this/, 'the task itself still comes first');
+});
+
+test('a cross-vendor review is not given the handicap notice', async () => {
+  const spawnImpl = fakeSpawn([{ code: 0, stdout: claudeOut('ok') }]);
+  await runAgent(
+    { provider: 'claude', model: 'sonnet', tier: 'balanced', fallback: null,
+      independence: 'cross-vendor', degradedReview: false },
+    'grade this',
+    { spawnImpl, sleep: async () => {} },
+  );
+  assert.doesNotMatch(spawnImpl.calls[0].prompt, /INDEPENDENCE NOTICE/);
+});
+
+test('the handicap and a schema contract coexist', async () => {
+  const spawnImpl = fakeSpawn([{ code: 0, stdout: claudeOut('{"score":3}') }]);
+  const out = await runAgent(
+    { provider: 'claude', model: 'sonnet', tier: 'balanced', fallback: null,
+      independence: 'same-vendor', degradedReview: true },
+    'grade this',
+    { spawnImpl, sleep: async () => {}, schema: { type: 'object', properties: { score: { type: 'integer' } } } },
+  );
+  const sent = spawnImpl.calls[0].prompt;
+  assert.match(sent, /INDEPENDENCE NOTICE/);
+  assert.match(sent, /RETURN FORMAT \(hard requirement\)/);
+  assert.deepEqual(out.resultJson, { score: 3 });
+});
+
 test('a timeout is reported, not swallowed as an empty answer', async () => {
   const spawnImpl = fakeSpawn([
     { code: null, signal: 'SIGKILL', timedOut: true, stderr: '' },

@@ -343,7 +343,28 @@ export async function runAgent(decision, prompt, opts = {}) {
     await writeFile(schemaFile, JSON.stringify(schema), 'utf8');
   }
 
-  const fullPrompt = schema ? `${prompt}\n${schemaContract(schema)}` : prompt;
+  // A grader running on the vendor that produced the artifact is predisposed to
+  // approve it. Saying so is the cheapest available mitigation: it cannot
+  // remove the bias, but it can push the agent to apply the rubric mechanically
+  // instead of reaching for a holistic judgement it is badly placed to make.
+  const handicap = decision.degradedReview ? [
+    '',
+    '---',
+    'INDEPENDENCE NOTICE: you are reviewing work produced by your own model',
+    'family, because the other vendor is out of capacity. You share the',
+    "producer's training, priors and blind spots, so your instinct that this is",
+    'correct is evidence of nothing. Compensate deliberately:',
+    '',
+    '- Work the rubric criterion by criterion. Do not form an overall',
+    '  impression and reason back to it.',
+    '- Where a criterion is arguable, resolve it AGAINST the artifact.',
+    '- State plainly what you checked and what you could not check.',
+    '',
+    'Your verdict is recorded as a same-vendor review, not an independent one,',
+    'and may be re-run later against the other vendor.',
+  ].join('\n') : '';
+
+  const fullPrompt = `${prompt}${handicap}${schema ? `\n${schemaContract(schema)}` : ''}`;
 
   // The dispatch ladder: primary first, then the other vendor if the policy
   // gave us one. This is "codex first, claude when codex is unavailable".
