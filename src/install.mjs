@@ -56,7 +56,14 @@ async function pathKind(path) {
 async function isOurs(path, info) {
   if (info.kind === 'symlink') {
     if (!info.live) return true;
-    return resolve(dirname(path), info.target).startsWith(PACKAGE_ROOT);
+    const target = resolve(dirname(path), info.target);
+    if (target.startsWith(PACKAGE_ROOT)) return true;
+    // A link into ANOTHER copy of this same package — a source checkout when
+    // you later install from npm, or a package root that moved between
+    // versions. Still ours, and still safe to relink. Without this, switching
+    // install methods leaves you with "not ours to replace" and no way
+    // forward but deleting the links by hand.
+    return /[/\\]cross-model-orchestrate[/\\](skill|agents)([/\\]|$)/.test(target);
   }
   if (info.kind === 'dir') {
     try {

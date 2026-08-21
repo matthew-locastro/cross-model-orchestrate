@@ -182,6 +182,32 @@ test('a dangling link from an earlier install is reclaimed', () => {
   });
 });
 
+test('switching install methods relinks instead of refusing', () => {
+  // A link into another copy of THIS package — a source checkout after you
+  // install from npm, or a package root that moved between versions. Treating
+  // it as foreign leaves the user with "not ours to replace" and no way
+  // forward except deleting links by hand.
+  fakeHome((home) => {
+    const dir = join(home, '.claude/skills');
+    mkdirSync(dir, { recursive: true });
+    const other = mkdtempSync(join(tmpdir(), 'cmo-othercopy-'));
+    const otherPkg = join(other, 'cross-model-orchestrate');
+    mkdirSync(join(otherPkg, 'skill'), { recursive: true });
+    writeFileSync(join(otherPkg, 'skill', 'SKILL.md'), '# an older copy\n');
+    symlinkSync(join(otherPkg, 'skill'), join(dir, 'cross-model-orchestrate'));
+
+    const out = runInstall(home, ['install']);
+
+    assert.doesNotMatch(out, /not ours to replace/);
+    assert.equal(
+      readFileSync(join(dir, 'cross-model-orchestrate/SKILL.md'), 'utf8').includes('an older copy'),
+      false,
+      'the link should now resolve to this package, not the old copy',
+    );
+    rmSync(other, { recursive: true, force: true });
+  });
+});
+
 test('--skill-name installs under a different directory, so collisions have a fix', () => {
   fakeHome((home) => {
     runInstall(home, ['install', '--skill-name', 'orchestrate']);
