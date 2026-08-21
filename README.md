@@ -302,8 +302,25 @@ const verdict = await agent(
 );
 ```
 
-Omit `agentType` for an ordinary Claude subagent — right when the agent needs the
-harness's own tools rather than a shell.
+**Dispatch through the shim by default.** This is the decision that determines
+whether a run balances at all. Claude's window is the scarce one — the
+orchestrator is a Claude session spending it continuously, and it is the only
+thing that cannot be moved — so every subagent left on Claude competes with the
+thing driving the run.
+
+A measured example: one fan-out spent 9.6k tokens on a `codex-runner` dispatch
+and 557k on a workflow whose stages were plain `agent()` calls. Codex ended the
+hour at 10% consumed, Claude at 96%. Nothing was misconfigured; the workflow
+just defaulted to Claude for everything but one stage.
+
+Keep a plain `agent()` only when the task needs something Codex has no access
+to: an MCP server wired into the Claude session, the harness's browser, or an
+agent you plan to resume later. Ordinary file work is not on that list — Codex
+reads, writes and greps fine through `cmo run`.
+
+The shim costs ~10–15k Haiku tokens per dispatch, mostly its own prompt. Trivial
+against a real agent, absurd against a five-second one — batch small work rather
+than shimming each piece.
 
 ---
 

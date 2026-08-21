@@ -192,13 +192,38 @@ const verdict = await agent(
 ```
 
 `codex-runner` is a Haiku shim with `Bash` only: it runs `cmo run` and returns
-the result verbatim. Its cost is a rounding error against the agent it
-dispatches.
+the result verbatim.
 
-Omit `agentType` for an ordinary Claude subagent. That is the right choice when
-the agent needs the harness's own tools — Read, Edit, Glob, the browser — rather
-than a shell. Reach for the shim when the work is self-contained and you want it
-billed to the other subscription.
+**Dispatch through the shim by default. A plain `agent()` needs a reason.**
+
+This is the single decision that determines whether the run balances at all, and
+getting it wrong is invisible until you look at the meters. Claude's window is
+the scarce one: the orchestrator is a Claude session spending it continuously
+for the whole run, and it is the only thing that cannot be moved. Every subagent
+you leave on Claude competes with the thing driving the run.
+
+A measured example. One fan-out spent 9.6k tokens on a `codex-runner` dispatch
+and 557k on a workflow whose agents were plain `agent()` calls. Codex finished
+the hour at 10% consumed and Claude at 96% — on a run whose entire purpose was
+to spend both. Nothing was misconfigured; the workflow simply defaulted to
+Claude for everything except one stage.
+
+So: generation, research, implementation, mechanical passes, grading, synthesis
+— all of it goes through `codex-runner` unless it *cannot*. Keep a plain
+`agent()` only when the task needs something Codex genuinely has no access to:
+
+- MCP servers wired into this Claude session;
+- the harness's own browser, for looking at a rendered page;
+- an agent you intend to resume later with `SendMessage`.
+
+Ordinary file work is not on that list. Codex reads, writes and greps perfectly
+well through `cmo run`; needing to edit files is not a reason to spend Claude.
+
+One real cost to weigh: the shim itself burns roughly 10–15k Haiku tokens per
+dispatch, mostly its own prompt. That is trivial against a substantial agent and
+absurd against a trivial one. Do not route a task through the shim that a
+five-second inline step would finish — batch small work into one dispatch, or
+just do it in the orchestrator.
 
 Patterns and worked scripts: `references/workflow-patterns.md`.
 

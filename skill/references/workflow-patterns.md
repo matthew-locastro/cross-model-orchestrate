@@ -52,7 +52,12 @@ const results = await pipeline(
 ```
 
 `independent-of: codex` sends the judge to Claude even though the shim is
-`codex-runner` — the shim dispatches, the policy decides. Slot A can be in the
+`codex-runner` — the shim dispatches, the policy decides.
+
+Note that **every** stage here goes through the shim, including the generators.
+That is the default, not a flourish: a workflow that reaches for a plain
+`agent()` out of habit spends Claude on work Codex could have done, and the
+orchestrator needs that window for itself. Slot A can be in the
 judge stage while slot B is still generating; a stall costs one slot, not the
 run.
 
