@@ -315,6 +315,11 @@ was measured for each.
 | Orphan reservations | `state.json` | Should always be zero at rest. Anything else suppresses dispatch silently. |
 | Token split | agent list | Codex should carry the bulk. If Claude does, phase 01's gate has regressed. |
 
+> **The clock restarted at 2026-08-22 06:42 UTC.** Everything logged before that
+> is contaminated by the classifier defect below: completed Codex runs were
+> recorded as failures, so failure counts, retry rates, failover counts and the
+> Codex share are all wrong in the same direction. Do not count those days.
+
 Gate:
 - Three consecutive days with no unexplained stall and no orphaned state.
 - At least one real usage-limit event handled cleanly — the scenario the whole
@@ -372,6 +377,83 @@ Three things make this the most instructive failure in the project so far:
 error handling — and confirm its receipt reads `ok: true`. Then check no receipt
 in the run carries `error: "exit 0"`, which is the signature: clean exit, empty
 stderr, failed anyway.
+
+---
+
+## "Which version is actually running" — check all four
+
+Every staleness incident in this project has the same shape: the version you
+check is not the version that runs. There are four independent places it can be
+wrong, and phase 00 is only credible if all four agree.
+
+1. **The global install**, from the account that does the work — not from root,
+   not from your login shell. A different user has a different npm prefix.
+2. **A project's `node_modules`.** A consumer repo that depends on this package
+   may resolve its own copy, and a shim that prefers `node_modules/.bin` over
+   `PATH` will run it. TermRoam sat on **0.1.1 for eighteen releases** this way:
+   the caret range permitted the upgrade, nothing had reinstalled, and every
+   dispatch from that repo silently ran a build with no receipts, no dispatch
+   file (so the shim could drop `--independent-of` unnoticed), no signal
+   handling, and the classifier that graded an agent by its own work product.
+3. **The installed skill and subagent.** Symlinks into the global package track
+   upgrades for free; `--copy` installs do not and must be re-run.
+4. **A long-running `cmo serve`.** A coordinator started days ago holds the code
+   it loaded at start. Before bouncing it — which briefly degrades the fleet to
+   local-only and is not free while dispatches are in flight — check whether its
+   code actually moved:
+
+   ```bash
+   git diff --name-only v<running-version>..HEAD -- src/server.mjs src/remote.mjs src/ledger.mjs
+   ```
+
+   Empty output means the process is functionally current; leave it alone. On
+   2026-08-22 a coordinator running 0.1.11 code was byte-identical to 0.1.19's,
+   because every change since had landed in `run`, `limits`, `audit`, `doctor`
+   and `update` — none of which execute in the server loop.
+
+---
+
+## Releasing: the tag has to be annotated
+
+`git push --follow-tags` pushes **annotated** tags only. A lightweight
+`git tag v0.1.19` is silently left behind, the tag-triggered release workflow
+never fires, and `npm view` keeps reporting the previous version while the commit
+sits on `main` looking shipped. It looks exactly like a slow publish.
+
+Either `git tag -a v<x> -m v<x>`, or push the tag explicitly:
+
+```bash
+git push origin v<x>
+```
+
+Confirm with `gh run list` that the **release** workflow ran, not just `ci`.
+
+---
+
+## If a dispatch is wrongly recorded as failed, the work may still exist
+
+Worth knowing before anyone re-runs anything expensive. A Codex agent with write
+access **edits the working tree as it goes**. When the dispatcher misjudges the
+outcome, what is lost is the *report*, not the edits — the files are on disk, and
+the orchestrator, believing it failed, re-dispatches the same task to the other
+vendor, which then works on top of them.
+
+So the recovery move is reconciliation, not repetition:
+
+```bash
+# the agent's own final message, from the session rollout
+python3 - <<'EOF'
+import json,glob
+f=glob.glob('~/.codex/sessions/YYYY/MM/DD/rollout-<stamp>*.jsonl')[0]
+for line in open(f):
+    e=json.loads(line); p=e.get('payload') or {}
+    if p.get('type')=='task_complete': print(p['last_agent_message'])
+EOF
+```
+
+Then diff that report against the tree and look for **double application** —
+two implementations of the same change, one from each vendor. Both discarded
+runs on 2026-08-22 turned out to have completed their file edits in full.
 
 ---
 
