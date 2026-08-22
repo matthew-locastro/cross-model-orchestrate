@@ -520,6 +520,16 @@ Every real dispatch writes one line to
 comes back in the envelope as `dispatchId`. The gap between agents you spawned
 and receipts on record is the number that never ran.
 
+## Before a real release
+
+[`COMMERCIALIZATION_GATE.md`](COMMERCIALIZATION_GATE.md) is the checklist to come
+back to before this goes to people who will run it unattended on their own
+machines and their own subscriptions. It holds the eight validation phases, which
+version each last passed against, and what has drifted since.
+
+Its gate is one sentence, and it is currently unmet: *every phase passed against
+the version you are actually publishing, not an earlier one.*
+
 ## Releasing
 
 Published via npm [Trusted Publishing](https://docs.npmjs.com/trusted-publishers)
