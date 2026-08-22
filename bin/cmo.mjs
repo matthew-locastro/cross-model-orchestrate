@@ -303,10 +303,11 @@ async function main() {
         : Number(spec) || 1440;
     const rows = await readAudit({ sinceMs: Date.now() - mins * 60_000 });
     const cost = await perAgentCost('codex').catch(() => null);
+    const lim = await readLimits().catch(() => null);
     const sum = summarise(rows);
     const tiers = tierStats(rows);
     const fails = failureTaxonomy(rows);
-    const found = findings(rows, { perAgentCost: cost });
+    const found = findings(rows, { perAgentCost: cost, limits: lim });
 
     if (args.json) {
       process.stdout.write(`${JSON.stringify({ window: spec, summary: sum, tiers, failures: fails, findings: found }, null, 2)}\n`);
@@ -318,6 +319,7 @@ async function main() {
     process.stdout.write(`${'─'.repeat(60)}\n`);
     if (!rows.length) {
       process.stdout.write('no dispatches recorded in this window.\n');
+      for (const f of found) process.stdout.write(`\n  [${f.severity}] ${f.finding}\n          → ${f.action}\n`);
       return 0;
     }
 

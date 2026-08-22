@@ -154,8 +154,29 @@ export function failureTaxonomy(rows) {
  * The recommendations. Each one names what was measured, so it can be argued
  * with rather than merely obeyed.
  */
-export function findings(rows, { perAgentCost = null } = {}) {
+export function findings(rows, { perAgentCost = null, limits = null } = {}) {
   const out = [];
+
+  // A dark meter first, before anything else — every other number here is
+  // computed against headroom the tool may no longer be able to see. Found on
+  // the first day of a soak: an expired Claude OAuth token silently blinded the
+  // Claude side, and the tool carried on dispatching as if the window were
+  // unknown-and-usable.
+  for (const provider of ['codex', 'claude']) {
+    const p = limits?.[provider];
+    if (p && p.available === false) {
+      out.push({
+        severity: 'high',
+        finding: `the ${provider} meter is dark: ${p.error ?? 'unavailable'}`,
+        action: provider === 'claude' && /expired/i.test(p.error ?? '')
+          ? 'Run any claude command once to refresh the OAuth token. Until then headroom reads as '
+            + 'unknown, which the policy treats as usable — so it will keep dispatching into a window it cannot see.'
+          : 'Fix the probe before trusting anything else here. Unknown headroom is treated as usable by design, '
+            + 'so a blind meter fails toward over-dispatching.',
+      });
+    }
+  }
+
   const total = rows.length;
   if (!total) return out;
 

@@ -86,3 +86,21 @@ test('every failure kind is counted, commonest first', () => {
 test('an empty window says nothing rather than inventing findings', () => {
   assert.deepEqual(findings([]), []);
 });
+
+test('a dark meter outranks every other finding', () => {
+  // Everything else is computed against headroom the tool can no longer see,
+  // and unknown headroom is treated as usable — so a blind meter fails toward
+  // over-dispatching rather than stopping.
+  const f = findings(many(10, {}), {
+    limits: { claude: { available: false, error: 'claude oauth token expired — run `claude` once to refresh' } },
+  });
+  assert.equal(f[0].severity, 'high');
+  assert.match(f[0].finding, /claude meter is dark/);
+  assert.match(f[0].action, /refresh the OAuth token/);
+});
+
+test('a dark meter is reported even with no dispatches at all', () => {
+  const f = findings([], { limits: { codex: { available: false, error: 'no rollouts' } } });
+  assert.equal(f.length, 1);
+  assert.match(f[0].finding, /codex meter is dark/);
+});
