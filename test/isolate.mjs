@@ -15,3 +15,14 @@ import { join } from 'node:path';
 if (!process.env.CMO_CACHE_DIR || process.env.CMO_CACHE_DIR.includes('.cache/cross-model-orchestrate')) {
   process.env.CMO_CACHE_DIR = mkdtempSync(join(tmpdir(), 'cmo-test-state-'));
 }
+
+// The config dir too. Writing a real fleet config on this machine made four
+// ledger tests start talking to a live coordinator instead of the local file —
+// the suite passed everywhere except the one box that had actually been set up.
+if (!process.env.CMO_CONFIG_DIR || process.env.CMO_CONFIG_DIR.includes('.config/cross-model-orchestrate')) {
+  process.env.CMO_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'cmo-test-config-'));
+}
+
+// And any fleet settings inherited from the shell, for the same reason.
+delete process.env.CMO_FLEET_URL;
+delete process.env.CMO_FLEET_TOKEN;

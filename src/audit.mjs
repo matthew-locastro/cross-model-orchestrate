@@ -100,3 +100,135 @@ export function summarise(rows, { expected = null } = {}) {
       : {}),
   };
 }
+
+// ── soak analysis ─────────────────────────────────────────────────────────
+//
+// A multi-day soak that ends with "it felt fine" taught nothing. These turn the
+// log into findings, and findings into specific changes: a tier that is always
+// over-provisioned, a role that keeps retrying, a review that keeps degrading,
+// a reservation cost that is nowhere near what agents actually consume.
+//
+// Nothing here changes configuration. It says what it saw and what it would
+// change, and a person decides — the same posture as doctor.
+
+function pct(n, total) {
+  return total ? Math.round((n / total) * 100) : 0;
+}
+
+function quantile(sorted, q) {
+  if (!sorted.length) return null;
+  const i = Math.min(sorted.length - 1, Math.floor(sorted.length * q));
+  return sorted[i];
+}
+
+/** Duration spread per tier, which is where over- and under-provisioning shows. */
+export function tierStats(rows) {
+  const byTier = {};
+  for (const r of rows) {
+    if (!r.tier || typeof r.durationMs !== 'number') continue;
+    (byTier[r.tier] ??= []).push(r.durationMs);
+  }
+  const out = {};
+  for (const [tier, list] of Object.entries(byTier)) {
+    const sorted = [...list].sort((a, b) => a - b);
+    out[tier] = {
+      count: sorted.length,
+      p50: quantile(sorted, 0.5),
+      p95: quantile(sorted, 0.95),
+    };
+  }
+  return out;
+}
+
+/** Every distinct way dispatches went wrong, most common first. */
+export function failureTaxonomy(rows) {
+  const kinds = {};
+  for (const r of rows) {
+    for (const f of r.failures ?? []) kinds[f] = (kinds[f] ?? 0) + 1;
+    if (r.ok === false && !(r.failures ?? []).length) kinds.unknown = (kinds.unknown ?? 0) + 1;
+  }
+  return Object.fromEntries(Object.entries(kinds).sort((a, b) => b[1] - a[1]));
+}
+
+/**
+ * The recommendations. Each one names what was measured, so it can be argued
+ * with rather than merely obeyed.
+ */
+export function findings(rows, { perAgentCost = null } = {}) {
+  const out = [];
+  const total = rows.length;
+  if (!total) return out;
+
+  const ok = rows.filter((r) => r.ok !== false).length;
+  const failed = total - ok;
+  if (failed) {
+    const kinds = failureTaxonomy(rows);
+    const top = Object.entries(kinds)[0];
+    out.push({
+      severity: failed / total > 0.05 ? 'high' : 'low',
+      finding: `${failed} of ${total} dispatches failed (${pct(failed, total)}%), most often "${top[0]}" x${top[1]}`,
+      action: top[0] === 'timeout'
+        ? 'Raise --timeout for the roles that hit it, or split the task; a timeout is work paid for and thrown away.'
+        : top[0] === 'rate-limit'
+          ? 'Expected when a window fills. If it happens with headroom showing, the meter is lying — check cmo limits --refresh.'
+          : 'Read the error field on those rows; a deterministic failure repeated is a prompt or flag bug, not bad luck.',
+    });
+  }
+
+  const retried = rows.filter((r) => r.retried).length;
+  if (retried / total > 0.1) {
+    out.push({
+      severity: 'medium',
+      finding: `${retried} dispatches (${pct(retried, total)}%) needed more than one attempt`,
+      action: 'Retries are wasted spend. Check whether one provider is flaky, or a tier is too small for its role.',
+    });
+  }
+
+  const codex = rows.filter((r) => r.provider === 'codex').length;
+  const share = pct(codex, total);
+  if (share < 50) {
+    out.push({
+      severity: 'high',
+      finding: `only ${share}% of dispatches went to codex`,
+      action: 'The orchestrator is a Claude session and cannot move. Route more fan-out through codex-runner, '
+        + 'or the run competes with the thing driving it.',
+    });
+  }
+
+  const reviews = rows.filter((r) => r.independence);
+  const degraded = reviews.filter((r) => r.independence === 'same-vendor').length;
+  if (degraded) {
+    out.push({
+      severity: degraded / reviews.length > 0.25 ? 'high' : 'medium',
+      finding: `${degraded} of ${reviews.length} reviews ran same-vendor (${pct(degraded, reviews.length)}%)`,
+      action: 'Those verdicts are provisional — the grader shared the producer\'s blind spots. Re-grade them '
+        + 'when the other window reopens, and start fan-outs earlier in the window.',
+    });
+  }
+
+  const stats = tierStats(rows);
+  for (const [tier, s] of Object.entries(stats)) {
+    if (tier !== 'fast' && s.count >= 10 && s.p95 != null && s.p95 < 12_000) {
+      out.push({
+        severity: 'low',
+        finding: `${tier} tier: ${s.count} dispatches, p95 only ${Math.round(s.p95 / 1000)}s`,
+        action: `Work finishing that fast rarely needed ${tier}. Try lowering complexity or length for those roles `
+          + 'and watch whether quality moves.',
+      });
+    }
+  }
+
+  if (perAgentCost != null) {
+    const configured = 1.0;
+    if (perAgentCost <= configured / 4) {
+      out.push({
+        severity: 'low',
+        finding: `measured cost is ${perAgentCost} points per agent against a ${configured} default`,
+        action: 'The default is being carried by the floor. Reservations are over-reserving, which makes '
+          + 'concurrent fan-outs defer earlier than they need to.',
+      });
+    }
+  }
+
+  return out;
+}

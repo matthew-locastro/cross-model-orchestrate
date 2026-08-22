@@ -31,7 +31,7 @@ function withCache(body) {
 // contention between processes is the thing being modelled.
 function run(dir, source) {
   return execFileSync(process.execPath, ['--input-type=module', '-e', source], {
-    env: { ...process.env, CMO_CACHE_DIR: dir },
+    env: { ...process.env, CMO_CACHE_DIR: dir, CMO_CONFIG_DIR: dir },
     encoding: 'utf8',
     cwd: new URL('..', import.meta.url).pathname,
   }).trim();
@@ -79,7 +79,7 @@ test('one orchestrator sees another orchestrator\'s in-flight dispatches', () =>
     `;
     const child = spawn(
       process.execPath, ['--input-type=module', '-e', holder],
-      { env: { ...process.env, CMO_CACHE_DIR: dir }, stdio: 'pipe' },
+      { env: { ...process.env, CMO_CACHE_DIR: dir, CMO_CONFIG_DIR: dir }, stdio: 'pipe' },
     );
     try {
       // wait for the reservations to land
@@ -212,7 +212,7 @@ test('concurrent writers do not lose each other\'s reservations', async () => {
     `;
     for (let i = 0; i < 12; i++) {
       kids.push(spawn(process.execPath, ['--input-type=module', '-e', src], {
-        env: { ...process.env, CMO_CACHE_DIR: dir }, stdio: 'pipe',
+        env: { ...process.env, CMO_CACHE_DIR: dir, CMO_CONFIG_DIR: dir }, stdio: 'pipe',
       }));
     }
     await Promise.all(kids.map((k) => new Promise((res) => {

@@ -39,6 +39,7 @@ import { join } from 'node:path';
 import { markExhausted, recordCodexRateLimits, refreshCodexLimits } from './limits.mjs';
 import { recordSample, releaseReservation, reserve, snapshot } from './ledger.mjs';
 import { newDispatchId, record } from './audit.mjs';
+import { identity } from './remote.mjs';
 
 export const DEFAULT_TIMEOUT_MS = 20 * 60_000;
 const KILL_GRACE_MS = 5_000;
@@ -382,6 +383,7 @@ export async function runAgent(decision, prompt, opts = {}) {
   } = opts;
 
   wireSignals();
+  const who = identity(cwd);
   const startedAt = now();
   // Every dispatch gets a receipt, so a caller can tell a real one from a shim
   // that answered by itself. See audit.mjs.
@@ -525,13 +527,27 @@ export async function runAgent(decision, prompt, opts = {}) {
             }
             break;
           }
+          // Everything a later analysis might want, recorded once. A soak that
+          // ends with "something felt slow" and no numbers was wasted time.
           await record({
             at: now(), id: dispatchId, ok: true,
             provider: target.provider, model: target.model, tier: target.tier,
             role: decision.factors?.role ?? null,
+            weight: decision.weight ?? null,
+            complexity: decision.factors?.complexity ?? null,
+            length: decision.factors?.length ?? null,
             independence: decision.independence ?? null,
             degradedReview: Boolean(decision.degradedReview),
-            failedOver: rung > 0, durationMs: now() - startedAt,
+            failedOver: rung > 0,
+            attempts: attempts.length,
+            retried: attempts.length > 1,
+            failures: attempts.map((a) => a.failure).filter(Boolean),
+            durationMs: now() - startedAt,
+            tokens: usage ? {
+              in: usage.input_tokens ?? usage.inputTokens ?? null,
+              out: usage.output_tokens ?? usage.outputTokens ?? null,
+            } : null,
+            node: who.node, project: who.project,
           }).catch(() => {});
 
           return {
@@ -572,11 +588,17 @@ export async function runAgent(decision, prompt, opts = {}) {
 
     await record({
       at: now(), id: dispatchId, ok: false,
-      provider: decision.provider, model: decision.model,
+      provider: decision.provider, model: decision.model, tier: decision.tier ?? null,
       role: decision.factors?.role ?? null,
+      weight: decision.weight ?? null,
+      complexity: decision.factors?.complexity ?? null,
+      length: decision.factors?.length ?? null,
       independence: decision.independence ?? null,
+      attempts: attempts.length,
+      failures: attempts.map((a) => a.failure).filter(Boolean),
       durationMs: now() - startedAt,
       error: (lastError ?? 'all providers failed').slice(0, 200),
+      node: who.node, project: who.project,
     }).catch(() => {});
 
     return {

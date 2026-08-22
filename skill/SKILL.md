@@ -263,6 +263,21 @@ unverified: re-dispatch them, and say so in your report. Also read the two other
 lines it prints — `codex share` answers whether the run actually balanced, and
 the cross-vendor / same-vendor split tells you how many verdicts were degraded.
 
+### After a run, read the log back
+
+```bash
+cmo report --since 24h        # or --json, to act on the findings directly
+```
+
+It reports what actually happened — failure kinds, retry rate, codex share,
+how many reviews degraded, whether a tier's timings say the work never needed
+it — and names a specific change for each. Over a multi-day soak this is what
+makes the orchestration improve rather than merely continue: the same three
+mistakes stop being invisible.
+
+When you act on a finding, say which one and what you changed. A finding acted
+on silently looks exactly like a finding ignored.
+
 ### Keep watching the meter
 
 Re-run `cmo limits` between phases, and at least every ~25 agents in a long

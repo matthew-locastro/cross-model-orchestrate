@@ -22,7 +22,8 @@ import { install, uninstall } from '../src/install.mjs';
 import { createCoordinator, DEFAULT_PORT } from '../src/server.mjs';
 import { fleetConfig, health } from '../src/remote.mjs';
 import { mergeDispatch, parseDispatchFile } from '../src/dispatch-file.mjs';
-import { readAudit, summarise } from '../src/audit.mjs';
+import { readAudit, summarise, findings, tierStats, failureTaxonomy } from '../src/audit.mjs';
+import { perAgentCost } from '../src/ledger.mjs';
 import { update } from '../src/update.mjs';
 
 function parseArgs(argv) {
@@ -130,6 +131,7 @@ setup
 
 dispatch
   audit       what was ACTUALLY dispatched — the receipt for a fan-out
+  report      read the soak log back: reliability, balance, and what to change
   limits      report remaining subscription headroom for codex and claude
   plan        show which provider/model/effort a task would get, and why
   run         plan, then execute the subagent and print a JSON envelope
@@ -184,6 +186,10 @@ run options
   --no-failover     do not try the other vendor
   --full-access     codex only: bypass the sandbox (use inside an isolated box)
   --sandbox         codex sandbox: read-only|workspace-write|danger-full-access
+
+report options
+  --since           how far back: 90 (minutes), 24h, or 7d (default 24h)
+  --json            structured findings, for pasting to an agent to act on
 
 audit options
   --since           minutes to look back (default 60)
@@ -288,6 +294,60 @@ async function main() {
           + `they never called the dispatcher and answered by themselves.\n`);
     }
     return sum.undispatched ? 3 : 0;
+  }
+
+  if (command === 'report') {
+    const spec = String(args.since ?? '24h');
+    const mins = /^\d+d$/.test(spec) ? parseInt(spec, 10) * 1440
+      : /^\d+h$/.test(spec) ? parseInt(spec, 10) * 60
+        : Number(spec) || 1440;
+    const rows = await readAudit({ sinceMs: Date.now() - mins * 60_000 });
+    const cost = await perAgentCost('codex').catch(() => null);
+    const sum = summarise(rows);
+    const tiers = tierStats(rows);
+    const fails = failureTaxonomy(rows);
+    const found = findings(rows, { perAgentCost: cost });
+
+    if (args.json) {
+      process.stdout.write(`${JSON.stringify({ window: spec, summary: sum, tiers, failures: fails, findings: found }, null, 2)}\n`);
+      return 0;
+    }
+
+    const hrs = Math.round(mins / 60);
+    process.stdout.write(`\ncross-model-orchestrate — last ${hrs >= 24 ? `${Math.round(hrs / 24)}d` : `${hrs}h`}\n`);
+    process.stdout.write(`${'─'.repeat(60)}\n`);
+    if (!rows.length) {
+      process.stdout.write('no dispatches recorded in this window.\n');
+      return 0;
+    }
+
+    process.stdout.write(`${sum.total} dispatches · ${sum.failed} failed · codex share ${sum.codexShare}%\n\n`);
+    for (const [prov, info] of Object.entries(sum.byProvider)) {
+      const models = Object.entries(info.models).map(([m, n]) => `${m}x${n}`).join('  ');
+      process.stdout.write(`  ${prov.padEnd(7)} ${String(info.count).padStart(4)}   ${models}\n`);
+    }
+    process.stdout.write('\n  by role: '
+      + Object.entries(sum.byRole).map(([r, n]) => `${r}x${n}`).join('  ') + '\n');
+    const t = Object.entries(tiers).map(([k, v]) => `${k} p50 ${Math.round(v.p50 / 1000)}s/p95 ${Math.round(v.p95 / 1000)}s`);
+    if (t.length) process.stdout.write(`  timing:  ${t.join('   ')}\n`);
+    if (Object.keys(fails).length) {
+      process.stdout.write(`  failures: ${Object.entries(fails).map(([k, n]) => `${k}x${n}`).join('  ')}\n`);
+    }
+    const ind = sum.independence;
+    if (ind['cross-vendor'] || ind['same-vendor']) {
+      process.stdout.write(`  reviews: ${ind['cross-vendor']} cross-vendor, ${ind['same-vendor']} same-vendor\n`);
+    }
+
+    process.stdout.write(`\n${'─'.repeat(60)}\n`);
+    if (!found.length) {
+      process.stdout.write('nothing worth changing in this window.\n\n');
+      return 0;
+    }
+    process.stdout.write(`${found.length} finding(s)\n\n`);
+    for (const f of found) {
+      process.stdout.write(`  [${f.severity}] ${f.finding}\n          → ${f.action}\n\n`);
+    }
+    return 0;
   }
 
   if (command === 'limits') {

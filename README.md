@@ -387,6 +387,54 @@ an injectable spawn, so the policy is fully testable without spending anything.
 
 ---
 
+## The soak loop
+
+Run it as your daily driver, then read the log back. `cmo report` turns the
+dispatch receipts into findings, and each finding names what was measured so you
+can argue with it rather than just obey it.
+
+```
+$ cmo report --since 7d
+
+cross-model-orchestrate — last 7d
+────────────────────────────────────────────────────────────
+412 dispatches · 7 failed · codex share 71%
+
+  codex    291   gpt-5.6-terra x203  gpt-5.6-luna x74  gpt-5.6-sol x14
+  claude   121   sonnet x98  opus x23
+
+  by role: implement x186  research x94  judge x71  mechanical x61
+  timing:  fast p50 9s/p95 14s   balanced p50 41s/p95 96s   frontier p50 88s/p95 240s
+  failures: timeout x5  transient x2
+  reviews: 64 cross-vendor, 7 same-vendor
+
+────────────────────────────────────────────────────────────
+2 finding(s)
+
+  [medium] 7 of 71 reviews ran same-vendor (10%)
+          → Those verdicts are provisional — the grader shared the producer's
+            blind spots. Re-grade them when the other window reopens, and start
+            fan-outs earlier in the window.
+
+  [low] measured cost is 0.19 points per agent against a 1 default
+          → The default is being carried by the floor. Reservations are
+            over-reserving, which makes concurrent fan-outs defer earlier than
+            they need to.
+```
+
+`--json` gives the same thing structured, which is the point: paste it to the
+agent that runs your orchestration and it can act on the findings — adjust the
+tier map, change a role's complexity, re-grade the provisional verdicts — rather
+than you reading counts and guessing.
+
+What it looks for: failure rate and its commonest kind, retries as wasted spend,
+whether the fan-out actually reached Codex, how many reviews degraded to
+same-vendor, tiers whose p95 says the work never needed them, and a reservation
+cost that has drifted from what agents really consume.
+
+It changes nothing on its own. Same posture as `doctor`: measure, recommend,
+let a person decide.
+
 ## Keeping the CLIs current
 
 `doctor` never changes anything — it is a diagnostic, and `codex` and `claude`
