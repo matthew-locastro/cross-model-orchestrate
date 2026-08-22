@@ -9,10 +9,34 @@ each subscription before dispatching, sends work to Codex first so your Claude
 session keeps its own headroom, and — the part that changes output quality —
 **always grades work on the vendor that didn't produce it.**
 
+## First, the two CLIs this drives
+
+`cmo` has no API keys and no models of its own. It drives the **Claude Code** and
+**Codex** CLIs you are already paying for, so both have to be installed *and
+logged in* before it can do anything. Skip this and `cmo doctor` will tell you —
+but you will have installed a tool that can only reach one vendor, and grading
+work on the vendor that did not produce it is the entire point.
+
+Node 20 or newer, then:
+
+```bash
+npm install -g @anthropic-ai/claude-code   # or Claude Code's native installer
+npm install -g @openai/codex
+
+claude    # log in, then quit
+codex     # log in, send it one message, then quit
+```
+
+That message to Codex is not ceremony. It writes Codex's first session file, and
+that file is where `cmo` reads your Codex usage from — until one exists, the
+Codex meter reads "no codex session rollouts found" and routing has to guess.
+
+## Then the tool itself
+
 ```bash
 npm install -g cross-model-orchestrate
 cmo install     # wires the skill into Claude Code, Codex, Kilo, OpenCode
-cmo doctor      # checks both CLIs, auth, model IDs, headroom
+cmo doctor      # every row should read ok
 ```
 
 Global, not `npx`: the `codex-runner` shim needs `cmo` on `PATH`, and paying
@@ -21,9 +45,18 @@ npx's unpack cost once per subagent across a 250-agent fan-out is not free.
 Two steps, both needed. The npm install puts `cmo` on your path and nothing
 else; `cmo install` is what wires the skill and the `codex-runner` subagent into
 your agent tools, which is what makes the command below exist. Running `cmo`
-with no arguments reprints these steps at any time. (There is a postinstall
-banner too, but npm 7+ hides lifecycle output unless you pass
-`--foreground-scripts`, so do not rely on seeing it.)
+with no arguments reprints these steps at any time.
+
+`cmo doctor` is the gate: if it is green, a fan-out will work, and if it is not,
+it names the command that fixes each row. Run it before your first dispatch and
+any time something behaves oddly.
+
+(Two harmless things npm may say on the way in. It hides our postinstall banner
+unless you pass `--foreground-scripts`, and newer npm warns that the package
+"has install scripts not yet covered by allowScripts". Both are fine to ignore:
+that script only prints text — it writes nothing, touches no directory outside
+the package, and cannot fail your install. `cmo install`, which you type
+yourself, is what actually wires anything up.)
 
 **The orchestration runs from Claude Code, and only from Claude Code.** Codex is
 a worker here, not a driver — it executes subagents, it does not run the
@@ -36,7 +69,7 @@ claude --model opus --effort high
 ```
 
 Zero dependencies. Plain Node ESM, no build step, no API keys — it drives the
-`codex` and `claude` CLIs you already have logged in.
+`codex` and `claude` CLIs you logged into above.
 
 ---
 

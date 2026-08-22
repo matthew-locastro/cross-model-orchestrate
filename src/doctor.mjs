@@ -22,6 +22,17 @@ const WARN = 'warn';
 const FAIL = 'FAIL';
 
 /**
+ * How to GET a CLI that is missing, as opposed to `upgradeCommand` below, which
+ * is how to freshen one you already have. A first run on a clean machine is the
+ * one moment every user passes through, and a warning that names the problem
+ * without naming the fix turns that moment into a support question.
+ */
+const INSTALL_COMMAND = {
+  codex: 'npm install -g @openai/codex',
+  claude: 'npm install -g @anthropic-ai/claude-code',
+};
+
+/**
  * How a CLI got onto this machine, so the upgrade advice is the command that
  * will actually work here. Guessing wrong is worse than not guessing: telling
  * a Homebrew user to run `npm install -g` leaves them with two copies and a
@@ -125,8 +136,13 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
     binaryVersion('codex'),
     binaryVersion('claude'),
   ]);
-  line(codexVersion ? OK : WARN, 'codex', codexVersion ?? 'not on PATH — codex dispatch unavailable');
-  line(claudeVersion ? OK : WARN, 'claude', claudeVersion ?? 'not on PATH — claude dispatch unavailable');
+  const todo = []; // what a human has to type to finish setup, in order
+  line(codexVersion ? OK : WARN, 'codex',
+    codexVersion ?? `not on PATH — ${INSTALL_COMMAND.codex}`);
+  line(claudeVersion ? OK : WARN, 'claude',
+    claudeVersion ?? `not on PATH — ${INSTALL_COMMAND.claude}`);
+  if (!codexVersion) todo.push([INSTALL_COMMAND.codex, 'the vendor cmo prefers — without it every dispatch fails over']);
+  if (!claudeVersion) todo.push([INSTALL_COMMAND.claude, 'the orchestrator itself runs here']);
   if (!codexVersion && !claudeVersion) {
     line(FAIL, 'at least one provider', 'install codex or claude and log in');
   }
@@ -150,7 +166,14 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
       line(WARN, 'claude oauth', 'token expired — run `claude` once to refresh');
     } else line(OK, 'claude oauth', config.claudeCredentials);
   } catch {
-    line(WARN, 'claude oauth', `unreadable: ${config.claudeCredentials}`);
+    // Three different situations produce the same ENOENT, and they have three
+    // different remedies. Saying only "unreadable" makes the reader guess.
+    if (!claudeVersion) {
+      line(WARN, 'claude oauth', 'no claude CLI yet, so there are no credentials to read');
+    } else {
+      line(WARN, 'claude oauth', `not logged in — run \`claude\` once (expected ${config.claudeCredentials})`);
+      todo.push(['claude', 'log in, then quit — this writes the credentials the meter reads']);
+    }
   }
 
   log('\nfleet');
@@ -171,6 +194,16 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
     const p = limits[provider];
     if (!p.available) {
       line(WARN, provider, p.error ?? 'unavailable');
+      // A dark meter is not cosmetic: routing runs off it, so every decision
+      // below it is a guess. Whoever reads this line needs the remedy on it.
+      const error = String(p.error ?? '');
+      if (provider === 'codex' && /rollout|session/i.test(error)) {
+        log('       run codex once and send it a message — that writes the session file');
+        log('       this is read from; no session, no meter.');
+        if (codexVersion) todo.push(['codex', 'send it one message, then quit — writes the session cmo meters']);
+      } else if (provider === 'claude' && /ENOENT|credential|expired|oauth/i.test(error)) {
+        log('       run claude once to log in; the meter reads its stored credentials.');
+      }
       continue;
     }
     const windows = p.windows.map((w) => `${w.label} ${w.percentUsed}%`).join('  ');
@@ -249,5 +282,21 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
   if (failures) log(`${failures} failure(s), ${warnings} warning(s). Fix the failures before running a fan-out.`);
   else if (warnings) log(`no failures, ${warnings} warning(s). Anything marked "warn" degrades gracefully.`);
   else log('everything checks out.');
+
+  // Setup steps are a different thing from warnings, and collapsing them was a
+  // real defect: a clean machine reported "4 warnings, degrades gracefully"
+  // when what it meant was "you have installed one third of this". Degrading
+  // gracefully onto a single vendor is precisely the state this tool exists to
+  // get you out of, so say so, in the order the steps have to be typed.
+  if (todo.length) {
+    const width = Math.max(...todo.map(([cmd]) => cmd.length));
+    log('');
+    log('to finish setup');
+    log('  cmo drives the vendor CLIs, it does not replace them. Until both read,');
+    log('  work runs on one vendor and cross-vendor grading cannot happen.');
+    log('');
+    todo.forEach(([cmd, why], i) => log(`    ${i + 1}. ${cmd.padEnd(width + 2)}# ${why}`));
+    log(`    ${todo.length + 1}. cmo doctor${' '.repeat(Math.max(1, width - 8))}# should come back all ok`);
+  }
   return failures === 0 ? 0 : 1;
 }

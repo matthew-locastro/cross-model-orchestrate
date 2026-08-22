@@ -35,11 +35,16 @@ export function nextSteps({ version = '', done = null, stream = process.stdout }
       'Wires the skill and the codex-runner subagent into Claude Code,',
       'Codex, Kilo and OpenCode. npm gave you the CLI and nothing else.',
     ]),
-    ...step(2, 'claude --model opus --effort high', [
+    ...step(2, 'cmo doctor', [
+      'Checks that both vendor CLIs are installed and logged in — cmo',
+      'drives them, it does not replace them. Names the exact command',
+      'for anything missing, so run it before your first dispatch.',
+    ]),
+    ...step(3, 'claude --model opus --effort high', [
       'The orchestrator does the least typing and the most deciding, so',
       'give it the good model. Subagents get cheap tiers automatically.',
     ]),
-    ...step(3, '/cross-model-orchestrate <what you want built>', [
+    ...step(4, '/cross-model-orchestrate <what you want built>', [
       "Runs it on Claude Code's dynamic-workflow tooling, fanning out to",
       'subagents on Codex as well as Claude — and grading every artifact',
       'on the vendor that did not produce it.',
@@ -47,8 +52,8 @@ export function nextSteps({ version = '', done = null, stream = process.stdout }
     `  ${dim('The orchestration runs from Claude Code only. Codex does the work,')}`,
     `  ${dim('it does not do the deciding.')}`,
     '',
-    `  ${cyan('cmo doctor')}   ${dim('check both CLIs, auth, model IDs, headroom, install')}`,
     `  ${cyan('cmo limits')}   ${dim("what's left on each subscription — costs nothing")}`,
+    `  ${cyan('cmo report')}   ${dim('what recent dispatches actually did, ranked as findings')}`,
     '',
   ].join('\n');
 }
