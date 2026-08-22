@@ -140,6 +140,49 @@ export function childEnv(base = process.env) {
   return env;
 }
 
+// ── termination ───────────────────────────────────────────────────────────
+//
+// Killing the orchestrator used to leave the vendor CLI running. Measured: two
+// `codex exec` processes outlived their parent by minutes, still billing, still
+// writing output files, with nothing left to receive the result. For a tool
+// whose whole purpose is managing scarce quota, "I stopped the run and it kept
+// spending" is a defect, not a quirk.
+//
+// So a dispatcher that is asked to stop takes its child with it, and hands back
+// the headroom it had reserved. SIGKILL is still unstoppable — nothing can run
+// on SIGKILL — but that is the operator choosing violence; SIGTERM and SIGINT
+// are the ordinary ways a run is stopped, and those are covered.
+
+const liveChildren = new Set();
+const liveTickets = new Set();
+const SIGNUM = { SIGINT: 2, SIGTERM: 15, SIGHUP: 1 };
+let signalsWired = false;
+
+function wireSignals() {
+  if (signalsWired || process.env.CMO_NO_SIGNAL_TRAP) return;
+  signalsWired = true;
+  for (const sig of Object.keys(SIGNUM)) {
+    process.on(sig, () => { shutdown(sig); });
+  }
+}
+
+async function shutdown(sig) {
+  for (const child of liveChildren) {
+    try { child.kill('SIGTERM'); } catch { /* already gone */ }
+  }
+  setTimeout(() => {
+    for (const child of liveChildren) {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    }
+  }, 2_000).unref?.();
+
+  // Give back the headroom, or every other orchestrator on the box keeps
+  // counting this dispatch until the lease expires.
+  await Promise.all([...liveTickets].map((id) => releaseReservation(id).catch(() => {})));
+
+  setTimeout(() => process.exit(128 + (SIGNUM[sig] ?? 15)), 2_200).unref?.();
+}
+
 // ── process execution ─────────────────────────────────────────────────────
 
 function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env }) {
@@ -155,6 +198,8 @@ function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env }) {
       resolve({ code: null, signal: null, timedOut: false, stdout: '', stderr: String(err) });
       return;
     }
+
+    liveChildren.add(child);
 
     let stdout = '';
     let stderr = '';
@@ -175,6 +220,7 @@ function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env }) {
     child.on('error', (err) => {
       if (settled) return;
       settled = true;
+      liveChildren.delete(child);
       clearTimeout(killTimer);
       resolve({ code: null, signal: null, timedOut, stdout, stderr: `${stderr}\n${err.message}` });
     });
@@ -182,6 +228,7 @@ function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env }) {
     child.on('close', (code, signal) => {
       if (settled) return;
       settled = true;
+      liveChildren.delete(child);
       clearTimeout(killTimer);
       resolve({ code, signal, timedOut, stdout, stderr });
     });
@@ -334,6 +381,7 @@ export async function runAgent(decision, prompt, opts = {}) {
     now = () => Date.now(),
   } = opts;
 
+  wireSignals();
   const startedAt = now();
   // Every dispatch gets a receipt, so a caller can tell a real one from a shim
   // that answered by itself. See audit.mjs.
@@ -402,6 +450,7 @@ export async function runAgent(decision, prompt, opts = {}) {
           // expires on its own. One timeout of slack covers a retry.
           leaseMs: timeoutMs * 2 + 60_000,
         }).catch(() => null);
+        if (ticket) liveTickets.add(ticket);
 
         let result;
         try {
@@ -414,7 +463,10 @@ export async function runAgent(decision, prompt, opts = {}) {
             env: childEnv(),
           });
         } finally {
-          if (ticket) await releaseReservation(ticket).catch(() => {});
+          if (ticket) {
+            liveTickets.delete(ticket);
+            await releaseReservation(ticket).catch(() => {});
+          }
         }
 
         let text = '';
