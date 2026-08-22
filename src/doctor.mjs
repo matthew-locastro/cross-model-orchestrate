@@ -59,19 +59,34 @@ async function binaryVersion(binary) {
  * stale model ID before it costs a failed agent halfway through a run.
  */
 async function codexKnownModels() {
-  for (const path of [
-    join(process.env.CODEX_HOME ?? join(process.env.HOME ?? '', '.codex'), 'models_cache.json'),
-  ]) {
+  const path = join(process.env.CODEX_HOME ?? join(process.env.HOME ?? '', '.codex'), 'models_cache.json');
+  try {
+    const raw = await readFile(path, 'utf8');
+    const ids = new Set();
+    for (const match of raw.matchAll(/"(gpt-[a-z0-9.\-]+)"/gi)) ids.add(match[1]);
+    if (!ids.size) return null;
+    // How old the list is matters as much as what is in it. A cache written
+    // before a model family launched reports that family missing on an account
+    // that has it, which sends people to upgrade a CLI that is already current.
+    let ageDays = null;
     try {
-      const raw = await readFile(path, 'utf8');
-      const ids = new Set();
-      for (const match of raw.matchAll(/"(gpt-[a-z0-9.\-]+)"/gi)) ids.add(match[1]);
-      if (ids.size) return ids;
-    } catch {
-      /* no cache — not an error, just no cross-check */
-    }
+      ageDays = Math.floor((Date.now() - (await stat(path)).mtimeMs) / 86_400_000);
+    } catch { /* age is a nicety */ }
+    return { ids, ageDays };
+  } catch {
+    return null; /* no cache — not an error, just no cross-check */
   }
-  return null;
+}
+
+/** More than one binary of the same name on PATH is a coin toss at dispatch time. */
+async function shadowed(binary) {
+  try {
+    const { stdout } = await execFileAsync(process.platform === 'win32' ? 'where' : 'which', ['-a', binary]);
+    const paths = [...new Set(stdout.trim().split('\n').filter(Boolean))];
+    return paths.length > 1 ? paths : null;
+  } catch {
+    return null;
+  }
 }
 
 async function skillLocations(skillName) {
@@ -116,6 +131,15 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
     line(FAIL, 'at least one provider', 'install codex or claude and log in');
   }
 
+  for (const binary of ['codex', 'claude']) {
+    const paths = await shadowed(binary);
+    if (paths) {
+      // Which one runs depends on PATH, and an agent's PATH is rarely a login
+      // shell's. doctor could check one binary while dispatches use another.
+      line(WARN, `${binary} is shadowed`, `${paths.length} on PATH: ${paths.join('  ')}`);
+    }
+  }
+
   log('\nauth');
   try {
     const raw = JSON.parse(await readFile(config.claudeCredentials, 'utf8'));
@@ -156,7 +180,8 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
   const missingCodexModels = [];
   log('\nmodels');
   log(`  ${config.configFileFound ? 'from' : 'defaults; no config at'} ${config.configFile}`);
-  const known = await codexKnownModels();
+  const cache = await codexKnownModels();
+  const known = cache?.ids ?? null;
   for (const provider of ['codex', 'claude']) {
     for (const tier of TIERS) {
       const spec = config.models[provider][tier];
@@ -186,7 +211,17 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
     log('');
     log(`  ${missingCodexModels.length} configured codex model(s) are unavailable here.`);
     log(`  This codex CLI (${codexVersion ?? 'unknown version'}) offers: ${offered.join(', ')}`);
-    log('  Fix it either way:');
+    // A stale cache is by far the likeliest cause, and the one whose remedy
+    // looks nothing like the others.
+    if (cache?.ageDays != null && cache.ageDays > 7) {
+      log(`  Your codex model list was cached ${cache.ageDays} days ago, which is the`);
+      log('  likeliest cause — a list written before a model family launched reports');
+      log('  it missing on an account that has it. Refresh it by running codex once:');
+      log('    echo hi | codex exec --skip-git-repo-check --cd /tmp -');
+      log('  then re-run cmo doctor. Upgrading the CLI does NOT refresh this.');
+      log('');
+    }
+    log('  Otherwise:');
     const upgrade = await upgradeCommand('codex');
     log(upgrade
       ? `    ${upgrade}${' '.repeat(Math.max(1, 38 - upgrade.length))}# if the CLI is simply old`
