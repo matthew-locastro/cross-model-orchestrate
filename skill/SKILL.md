@@ -205,8 +205,12 @@ const verdict = await agent(
 );
 ```
 
-`codex-runner` is a Haiku shim with `Bash` only: it runs `cmo run` and returns
-the result verbatim.
+`codex-runner` is a Haiku shim with `Bash` only: it copies the whole block to a
+file, runs `cmo run --dispatch <file>`, and returns the result verbatim. It does
+not retype the parameters as flags — an earlier version did, and dropped
+`--independent-of` on one dispatch in four, which turned a cross-vendor review
+into an unlabelled same-vendor one. Keep the `DISPATCH` header in the prompt;
+`cmo` parses it.
 
 **Dispatch through the shim by default. A plain `agent()` needs a reason.**
 

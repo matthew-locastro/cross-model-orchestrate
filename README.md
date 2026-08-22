@@ -285,8 +285,15 @@ codex   ok        plan=pro
 
 Workflow scripts have no shell, so a Codex subagent is reached through a shim
 agent that does — `agentType: 'codex-runner'`, installed by `cmo install`. It's
-Haiku with `Bash` only; it runs `cmo run` and returns the result verbatim, at a
-cost that's a rounding error against the agent it dispatches.
+Haiku with `Bash` only; it copies the block to a file, runs
+`cmo run --dispatch <file>`, and returns the result verbatim, at a cost that's a
+rounding error against the agent it dispatches.
+
+The shim copies rather than transcribes on purpose. An earlier version read the
+parameters out of the prompt and retyped them as flags; on the first real
+fan-out one agent in four dropped `--independent-of codex`, so a review of
+Codex's work went back to Codex and returned a verdict with no label on it.
+Copying a block is reliable; transcribing eight parameters is not.
 
 ```js
 const verdict = await agent(

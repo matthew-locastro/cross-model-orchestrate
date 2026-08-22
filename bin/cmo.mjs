@@ -21,6 +21,7 @@ import { doctor } from '../src/doctor.mjs';
 import { install, uninstall } from '../src/install.mjs';
 import { createCoordinator, DEFAULT_PORT } from '../src/server.mjs';
 import { fleetConfig, health } from '../src/remote.mjs';
+import { mergeDispatch, parseDispatchFile } from '../src/dispatch-file.mjs';
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -162,6 +163,9 @@ task options (plan, run)
   --model           exact model id, bypassing the tier map
 
 run options
+  --dispatch        a file holding a DISPATCH header and a TASK body. Preferred:
+                    the parameters travel WITH the task, so nothing has to be
+                    retyped as flags and nothing can be dropped in the retyping.
   --prompt-file     read the prompt from a file (else stdin, else --prompt)
   --schema          JSON Schema file; the result is validated and returned parsed
   --cwd             working directory for the subagent  (default: cwd)
@@ -246,8 +250,12 @@ async function main() {
   }
 
   if (command === 'plan') {
-    const limits = await readLimits({ refresh: Boolean(args.refresh) });
-    const decision = decide(taskFromArgs(args), limits);
+    let planArgs = args;
+    if (typeof args.dispatch === 'string') {
+      planArgs = mergeDispatch(args, parseDispatchFile(await readFile(args.dispatch, 'utf8')).meta);
+    }
+    const limits = await readLimits({ refresh: Boolean(planArgs.refresh) });
+    const decision = decide(taskFromArgs(planArgs), limits);
     if (args.human) {
       if (!decision.ok) {
         process.stdout.write(`DEFER — ${decision.reason}\nresume after ${decision.resumeAfter ?? 'unknown'}\n`);
@@ -272,31 +280,49 @@ async function main() {
   }
 
   if (command === 'run') {
-    const prompt = (await readPrompt(args)).trim();
+    // A dispatch file carries its own parameters, so the caller never has to
+    // transcribe them onto the command line — the failure mode that silently
+    // turned a cross-vendor review into a same-vendor one.
+    let runArgs = args;
+    let prompt;
+    if (typeof args.dispatch === 'string') {
+      const parsed = parseDispatchFile(await readFile(args.dispatch, 'utf8'));
+      runArgs = mergeDispatch(args, parsed.meta);
+      prompt = parsed.task;
+      if (parsed.unknown.length) {
+        process.stderr.write(`cmo run: ignoring unknown dispatch keys: ${parsed.unknown.join(', ')}\n`);
+      }
+      if (!prompt) {
+        process.stderr.write(`cmo run: ${args.dispatch} has no TASK section\n`);
+        return 2;
+      }
+    } else {
+      prompt = (await readPrompt(args)).trim();
+    }
     if (!prompt) {
       process.stderr.write('cmo run: no prompt (use --prompt-file, --prompt, or stdin)\n');
       return 2;
     }
-    const limits = await readLimits({ refresh: Boolean(args.refresh) });
-    const decision = decide(taskFromArgs(args), limits);
+    const limits = await readLimits({ refresh: Boolean(runArgs.refresh) });
+    const decision = decide(taskFromArgs(runArgs), limits);
     if (!decision.ok) {
       process.stdout.write(`${JSON.stringify({ ok: false, deferred: true, ...decision }, null, 2)}\n`);
       return 3;
     }
 
     let schema = null;
-    if (typeof args.schema === 'string') {
-      schema = JSON.parse(await readFile(args.schema, 'utf8'));
+    if (typeof runArgs.schema === 'string') {
+      schema = JSON.parse(await readFile(runArgs.schema, 'utf8'));
     }
 
     const envelope = await runAgent(decision, prompt, {
-      cwd: args.cwd ? String(args.cwd) : process.cwd(),
-      timeoutMs: args.timeout ? Number(args.timeout) * 1000 : DEFAULT_TIMEOUT_MS,
-      maxAttempts: args.attempts ? Number(args.attempts) : 3,
+      cwd: runArgs.cwd ? String(runArgs.cwd) : process.cwd(),
+      timeoutMs: runArgs.timeout ? Number(runArgs.timeout) * 1000 : DEFAULT_TIMEOUT_MS,
+      maxAttempts: runArgs.attempts ? Number(runArgs.attempts) : 3,
       schema,
-      failover: !args['no-failover'],
-      fullAccess: Boolean(args['full-access']),
-      sandbox: args.sandbox ? String(args.sandbox) : 'workspace-write',
+      failover: !runArgs['no-failover'],
+      fullAccess: Boolean(runArgs['full-access']),
+      sandbox: runArgs.sandbox ? String(runArgs.sandbox) : 'workspace-write',
     });
 
     process.stdout.write(`${JSON.stringify({ ...envelope, decision: { weight: decision.weight, tier: decision.tier, reason: decision.reason, notes: decision.notes } }, null, 2)}\n`);
