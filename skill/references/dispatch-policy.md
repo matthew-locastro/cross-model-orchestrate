@@ -167,3 +167,23 @@ echo "Reply with the single word: pong" \
 
 Both must return `"ok": true` with a populated `usage` block. A failure here is
 almost always a renamed flag, not a broken policy.
+
+One more that only a live run can prove — a stopped dispatcher must take its
+vendor process with it, or a cancelled run carries on billing:
+
+```bash
+cmo run --dispatch /tmp/slow-task.md &    # something that takes a while
+CMO=$!
+sleep 12 && pgrep -x codex | wc -l        # >0, and one reservation is held
+kill -TERM $CMO
+sleep 4  && pgrep -x codex | wc -l        # back down, reservation released
+```
+
+SIGKILL is not covered and cannot be — nothing runs on SIGKILL. SIGTERM and
+SIGINT are the ordinary ways a run stops, and those release cleanly.
+
+> **Kill by PID, never by pattern.** `pgrep -f 'codex exec'` matches the shell
+> you typed it in, and `pgrep -x codex` matches every Codex session on the
+> machine — including ones you did not start. Capture the PID when you launch
+> the thing. Both mistakes were made while testing this, and the second one
+> killed unrelated sessions.
