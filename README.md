@@ -238,12 +238,24 @@ at it:
 ```bash
 # on whichever machine is always up
 export CMO_FLEET_TOKEN=$(head -c 32 /dev/urandom | base64 | tr -d '=+/')
-cmo serve --host 0.0.0.0          # or a tailnet address
-
-# on every box, including that one
-export CMO_FLEET_URL=http://<reachable-host>:7867
-export CMO_FLEET_TOKEN=<the same token>
+cmo serve --host <tailnet-address>      # never a public interface
 ```
+
+On every other box, write the config file rather than exporting variables — it
+persists across shells, and there is no `export` keyword to drop. (Setting three
+env vars by hand is how the first real fleet join failed: two of the three lines
+lost their `export` and the token never reached the process.)
+
+```bash
+mkdir -p ~/.config/cross-model-orchestrate
+cat > ~/.config/cross-model-orchestrate/config.json <<'EOF'
+{"fleet":{"url":"http://<reachable-host>:7867","token":"<the same token>","nodeId":"<this-box>"}}
+EOF
+cmo doctor
+```
+
+`CMO_FLEET_URL` / `CMO_FLEET_TOKEN` / `CMO_NODE_ID` still work and still win
+over the file, which is useful for a one-off or in CI.
 
 Now `cmo limits` is a fleet view:
 
