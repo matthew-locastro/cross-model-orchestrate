@@ -1,6 +1,6 @@
 {
   "name": "cross-model-orchestrate",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "Run agent fan-outs across two AI subscriptions at once: pick each subagent's model by complexity, length and token efficiency against live usage limits, spend Codex before Claude, and always grade work on the vendor that did not produce it.",
   "type": "module",
   "bin": {
