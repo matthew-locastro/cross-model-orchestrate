@@ -45,6 +45,7 @@ What landed after the phases were validated, and what it invalidates.
 | 0.1.16 | `cmo report` — reads the dispatch log back as findings | 07 (this is the soak's instrument) |
 | 0.1.17 | a dark meter outranks every other finding | 07 |
 | 0.1.18 | **an expired Claude OAuth token repairs itself** | **00, 01, 02, 03** |
+| 0.1.19 | **the classifier no longer greps the agent's work product** | **01, 02** |
 
 0.1.18 is the one to take seriously. It puts a **subprocess spawn inside the
 limits probe** — the probe that 00 gates on, that 01 depends on for every routing
@@ -335,6 +336,42 @@ Only after 01–07 pass **on the build you are actually publishing**.
 Gate:
 - Every phase above passed against **this** version.
 - `npm view cross-model-orchestrate version` matches the local build.
+
+---
+
+## The bug this file was written one day too early to include
+
+Found 2026-08-22, after 00–05 had passed and while the soak was running. Worth
+reading before trusting any earlier phase result.
+
+`classifyFailure` decided what a dispatch's outcome was by running error regexes
+over **stderr and stdout together**. An agent's stdout is its *work product*. An
+agent writing web code emits `401`, `429` and `503` as content; any agent at all
+emits three-digit numbers, and `5\d\d` matched every one of them from 500 to 599.
+
+Two real dispatches ran to completion on Codex — 20 and 23 minutes, one of them
+6.5M tokens, both ending in `task_complete` with a full final message in the
+session rollout — and were discarded and re-run on Claude. One matched `429` and
+`401` while building a storefront; the other matched `rate-limit` and `403` while
+editing a test file. Both receipts read `error: "exit 0"`.
+
+Three things make this the most instructive failure in the project so far:
+
+- **It inverted the product's whole purpose.** The tool exists to move work onto
+  Codex. This moved completed Codex work back onto Claude, and billed both.
+- **It was invisible from inside.** Exit 0, empty stderr, a receipt saying
+  failure. Read from outside, that is indistinguishable from a broken Codex CLI —
+  and a 15-agent adversarial review was run entirely on Claude, its independence
+  caveat blaming a CLI that was working perfectly.
+- **The phases would not have caught it.** Phase 01's fan-out writes glossary
+  definitions; phase 02's failure injection uses short, controlled prompts.
+  Neither produces an agent that writes an HTTP status code. It needed real work.
+
+**Add to phase 01's gate:** at least one agent whose output legitimately contains
+`401`, `429`, `503` and a number in the 500s — have it write a fetch wrapper with
+error handling — and confirm its receipt reads `ok: true`. Then check no receipt
+in the run carries `error: "exit 0"`, which is the signature: clean exit, empty
+stderr, failed anyway.
 
 ---
 

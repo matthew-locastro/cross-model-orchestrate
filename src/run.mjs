@@ -48,17 +48,39 @@ const MAX_BACKOFF_MS = 60_000;
 // ── failure classification ────────────────────────────────────────────────
 
 const RATE_LIMIT_RE = /\b(rate[ _-]?limit|usage limit|quota exceeded|429|too many requests|out of (?:credits|usage)|limit reached)\b/i;
-const TRANSIENT_RE = /\b(ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|network error|stream (?:closed|error)|5\d\d\b|overloaded|temporarily unavailable|service unavailable)\b/i;
+// 5\d\d matched any number from 500 to 599 — line numbers, byte counts, pixel
+// values, durations. Name the statuses that actually mean "retry" instead.
+const TRANSIENT_RE = /\b(ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|network error|stream (?:closed|error)|5(?:00|02|03|04|29)\b|overloaded|temporarily unavailable|service unavailable)\b/i;
 const AUTH_RE = /\b(unauthori[sz]ed|401|403|invalid[ _-]?api[ _-]?key|not logged in|please (?:run )?(?:codex )?login|token (?:has )?expired|re-?authenticate)\b/i;
 
 /**
  * Decide what a failed attempt was. The classification drives everything: a
  * rate limit fails over, a transient error backs off, and anything else fails
  * fast so a broken prompt does not cost three runs of the same mistake.
+ *
+ * `hasOutput` is the guard that makes any of this safe, and it was missing for
+ * eighteen releases. An agent's stdout is its WORK PRODUCT, not a log. An agent
+ * writing web code emits "401", "429" and "503" as content; an agent writing
+ * anything at all emits three-digit numbers. Grepping that for error signatures
+ * declares completed work a failure.
+ *
+ * It did. Two real dispatches on 2026-08-22 ran to completion on Codex — 20 and
+ * 23 minutes, one of them 6.5M tokens, both with `task_complete` and a full
+ * final message in the session rollout — and were thrown away and re-run on
+ * Claude because the first matched "429" and "401" while building a storefront,
+ * and the second matched "rate-limit" and "403" while editing a test file. Both
+ * receipts read `error: "exit 0"`: exit code zero, empty stderr, discarded
+ * anyway. Read from the outside that looks exactly like a broken Codex CLI, and
+ * it was read that way.
+ *
+ * So: a process that exited cleanly and produced output SUCCEEDED, whatever
+ * words are in it. Only when there is no usable output is stdout worth reading
+ * as a log — that is the case where a CLI printed its error there and exited.
  */
-export function classifyFailure({ code, signal, timedOut, stderr = '', stdout = '' }) {
+export function classifyFailure({ code, signal, timedOut, stderr = '', stdout = '', hasOutput = false }) {
   if (timedOut) return 'timeout';
-  const text = `${stderr}\n${stdout}`;
+  if (code === 0 && !signal && hasOutput) return 'none';
+  const text = hasOutput ? stderr : `${stderr}\n${stdout}`;
   if (RATE_LIMIT_RE.test(text)) return 'rate-limit';
   if (AUTH_RE.test(text)) return 'auth';
   if (TRANSIENT_RE.test(text)) return 'transient';
@@ -500,7 +522,7 @@ export async function runAgent(decision, prompt, opts = {}) {
           usage = parsed.usage;
         }
 
-        const failure = classifyFailure(result);
+        const failure = classifyFailure({ ...result, hasOutput: text.length > 0 });
         const succeeded = failure === 'none' && text.length > 0;
 
         attempts.push({

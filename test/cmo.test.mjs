@@ -376,6 +376,36 @@ test('failures are classified so the right recovery runs', () => {
   assert.equal(classifyFailure({ code: 1, stderr: 'ECONNRESET while streaming' }), 'transient');
   assert.equal(classifyFailure({ code: 1, stderr: 'Please run codex login' }), 'auth');
   assert.equal(classifyFailure({ code: 2, stderr: 'unknown flag --nope' }), 'fatal');
+
+  // The regression that cost two completed 20-minute Codex runs: an agent's
+  // stdout is its work product, and a storefront full of HTTP status codes is
+  // not a rate limit. A clean exit with output is a success, whatever it says.
+  const workProduct = 'return new Response(null, { status: 429 }); // 401 and 403 handled above; retry after 503';
+  assert.equal(
+    classifyFailure({ code: 0, stdout: workProduct, stderr: '', hasOutput: true }),
+    'none',
+    'completed work must not be reclassified as a failure by its own contents',
+  );
+  assert.equal(
+    classifyFailure({ code: 0, stdout: 'edited line 510 of 567', stderr: '', hasOutput: true }),
+    'none',
+    '5xx-looking numbers in ordinary prose are not transient errors',
+  );
+  // Real CLI failures still classify, because they land on stderr.
+  assert.equal(
+    classifyFailure({ code: 1, stderr: 'HTTP error: 401 Unauthorized', stdout: workProduct, hasOutput: true }),
+    'auth',
+    'stderr is still read when the process actually failed',
+  );
+  // And when there is no output at all, stdout is a log again — some CLIs
+  // print their error there and exit.
+  assert.equal(
+    classifyFailure({ code: 1, stdout: 'You have hit your usage limit', stderr: '', hasOutput: false }),
+    'rate-limit',
+  );
+  // 5xx narrowed to the statuses that actually mean retry.
+  assert.equal(classifyFailure({ code: 1, stderr: 'HTTP 503 from upstream' }), 'transient');
+  assert.equal(classifyFailure({ code: 1, stderr: 'compilation failed at offset 555' }), 'fatal');
 });
 
 test('backoff grows and stays bounded', () => {
