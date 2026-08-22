@@ -25,7 +25,7 @@ and it no longer proves what it proved.
 | Phase | What it buys | Passed against | Re-run needed |
 |---|---|---|---|
 | 00 Freeze the build | You are testing what you publish | **0.1.19** | Done 2026-08-22 — re-run before ship |
-| 01 One real fan-out | The core product claim | 0.1.8 | **Yes** |
+| 01 One real fan-out | The core product claim | **0.1.19** | Passed 2026-08-22 — see below |
 | 02 Make it fail on purpose | Failure paths are real, not described | 0.1.8 | **Yes** |
 | 03 Width and contention | Sixteen real agents on one ledger | ~0.1.8–0.1.11 | **Yes** |
 | 04 Interrupt it | Resume is a real property | ~0.1.11 | **Yes** |
@@ -150,6 +150,63 @@ Gate:
 Watch the clock, not just the output. Note wall-clock against summed agent time.
 Roughly equal means the work ran sequentially and the fan-out bought nothing —
 a finding, not a failure.
+
+#### 01 re-run, 2026-08-22 · PASSED against 0.1.19
+
+Five dispatches, zero failures, `cmo audit --expected 5` reports zero
+undispatched. Independently verified, not taken from the session's own summary.
+
+| Gate | Result |
+|---|---|
+| Codex dispatches > 0 | 3 |
+| Majority on Codex | 60% — 3 codex `gpt-5.6-terra`, 2 claude `sonnet` |
+| Every review reports independence | both judges `cross-vendor`, neither degraded |
+| No `DISPATCH_FAILED` | 0 failures, 0 retries, 0 failovers |
+| The grader rejected something | B promoted twice, A four times — it discriminated |
+| `cmo audit` shows no gap | `--expected 5` → `undispatched: 0` |
+| **New:** an agent emitting HTTP status codes survives | **confirmed — see below** |
+
+The promoted definitions are all inside the 40–60 word bound (48/50/46/49/49/52),
+checked against `glossary.md` rather than believed.
+
+**The sub-gate that mattered.** One agent's `task_complete` message carried
+`401`, `429`, `500`, `503` and `599` — it wrote a fetch wrapper — and its receipt
+reads `ok: true, attempts: 1, failures: []`. On 0.1.18 that run is classified
+`rate-limit`, discarded, and re-billed to the other vendor. **The classifier fix
+is now proven against a real agent rather than a unit test**, which is the single
+thing the drift ledger most needed. No receipt in the run reads `error: "exit 0"`.
+
+**Why 60% and not higher, and why that is correct.** The session deliberately put
+*both* candidate sets on Codex. Split them across vendors and no grader can be
+cross-vendor to both, and a Claude grader ends up judging its own house style
+against a rival's. Worth stating plainly because two gates pull against each
+other on a small fan: "majority on Codex" and "review is cross-vendor" compete
+for the same five slots. On a fan this size, 60% is the honest ceiling.
+
+**Two findings the phase surfaced, neither fatal:**
+
+- **Claude's per-agent cost is never measured.** `recordSample` is called on the
+  Codex path only (`run.mjs:512`); `state.json` holds 40 codex samples and no
+  claude key, so Claude permanently falls back to the configured default of 1
+  point while Codex's measured cost is 0.19. Every Claude agent therefore
+  reserves roughly **five times** what it spends, and a concurrent fan-out defers
+  Claude work that had headroom all along. The Codex harvest is free because the
+  exec stream carries rate limits; Claude's equivalent probe is an HTTP GET to
+  the OAuth usage endpoint, so this looks unimplemented rather than principled.
+- **Claude input tokens are undercounted in receipts.** `run.mjs:569` reads
+  `usage.input_tokens` alone, which excludes `cache_creation_input_tokens` and
+  `cache_read_input_tokens`. Both judges — which each read two full candidate
+  sets — recorded `tokens: {in: 2}`. Reporting only: routing and reservations run
+  off meter deltas, not token counts. But any vendor cost comparison drawn from
+  these receipts is wrong in Claude's favour by orders of magnitude, and "token
+  efficiency" is one of the factors this product advertises routing on.
+
+**On the clock**, as the phase asks: 188.7s of summed agent time inside a
+17m38s session. The agents did run concurrently — three candidates in one wave,
+two graders in the next — so the fan-out worked; the serial orchestrator between
+waves is what dominated. Fan-out pays when per-agent work is long relative to
+session-side composition, and a six-term glossary is not that. A finding, not a
+failure.
 
 ### 02 — Make it fail on purpose · ~20 min
 
