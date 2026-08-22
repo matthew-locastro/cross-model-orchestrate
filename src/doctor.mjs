@@ -6,7 +6,7 @@
 // usage endpoint that will not answer. Check all five and say which.
 
 import { execFile } from 'node:child_process';
-import { readFile, lstat, readlink } from 'node:fs/promises';
+import { readFile, lstat, readlink, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -20,6 +20,30 @@ const execFileAsync = promisify(execFile);
 const OK = 'ok';
 const WARN = 'warn';
 const FAIL = 'FAIL';
+
+/**
+ * How a CLI got onto this machine, so the upgrade advice is the command that
+ * will actually work here. Guessing wrong is worse than not guessing: telling
+ * a Homebrew user to run `npm install -g` leaves them with two copies and a
+ * PATH puzzle.
+ */
+async function upgradeCommand(binary) {
+  if (binary === 'claude') return 'claude update'; // it ships its own updater
+  // node's own resolver rather than `readlink -f`, which BSD/macOS did not
+  // have for years — and macOS is exactly where this advice gets read.
+  let real = '';
+  try {
+    const { stdout } = await execFileAsync(process.platform === 'win32' ? 'where' : 'which', [binary]);
+    real = await realpath(stdout.trim().split('\n')[0]);
+  } catch {
+    return null;
+  }
+  if (/[/\\]node_modules[/\\]@openai[/\\]codex[/\\]/.test(real)) {
+    return 'npm install -g @openai/codex@latest';
+  }
+  if (/[/\\](Cellar|homebrew)[/\\]/i.test(real)) return 'brew upgrade codex';
+  return null;
+}
 
 async function binaryVersion(binary) {
   try {
@@ -163,10 +187,16 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
     log(`  ${missingCodexModels.length} configured codex model(s) are unavailable here.`);
     log(`  This codex CLI (${codexVersion ?? 'unknown version'}) offers: ${offered.join(', ')}`);
     log('  Fix it either way:');
-    log('    npm install -g @openai/codex@latest      # if the CLI is simply old');
-    log(`    ${config.configFile}`);
+    const upgrade = await upgradeCommand('codex');
+    log(upgrade
+      ? `    ${upgrade}${' '.repeat(Math.max(1, 38 - upgrade.length))}# if the CLI is simply old`
+      : '    upgrade the codex CLI however you installed it');
+    log(`    edit ${config.configFile}`);
     log('      {"models":{"codex":{"fast":"<id>","balanced":"<id>","frontier":"<id>"}}}');
     log('  Or set CMO_CODEX_FAST / CMO_CODEX_BALANCED / CMO_CODEX_FRONTIER.');
+    log('');
+    log('  Nothing here upgrades anything for you: changing a vendor CLI mid-run');
+    log('  can change model ids under dispatches that are already in flight.');
   }
 
   log('\nskill install');
