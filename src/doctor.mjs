@@ -129,6 +129,7 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
     line(OK, provider, `${windows}${p.plan ? `  plan=${p.plan}` : ''}`);
   }
 
+  const missingCodexModels = [];
   log('\nmodels');
   log(`  ${config.configFileFound ? 'from' : 'defaults; no config at'} ${config.configFile}`);
   const known = await codexKnownModels();
@@ -140,13 +141,32 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
       let note = extra;
       if (provider === 'codex' && known && !known.has(spec.model)) {
         state = FAIL;
-        note = `${extra} — not in this account's codex model list`.trim();
+        note = `${extra} — this codex CLI does not offer it`.trim();
+        missingCodexModels.push(spec.model);
       }
       line(state, `${provider} ${tier}`, `${spec.model} ${note}`.trim());
     }
   }
   if (!known) {
     log('  (no codex model cache found — model IDs were not cross-checked)');
+  }
+
+  // A failure that does not say what to do about it is a support question.
+  // This one fires on almost every new machine, because an older codex CLI
+  // exposes different model IDs.
+  if (missingCodexModels.length) {
+    // The cache holds display names as well as ids ("GPT-5.6-Luna" beside
+    // "gpt-5.6-luna"). Only the lowercase ids are usable in config, and
+    // printing the other kind sends people to paste a string that will not work.
+    const offered = [...known].filter((m) => m === m.toLowerCase()).sort();
+    log('');
+    log(`  ${missingCodexModels.length} configured codex model(s) are unavailable here.`);
+    log(`  This codex CLI (${codexVersion ?? 'unknown version'}) offers: ${offered.join(', ')}`);
+    log('  Fix it either way:');
+    log('    npm install -g @openai/codex@latest      # if the CLI is simply old');
+    log(`    ${config.configFile}`);
+    log('      {"models":{"codex":{"fast":"<id>","balanced":"<id>","frontier":"<id>"}}}');
+    log('  Or set CMO_CODEX_FAST / CMO_CODEX_BALANCED / CMO_CODEX_FRONTIER.');
   }
 
   log('\nskill install');
