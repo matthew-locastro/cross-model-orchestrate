@@ -291,6 +291,55 @@ export function parseOAuthUsage(body) {
   return { windows, hardBlocked };
 }
 
+/**
+ * Claude's OAuth token is short-lived — hours, not days — and when it lapses the
+ * usage endpoint stops answering. The meter goes dark, headroom reads as
+ * unknown, and unknown is deliberately treated as usable: the tool keeps
+ * dispatching into a window it can no longer see. Over a multi-day soak that is
+ * the difference between a report and a fiction. It happened on the first
+ * morning of one.
+ *
+ * Finding the cheapest repair took measuring rather than guessing. Against a
+ * deliberately expired token, `claude auth status`, `claude doctor`,
+ * `claude agents list` and `claude mcp list` all leave it expired — they read
+ * the credentials file without authenticating. Only a real inference call
+ * refreshes it. So that is what this does, made as small as a turn can be:
+ *
+ *   haiku            the cheapest model on the account
+ *   empty cwd        no project CLAUDE.md, no git status, no directory context
+ *   --system-prompt  replaces the full agent preamble with one line
+ *   no skills        --disable-slash-commands skips plugin and skill loading
+ *
+ * That is a few hundred tokens against a five-hour window measured in millions,
+ * and it is spent only when the token has already lapsed. `--bare` would be
+ * cheaper still and is the obvious thing to reach for — but it deliberately
+ * never reads OAuth, so it refreshes nothing.
+ *
+ * Rate-limited to one attempt a minute per process: a fan-out of two hundred
+ * agents must not each spawn a CLI on a bad morning.
+ */
+let lastRefreshAttempt = 0;
+
+async function attemptTokenRefresh({ now = Date.now } = {}) {
+  if (now() - lastRefreshAttempt < 60_000) return false;
+  lastRefreshAttempt = now();
+  try {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const { tmpdir } = await import('node:os');
+    await promisify(execFile)('claude', [
+      '-p', 'ok',
+      '--model', 'claude-haiku-4-5-20251001',
+      '--system-prompt', 'Reply with the single word: ok',
+      '--disable-slash-commands',
+      '--no-session-persistence',
+    ], { timeout: 90_000, cwd: tmpdir() });
+    return true;
+  } catch {
+    return false; // no claude on PATH, or it failed — the caller reports honestly
+  }
+}
+
 async function readOAuthToken(credentialsPath) {
   const path = credentialsPath ?? loadConfig().claudeCredentials;
   const raw = await readFile(path, 'utf8');
@@ -306,10 +355,24 @@ async function readOAuthToken(credentialsPath) {
   return token;
 }
 
-export async function readClaudeLimits({ credentialsPath, fetchImpl } = {}) {
+export async function readClaudeLimits({ credentialsPath, fetchImpl, refresh = attemptTokenRefresh } = {}) {
   const doFetch = fetchImpl ?? globalThis.fetch;
   try {
-    const token = await readOAuthToken(credentialsPath);
+    let token;
+    try {
+      token = await readOAuthToken(credentialsPath);
+    } catch (err) {
+      // An expired token is the one failure worth trying to repair in place,
+      // because the alternative is a meter that stays dark for days.
+      if (!/expired/i.test(err?.message ?? '')) throw err;
+      const refreshed = await refresh();
+      if (!refreshed) throw new Error('claude oauth token expired and auto-refresh could not run — run `claude` once');
+      try {
+        token = await readOAuthToken(credentialsPath);
+      } catch {
+        throw new Error('claude oauth token expired and auto-refresh did not take — run `claude` once');
+      }
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     let response;

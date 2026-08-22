@@ -186,6 +186,34 @@ doesn't persist the rolling-window snapshot locally, so there's no offline
 alternative. If you're not comfortable with that call, `cmo` degrades gracefully:
 an unavailable probe reports `unknown` and is treated as usable.
 
+### The one exception: a lapsed OAuth token
+
+That token lives for hours, not days, and when it expires the usage endpoint
+stops answering. The meter goes dark — and because unknown headroom is treated
+as usable, a dark meter fails toward *over*-dispatching into a window nobody can
+see any more. On the first morning of a soak that is exactly what happened.
+
+So an expired token now repairs itself. Which repair is cheapest took measuring
+rather than guessing: against a deliberately expired token, `claude auth status`,
+`claude doctor`, `claude agents list` and `claude mcp list` all leave it expired
+— they read the credentials file without authenticating. Only a real inference
+call refreshes it.
+
+`cmo` therefore spends the smallest turn there is: Haiku, an empty working
+directory so no project `CLAUDE.md` or git status is loaded, a one-line system
+prompt in place of the agent preamble, and no skills. A few hundred tokens
+against a five-hour window measured in millions — and only when the token has
+already lapsed, at most once a minute. Measured end to end, a dark meter goes
+back to reporting in about seven seconds.
+
+(`--bare` is the obvious way to make it cheaper still, and it does not work: it
+deliberately never reads OAuth, so it refreshes nothing.)
+
+If the refresh can't run — no `claude` on `PATH` — nothing is hidden. The probe
+reports `claude oauth token expired and auto-refresh could not run`, and `cmo
+report` ranks a dark meter above every other finding, because every number
+underneath it was computed against headroom the tool could not see.
+
 ---
 
 ## Many orchestrators, two subscriptions
@@ -427,10 +455,12 @@ agent that runs your orchestration and it can act on the findings — adjust the
 tier map, change a role's complexity, re-grade the provisional verdicts — rather
 than you reading counts and guessing.
 
-What it looks for: failure rate and its commonest kind, retries as wasted spend,
-whether the fan-out actually reached Codex, how many reviews degraded to
-same-vendor, tiers whose p95 says the work never needed them, and a reservation
-cost that has drifted from what agents really consume.
+What it looks for, in order: a **dark meter** first — a provider whose headroom
+can no longer be read, which invalidates everything below it — then failure rate
+and its commonest kind, retries as wasted spend, whether the fan-out actually
+reached Codex, how many reviews degraded to same-vendor, tiers whose p95 says the
+work never needed them, and a reservation cost that has drifted from what agents
+really consume.
 
 It changes nothing on its own. Same posture as `doctor`: measure, recommend,
 let a person decide.
