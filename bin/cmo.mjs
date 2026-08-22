@@ -22,6 +22,7 @@ import { install, uninstall } from '../src/install.mjs';
 import { createCoordinator, DEFAULT_PORT } from '../src/server.mjs';
 import { fleetConfig, health } from '../src/remote.mjs';
 import { mergeDispatch, parseDispatchFile } from '../src/dispatch-file.mjs';
+import { readAudit, summarise } from '../src/audit.mjs';
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -126,6 +127,7 @@ setup
   serve       run the fleet coordinator so several machines share one view
 
 dispatch
+  audit       what was ACTUALLY dispatched — the receipt for a fan-out
   limits      report remaining subscription headroom for codex and claude
   plan        show which provider/model/effort a task would get, and why
   run         plan, then execute the subagent and print a JSON envelope
@@ -174,6 +176,12 @@ run options
   --no-failover     do not try the other vendor
   --full-access     codex only: bypass the sandbox (use inside an isolated box)
   --sandbox         codex sandbox: read-only|workspace-write|danger-full-access
+
+audit options
+  --since           minutes to look back (default 60)
+  --expected        how many subagents you dispatched. The gap between that and
+                    the receipts is the number that never ran — a shim answering
+                    by itself looks identical to a real dispatch without this.
 
 output
   --human           human-readable instead of JSON (limits, plan)
@@ -235,6 +243,35 @@ async function main() {
 
   if (command === 'doctor') {
     return doctor(typeof args['skill-name'] === 'string' ? { skillName: args['skill-name'] } : {});
+  }
+
+  if (command === 'audit') {
+    const mins = args.since ? Number(args.since) : 60;
+    const rows = await readAudit({ sinceMs: Date.now() - mins * 60_000 });
+    const sum = summarise(rows, args.expected ? { expected: Number(args.expected) } : {});
+    if (!args.human) {
+      process.stdout.write(`${JSON.stringify({ ...sum, rows }, null, 2)}\n`);
+      return sum.undispatched ? 3 : 0;
+    }
+    process.stdout.write(`dispatches in the last ${mins} min: ${sum.total}`
+      + (sum.failed ? `  (${sum.failed} failed)` : '') + '\n');
+    for (const [prov, info] of Object.entries(sum.byProvider)) {
+      const models = Object.entries(info.models).map(([m, n]) => `${m}x${n}`).join(' ');
+      process.stdout.write(`  ${prov.padEnd(7)} ${String(info.count).padStart(3)}   ${models}\n`);
+    }
+    if (sum.codexShare != null) process.stdout.write(`\ncodex share: ${sum.codexShare}%\n`);
+    const ind = sum.independence;
+    if (ind['cross-vendor'] || ind['same-vendor']) {
+      process.stdout.write(`reviews: ${ind['cross-vendor']} cross-vendor, `
+        + `${ind['same-vendor']} same-vendor\n`);
+    }
+    if (sum.undispatched != null) {
+      process.stdout.write(sum.undispatched === 0
+        ? `\nall ${sum.expected} expected dispatches are on record.\n`
+        : `\nWARNING: ${sum.undispatched} of ${sum.expected} subagents left NO receipt —\n`
+          + `they never called the dispatcher and answered by themselves.\n`);
+    }
+    return sum.undispatched ? 3 : 0;
   }
 
   if (command === 'limits') {

@@ -390,6 +390,32 @@ an injectable spawn, so the policy is fully testable without spending anything.
 
 ---
 
+## Auditing a fan-out
+
+The shim is a language model asked not to do the task itself, and it does not
+always comply — on a measured 12-agent run, four agents never called the
+dispatcher and answered from their own weights instead. A self-written answer
+looks exactly like a dispatched one, so the only reliable check is counting
+receipts:
+
+```
+$ cmo audit --since 30 --expected 12 --human
+dispatches in the last 30 min: 8
+  codex     5   gpt-5.6-terra x5
+  claude    3   sonnet x3
+
+codex share: 62%
+reviews: 3 cross-vendor, 0 same-vendor
+
+WARNING: 4 of 12 subagents left NO receipt —
+they never called the dispatcher and answered by themselves.
+```
+
+Every real dispatch writes one line to
+`~/.cache/cross-model-orchestrate/dispatches.jsonl` with a random id that also
+comes back in the envelope as `dispatchId`. The gap between agents you spawned
+and receipts on record is the number that never ran.
+
 ## Releasing
 
 Published via npm [Trusted Publishing](https://docs.npmjs.com/trusted-publishers)

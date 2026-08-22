@@ -38,6 +38,7 @@ import { join } from 'node:path';
 
 import { markExhausted, recordCodexRateLimits, refreshCodexLimits } from './limits.mjs';
 import { recordSample, releaseReservation, reserve, snapshot } from './ledger.mjs';
+import { newDispatchId, record } from './audit.mjs';
 
 export const DEFAULT_TIMEOUT_MS = 20 * 60_000;
 const KILL_GRACE_MS = 5_000;
@@ -334,6 +335,9 @@ export async function runAgent(decision, prompt, opts = {}) {
   } = opts;
 
   const startedAt = now();
+  // Every dispatch gets a receipt, so a caller can tell a real one from a shim
+  // that answered by itself. See audit.mjs.
+  const dispatchId = newDispatchId();
   const attempts = [];
   const workdir = await mkdtemp(join(tmpdir(), 'cmo-'));
   const lastMessageFile = join(workdir, 'last-message.txt');
@@ -469,8 +473,18 @@ export async function runAgent(decision, prompt, opts = {}) {
             }
             break;
           }
+          await record({
+            at: now(), id: dispatchId, ok: true,
+            provider: target.provider, model: target.model, tier: target.tier,
+            role: decision.factors?.role ?? null,
+            independence: decision.independence ?? null,
+            degradedReview: Boolean(decision.degradedReview),
+            failedOver: rung > 0, durationMs: now() - startedAt,
+          }).catch(() => {});
+
           return {
             ok: true,
+            dispatchId,
             provider: target.provider,
             model: target.model,
             tier: target.tier,
@@ -504,8 +518,18 @@ export async function runAgent(decision, prompt, opts = {}) {
       }
     }
 
+    await record({
+      at: now(), id: dispatchId, ok: false,
+      provider: decision.provider, model: decision.model,
+      role: decision.factors?.role ?? null,
+      independence: decision.independence ?? null,
+      durationMs: now() - startedAt,
+      error: (lastError ?? 'all providers failed').slice(0, 200),
+    }).catch(() => {});
+
     return {
       ok: false,
+      dispatchId,
       provider: decision.provider,
       model: decision.model,
       attempts,

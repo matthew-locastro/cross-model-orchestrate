@@ -245,6 +245,26 @@ just do it in the orchestrator.
 
 Patterns and worked scripts: `references/workflow-patterns.md`.
 
+### Audit the fan-out — do not trust the shim
+
+The shim is a language model told not to do the task itself, and it does not
+always obey. On a measured 12-agent run, four agents never called the dispatcher
+at all: three generators and one judge answered from their own weights, and the
+workflow could not tell, because a self-written answer looks exactly like a
+dispatched one.
+
+So count receipts. Every real dispatch writes one; a shim that answered by
+itself writes nothing.
+
+```bash
+cmo audit --since 30 --expected <number of subagents you spawned> --human
+```
+
+`undispatched` above zero means that many subagents lied. Treat their output as
+unverified: re-dispatch them, and say so in your report. Also read the two other
+lines it prints — `codex share` answers whether the run actually balanced, and
+the cross-vendor / same-vendor split tells you how many verdicts were degraded.
+
 ### Keep watching the meter
 
 Re-run `cmo limits` between phases, and at least every ~25 agents in a long
