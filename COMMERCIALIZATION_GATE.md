@@ -30,7 +30,8 @@ and it no longer proves what it proved.
 | 03 Width and contention | Sixteen real agents on one ledger | ~0.1.8–0.1.11 | **Yes** |
 | 04 Interrupt it | Resume is a real property | ~0.1.11 | **Yes** |
 | 05 Two real machines | The fleet story | 0.1.11 + lease test | Probably — see drift |
-| 06 Somebody else's computer | The documentation | **never run** | **Yes — needs a second person** |
+| 06a macOS conformance | The platform | **0.1.19, partial** | Lock/liveness/paths pass; meters untested |
+| 06b Somebody else's computer | The documentation | **never run** | **Yes — needs a second person** |
 | 07 Soak | Time | 0.1.19, day 1 from 2026-08-22 07:40Z | Needs 3 clean consecutive days |
 | 08 Ship | — | — | Blocked on all of the above |
 
@@ -356,6 +357,53 @@ Gate:
 - First dispatch succeeds.
 - Zero questions the README should have answered. Each one is a doc bug, not a
   user error.
+
+#### 06a, 2026-08-22 · macOS, partial
+
+06 was two tests wearing one hat, and they have now been split. **06a** is
+platform conformance and the author can run it. **06b** is the documentation
+test — "zero questions the README should have answered" — and the author
+structurally cannot, because he cannot un-know the README. 06b stays open.
+
+Run on arm64, macOS 26.5.1, node 26.7.0, Homebrew prefix `/opt/homebrew`.
+
+**Passed:** installed version equals registry; `cmo install` linked all five
+skill dirs and the agent; a real dispatch returned in 3s; and **six concurrent
+dispatches against one ledger left `reservations: []`** — the `wx` lock, the
+stale-break and `process.kill(pid, 0)` liveness all hold on APFS/BSD, which had
+never been tested off Linux. npm's `allowScripts` gate skipped the postinstall
+and nothing broke, because it only prints; that design decision paid for itself.
+
+**Not tested:** both meters were dark, so headroom and routing — the core — never
+ran on macOS, and phase 00's gate says stop when a provider will not read. The
+Codex path is untested; the CLI was absent. **06a is not closed.**
+
+**F1 · the README lands a new user on four warnings.** Following the published
+install block on a clean Mac yields `codex not on PATH`, `claude oauth
+unreadable`, and both meters unavailable. The prerequisite — both vendor CLIs
+installed *and logged in* — appears once, in a parenthetical, as an assumption:
+"the `codex` and `claude` CLIs you already have logged in." On a fresh machine
+that assumption is false for every new user. And `doctor` diagnoses without
+prescribing: "not on PATH — codex dispatch unavailable" never says how to get
+codex. Found by the author, which means a stranger hits it harder.
+
+**F2 · the router does not ask doctor what it already knows.** The decision read
+"codex headroom unknown; codex preferred by default" while doctor knew codex was
+not on `PATH`. The outcome was right — ENOENT, classified `fatal`, failed over to
+haiku, `ok: true` — but every dispatch pays a doomed spawn first. On a 250-agent
+fan-out that is 250 wasted spawns and a `fatal` in every receipt.
+
+**F3 · the token undercount, now from the raw payload.** The run printed
+`input_tokens: 10`, `cache_creation_input_tokens: 7822`,
+`cache_read_input_tokens: 18140`. The receipt recorded `in: 10`, dropping 25,962
+tokens. Confirms `run.mjs:569` as the cause; not a Claude-side oddity.
+
+**F4 · open, not confirmed.** `ENOENT` on `~/.claude/.credentials.json` is equally
+consistent with macOS Keychain storage and with never having logged in on that
+box. Settle it with `security find-generic-password -s "Claude Code-credentials"`
+before and after a login. If macOS really does keep the token in the Keychain,
+`limits.mjs:343` only knows how to read a file, every Mac customer's Claude meter
+is dark, and that is a ship-blocker for the platform rather than a warning.
 
 ### 07 — Soak · 3–5 days · passive
 
