@@ -23,6 +23,7 @@ import { createCoordinator, DEFAULT_PORT } from '../src/server.mjs';
 import { fleetConfig, health } from '../src/remote.mjs';
 import { mergeDispatch, parseDispatchFile } from '../src/dispatch-file.mjs';
 import { readAudit, summarise } from '../src/audit.mjs';
+import { update } from '../src/update.mjs';
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -124,6 +125,7 @@ setup
   install     install the skill into every agent host, and the Claude subagent
   uninstall   remove what install put there
   doctor      check CLIs, auth, model IDs, headroom, skill install and fleet
+  update      upgrade the vendor CLIs — prints the plan; --yes to execute
   serve       run the fleet coordinator so several machines share one view
 
 dispatch
@@ -137,6 +139,12 @@ install options
   --skill-name  install the skill under a different directory name
   --copy        copy instead of symlinking (automatic under npx)
   --hosts       comma-separated subset: claude,codex,agents,kilo,opencode
+
+update options
+  --yes         actually run it. Without this, update only prints the plan.
+  --self        also upgrade cross-model-orchestrate itself
+  --force       proceed even with dispatches in flight on this machine
+                (they may resolve model ids that stop existing mid-run)
 
 serve options
   --port        listen port (default ${DEFAULT_PORT})
@@ -239,6 +247,14 @@ async function main() {
     process.stdout.write('clients: export CMO_FLEET_URL=http://<reachable-host>:' + port + ' CMO_FLEET_TOKEN=<token>\n');
     await new Promise(() => {}); // run until killed
     return 0;
+  }
+
+  if (command === 'update') {
+    return update({
+      yes: Boolean(args.yes),
+      includeSelf: Boolean(args.self),
+      force: Boolean(args.force),
+    });
   }
 
   if (command === 'doctor') {

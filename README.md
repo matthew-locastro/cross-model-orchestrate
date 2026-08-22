@@ -375,6 +375,35 @@ an injectable spawn, so the policy is fully testable without spending anything.
 
 ---
 
+## Keeping the CLIs current
+
+`doctor` never changes anything — it is a diagnostic, and `codex` and `claude`
+are not our packages. `cmo update` does, explicitly:
+
+```
+$ cmo update
+would run:
+  plan   codex                    npm install -g @openai/codex@latest
+  plan   claude                   claude update
+
+Nothing has changed. Re-run with --yes to execute.
+```
+
+Four guards make it safe to hand to a fleet:
+
+- **Refuses while dispatches are running on this machine.** Swapping the codex
+  binary mid-run can change model ids underneath agents that already resolved
+  them. `--force` if you know what those agents are doing.
+- **Only runs a command it detected.** npm global tree → npm; Homebrew cellar →
+  brew; Claude → its own updater. An install it does not recognise is skipped
+  with the path, not guessed at — sending a Homebrew user to `npm install -g`
+  leaves two copies and a PATH puzzle.
+- **Prints the plan and stops.** Nothing executes without `--yes`.
+- **Reports before → after**, so "updated" means a version changed rather than
+  that a command exited 0.
+
+`--self` includes cross-model-orchestrate itself.
+
 ## Auditing a fan-out
 
 The shim is a language model asked not to do the task itself, and it does not
