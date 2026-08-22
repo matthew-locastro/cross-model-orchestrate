@@ -10,10 +10,13 @@ The gate is one sentence, and it is the one that is currently unmet:
 > not an earlier one.
 
 Phases 00–05 were run and passed. They were run against **0.1.8 – 0.1.11**. The
-shipping version is **0.1.18**. Seven releases of drift sit between the evidence
+shipping version is **0.1.19**. Eleven releases of drift sit between the evidence
 and the artifact, and some of that drift lands directly on the code paths those
 phases exercise. That is the whole reason this file exists: the work was done,
 and it no longer proves what it proved.
+
+**00 has since been re-run and passes against 0.1.19** (2026-08-22, evidence in
+`~/cmo-evidence/`). 01–06 have not.
 
 ---
 
@@ -21,14 +24,14 @@ and it no longer proves what it proved.
 
 | Phase | What it buys | Passed against | Re-run needed |
 |---|---|---|---|
-| 00 Freeze the build | You are testing what you publish | 0.1.8 | **Yes** — cheap, always first |
+| 00 Freeze the build | You are testing what you publish | **0.1.19** | Done 2026-08-22 — re-run before ship |
 | 01 One real fan-out | The core product claim | 0.1.8 | **Yes** |
 | 02 Make it fail on purpose | Failure paths are real, not described | 0.1.8 | **Yes** |
 | 03 Width and contention | Sixteen real agents on one ledger | ~0.1.8–0.1.11 | **Yes** |
 | 04 Interrupt it | Resume is a real property | ~0.1.11 | **Yes** |
 | 05 Two real machines | The fleet story | 0.1.11 + lease test | Probably — see drift |
 | 06 Somebody else's computer | The documentation | **never run** | **Yes — needs a second person** |
-| 07 Soak | Time | running since 2026-08-22 | Needs 3 clean consecutive days |
+| 07 Soak | Time | 0.1.19, day 1 from 2026-08-22 07:40Z | Needs 3 clean consecutive days |
 | 08 Ship | — | — | Blocked on all of the above |
 
 ---
@@ -315,10 +318,68 @@ was measured for each.
 | Orphan reservations | `state.json` | Should always be zero at rest. Anything else suppresses dispatch silently. |
 | Token split | agent list | Codex should carry the bulk. If Claude does, phase 01's gate has regressed. |
 
-> **The clock restarted at 2026-08-22 06:42 UTC.** Everything logged before that
-> is contaminated by the classifier defect below: completed Codex runs were
-> recorded as failures, so failure counts, retry rates, failover counts and the
-> Codex share are all wrong in the same direction. Do not count those days.
+> **The clock restarted at 2026-08-22 06:42 UTC — and that was eight minutes too
+> early.** 0.1.19 published at 06:50:25 and was installed globally right after.
+> A restart by wall clock does not clear dispatches already *in flight*: a
+> running dispatcher holds the code it loaded at spawn, so a run that started at
+> 06:21 lives its whole life on 0.1.18 no matter what the registry says. Two did,
+> and both landed inside the new window (07:26, 07:31), carrying 0.1.18's defect
+> into day 1 of a soak that is supposed to prove 0.1.19.
+>
+> Everything logged before **07:40 UTC** — the last dispatch descended from a
+> pre-install spawn — is contaminated by the classifier defect below: completed
+> Codex runs were recorded as failures, so failure counts, retry rates, failover
+> counts and the Codex share are all wrong in the same direction. Do not count
+> those days.
+>
+> **Restarting a soak means draining in-flight dispatches, not resetting a
+> clock.** Before the restart: `cmo limits --human` must report no dispatches in
+> flight, and `state.json` must show zero reservations.
+
+**Soak of record (2026-08-22):** this box, `srv1452130`, as `matthew`. Snapshots
+are taken by the `cmo-soak.timer` systemd unit at 23:55 UTC — late enough that
+the `--since 24h` window closes on the day it labels — appending to
+`~/cmo-soak.jsonl`. There is no `cron` on this box; a crontab entry silently is
+not a schedule. Pre-restart lines are archived in `~/cmo-soak.pre-0.1.19.jsonl`.
+Phase 00 evidence for 0.1.19 is in `~/cmo-evidence/`.
+
+#### What the two `exit 143` failures on day 1 actually were
+
+Both were the 0.1.18 classifier, not a new defect, and the proof is worth
+keeping because the receipt says nothing of the kind:
+
+| | started | ended | attempts | recorded |
+|---|---|---|---|---|
+| codex `gpt-5.6-sol` (hell-water) | 06:21:43 | 07:31:44 | 4 | `rate-limit, transient, transient, fatal` · `exit 143` |
+| claude `opus` (termroam) | 06:24:29 | 07:26:29 | 3 | `transient, transient, fatal` · `exit 143` |
+
+Attempt 1 of the Codex run **succeeded**. Its rollout
+(`rollout-2026-08-22T06-21-44-…`, 7.6 MB) carries a `task_complete` at 06:51:18
+with a full final message — "Consolidation is complete across the six finance
+files." The dispatcher, still on 0.1.18, grepped that work product, matched a
+rate-limit signature in it, threw the run away and re-dispatched it three more
+times. The last attempt was killed with `exit 143`.
+
+Two things follow, and the second is the one that matters:
+
+- **The work exists — checked, and nothing was lost.** Per "If a dispatch is
+  wrongly recorded as failed" below, hell-water's finance consolidation completed
+  at 06:51 and was then worked over by later attempts. The tree
+  (`workspaces/personal/hell-water`) is clean and the work is committed as
+  `97ae54d fix: consolidate the financial model onto one set of numbers` —
+  the same six finance files the agent's final message named. Nothing to
+  reconcile here; the cost of this defect was the duplicate spend, not the work.
+- **`exit 143` is not a timeout.** The watchdog was never involved — `timedOut`
+  is threaded into `classifyFailure` correctly in both 0.1.18 and 0.1.19, and a
+  watchdog kill would read `timeout`. No OOM kill and no service restart appear
+  in the journal for that window. `143` is SIGTERM from outside: the retry chain
+  was killed. A run terminated by signal is classified `fatal`, which reads as
+  "the agent broke" when it means "somebody stopped it" — worth its own class.
+
+So day 1 of the soak starts at **07:40 UTC**, and the outstanding item this
+leaves is real but small: **no dispatch has yet been observed dying on the wall
+clock in the wild.** Phase 02d proves the `timeout` label by injection; nothing
+in the soak log has confirmed it against a real agent.
 
 Gate:
 - Three consecutive days with no unexplained stall and no orphaned state.
