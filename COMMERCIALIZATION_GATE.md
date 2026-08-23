@@ -26,9 +26,9 @@ and it no longer proves what it proved.
 |---|---|---|---|
 | 00 Freeze the build | You are testing what you publish | **0.1.19** | Done 2026-08-22 — re-run before ship |
 | 01 One real fan-out | The core product claim | **0.1.19** | Passed 2026-08-22 — see below |
-| 02 Make it fail on purpose | Failure paths are real, not described | 0.1.8 | **Yes** |
-| 03 Width and contention | Sixteen real agents on one ledger | ~0.1.8–0.1.11 | **Yes** |
-| 04 Interrupt it | Resume is a real property | ~0.1.11 | **Yes** |
+| 02 Make it fail on purpose | Failure paths are real, not described | **0.1.19** | Passed 2026-08-23 |
+| 03 Width and contention | Sixteen real agents on one ledger | **0.1.19** | Passed 2026-08-23 |
+| 04 Interrupt it | Resume is a real property | **0.1.19, partial** | Ledger half FAILS on a fleet box — see F9 |
 | 05 Two real machines | The fleet story | 0.1.11 + lease test | Probably — see drift |
 | 06a macOS conformance | The platform | **0.1.19, partial** | Lock/liveness/paths pass; meters untested |
 | 06b Somebody else's computer | The documentation | **never run** | **Yes — needs a second person** |
@@ -310,6 +310,83 @@ Gate:
 > Kill by **PID**, never by pattern. `pgrep -f` matched its own shell three times
 > during this work, and `pgrep -x codex` once killed seven live Codex processes
 > including sessions that had nothing to do with the test.
+
+#### 02, 03 and 04 re-run 2026-08-23 · against 0.1.19
+
+**02 — passed, all four blocks**, but only after two corrections to the
+procedure. Recorded because the first run *looked* like it passed and had
+tested nothing.
+
+- **F6 · phase 02's isolation does not work on a fleet-connected box.** The
+  documented `CMO_CACHE_DIR=$D` cannot isolate anything, because the fleet is
+  configured in the **config file**, and `ledger.mjs:159` lets remote state
+  override the local cache wholesale. The first run of 02a read the live meter
+  (`claude tight (73%)`), printed a perfectly plausible cross-vendor decision,
+  and proved nothing. Isolate with **both** `CMO_CACHE_DIR` and
+  `CMO_CONFIG_DIR` pointed at empty directories.
+- **F7 · 02d's hang no longer hangs.** The documented prompt asks the agent to
+  run `read -p 'press enter' x`, but `spawnWithTimeout` closes stdin
+  immediately after the prompt *by design*, so `read` gets EOF and returns in
+  17 seconds. The fix documented in the code obsoleted the test written to
+  exercise it. Use `sleep 600`.
+
+With those fixed, every gate criterion held: 02a degraded to codex with
+`independence: same-vendor` **and raised a tier**; 02b deferred, naming
+`--strict-independence`, exit 3; 02c executed a real degraded review with
+`degradedReview: true`, `INDEPENDENCE NOTICE` present in the rollout, and the
+grader itself opening with "Same-vendor review noted" — the handicap reached the
+model, not just the envelope; 02d killed each attempt at ~60s with
+`timedOut: true, failure: "timeout"`.
+
+That last one closes an open question from the day-1 investigation: the
+`timeout` label is correct and does fire, which confirms the two `exit 143`
+failures were signal kills and not watchdog kills.
+
+- **F8 · a timeout is retried three times, then failed over.** 02d took 202s to
+  refuse a 60s hang. Timeouts are usually deterministic — the task is too big or
+  the command blocks — so retrying one costs 3× the wall clock to reach the same
+  answer. At the 20-minute default that is an hour spent to learn nothing.
+  `classifyFailure`'s own docstring says non-transient failures should fail fast;
+  `timeout` is classified as retryable anyway.
+
+**03 — passed, all four criteria.** Sixteen concurrent agents on the live
+ledger: mid-flight `cmo limits` reported `in-flight 11 agent(s) · reported 28%
+→ effective 31.3%`; all 16 returned `ok: true` in 29s; reservations returned to
+zero; measured cost grew 0.22 → 0.25. Evidence in `~/cmo-evidence/03-*.json`.
+
+**04 — the ledger half FAILS on a fleet box.** The resume-cache half is a
+Claude Code workflow property and was not run. The half cmo owns was, and it
+does not hold:
+
+- **F9 · a killed dispatch orphans its headroom for the entire lease.** Four
+  dispatches were `SIGKILL`ed by pid. All four reservations survived, and
+  `cmo limits` kept reporting `in-flight 4 agent(s) · effective 29.1%` after
+  every holder was dead. The cause is that the two stores each hold half of what
+  a GC needs:
+
+  | Store | has `pid` | has `expiresAt` |
+  |---|---|---|
+  | local `state.json` | yes | **no** |
+  | coordinator `fleet-state.json` | **no** | yes |
+
+  `gcReservations` works correctly in isolation — verified, it drops a dead pid —
+  but a fleet client prefers remote state, so its result is overwritten on every
+  read. The coordinator cannot check a pid on another machine, which
+  `server.mjs:12` states as a deliberate constraint, and it is right in general.
+  It is wrong in the case that actually occurred: the dead processes were on
+  **the same box as the coordinator**, their liveness was trivially checkable,
+  and each reservation already records `node`.
+
+  Impact is bounded but user-visible: headroom stays over-reported for the full
+  lease (`timeoutMs * 2 + 60s` — 14 minutes here, **41 minutes** at the default
+  20-minute timeout). It fails conservative, defers rather than overspends, and
+  self-heals. But "kill a run, retry it, watch it defer for forty minutes with no
+  explanation" is exactly the silent suppression phase 07 warns about.
+
+  Fix for 0.1.21: have the coordinator honour pid liveness for reservations whose
+  `node` matches its own hostname — the one case where it can — and keep leases
+  for everyone else. Phase 04's criterion as written ("the GC collects them") is
+  true single-machine and false on a fleet; the criterion needs to say which.
 
 ### 05 — Two real machines · ~30 min
 
