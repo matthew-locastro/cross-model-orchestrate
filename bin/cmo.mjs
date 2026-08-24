@@ -126,7 +126,7 @@ setup
   install     install the skill into every agent host, and the Claude subagent
   uninstall   remove what install put there
   doctor      check CLIs, auth, model IDs, headroom, skill install and fleet
-  update      upgrade the vendor CLIs — prints the plan; --yes to execute
+  update      upgrade the vendor CLIs, cmo and the skill — --yes to execute
   serve       run the fleet coordinator so several machines share one view
 
 dispatch
@@ -144,7 +144,9 @@ install options
 
 update options
   --yes         actually run it. Without this, update only prints the plan.
-  --self        also upgrade cross-model-orchestrate itself
+  --clis-only   upgrade only the vendor CLIs, leaving this package alone
+                (by default update covers the CLIs, cmo itself, and the
+                 installed skill when it is a copy rather than a symlink)
   --force       proceed even with dispatches in flight on this machine
                 (they may resolve model ids that stop existing mid-run)
 
@@ -258,7 +260,10 @@ async function main() {
   if (command === 'update') {
     return update({
       yes: Boolean(args.yes),
-      includeSelf: Boolean(args.self),
+      // Everything by default: the vendor CLIs, this package, and the installed
+      // skill if it is a copy. `--self` is still accepted so older instructions
+      // and scripts keep working; it is now the default rather than a flag.
+      includeSelf: !args['clis-only'],
       force: Boolean(args.force),
     });
   }

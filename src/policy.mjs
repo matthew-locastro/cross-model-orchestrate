@@ -56,6 +56,11 @@ export function pressure() {
 }
 
 export function providerState(limits, bands = pressure()) {
+  // A CLI that is not installed cannot run anything, which is a stronger claim
+  // than "its meter did not answer" and has to outrank the default preference.
+  if (limits && limits.installed === false) {
+    return { state: 'missing', percent: null, resetsAt: null };
+  }
   if (!limits || limits.available !== true) {
     // A dead probe must not stop the run. Unknown means usable.
     return { state: 'unknown', percent: null, resetsAt: null };
@@ -151,7 +156,10 @@ export function rankProviders(task, states, preference = loadConfig().preference
     let score = 0;
     const why = [];
 
-    if (s.state === 'exhausted') {
+    if (s.state === 'missing') {
+      score -= 1000;
+      why.push(`${id} CLI is not installed`);
+    } else if (s.state === 'exhausted') {
       score -= 1000;
       why.push(`${id} exhausted (${s.percent ?? '?'}%)`);
     } else if (s.state === 'critical') {
@@ -255,12 +263,17 @@ export function decide(task = {}, limits = {}) {
   if (normalized.independentOf && !normalized.pin) {
     const required = otherProvider(normalized.independentOf);
     const requiredState = states[required].state;
-    if (requiredState === 'exhausted' && !normalized.strictIndependence) {
+    // "Not installed" is as impossible as "spent", and has to reach the same
+    // branch: otherwise a box with one CLI silently forces every review onto a
+    // vendor that cannot run, and the run defers instead of degrading.
+    const requiredUnusable = requiredState === 'exhausted' || requiredState === 'missing';
+    if (requiredUnusable && !normalized.strictIndependence) {
       independence = 'same-vendor';
       degraded = true;
       ranked = ranked.filter((c) => c.provider === normalized.independentOf);
       notes.push(
-        `DEGRADED REVIEW: ${required} is exhausted, so this runs on ${normalized.independentOf} —`
+        `DEGRADED REVIEW: ${required} is ${requiredState === 'missing' ? 'not installed' : 'exhausted'},`
+        + ` so this runs on ${normalized.independentOf} —`
         + ' the same vendor that produced the artifact. Fresh context, shared blind spots.',
       );
     } else {
@@ -274,7 +287,9 @@ export function decide(task = {}, limits = {}) {
     notes.push(`provider pinned to ${normalized.pin} by the caller`);
   }
 
-  const usable = ranked.filter((c) => c.state !== 'exhausted');
+  // A missing CLI is as unusable as a spent one — filtering only on
+  // 'exhausted' let --strict-independence hand back a provider that cannot run.
+  const usable = ranked.filter((c) => c.state !== 'exhausted' && c.state !== 'missing');
 
   if (usable.length === 0) {
     const soonest = ranked
@@ -286,7 +301,7 @@ export function decide(task = {}, limits = {}) {
       defer: true,
       reason: normalized.independentOf
         ? (normalized.strictIndependence
-          ? 'the only provider allowed for this cross-model review is exhausted, and --strict-independence forbids degrading to the producer\'s vendor'
+          ? 'the only provider allowed for this cross-model review cannot run, and --strict-independence forbids degrading to the producer\'s vendor'
           : 'both providers are out of headroom, so not even a degraded review can run')
         : 'both providers are out of headroom',
       ...(normalized.independentOf ? { independence: 'none' } : {}),

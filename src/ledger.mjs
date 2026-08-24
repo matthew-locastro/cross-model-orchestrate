@@ -242,9 +242,16 @@ export async function reserve(provider, { label = null, cost = null, leaseMs = n
   // The coordinator cannot test a pid on another box, so the entry carries its
   // own expiry. A box that dies mid-run releases its headroom on the lease,
   // with no heartbeat machinery to get wrong.
+  //
+  // The pid goes too, even though it is meaningless to a remote coordinator.
+  // When the coordinator happens to run on THIS box — the common single-machine
+  // -plus-fleet setup — it can check the pid and collect the entry the moment
+  // the process dies, instead of holding headroom for the whole lease. It
+  // ignores the pid for every other node.
   if (fleetConfig()) {
     await remoteReserve({
       id, provider, cost: points, label, node: who.node, project: who.project,
+      pid: process.pid,
       leaseMs: leaseMs ?? RESERVATION_LEASE_MS,
     });
   }

@@ -36,7 +36,9 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { markExhausted, recordCodexRateLimits, refreshCodexLimits } from './limits.mjs';
+import {
+  markExhausted, recordCodexRateLimits, refreshClaudeLimits, refreshCodexLimits,
+} from './limits.mjs';
 import { recordSample, releaseReservation, reserve, snapshot } from './ledger.mjs';
 import { newDispatchId, record } from './audit.mjs';
 import { identity } from './remote.mjs';
@@ -87,6 +89,21 @@ export function classifyFailure({ code, signal, timedOut, stderr = '', stdout = 
   if (signal) return 'transient';
   if (code === 0) return 'none';
   return 'fatal';
+}
+
+/**
+ * Claude reports prompt tokens in three fields, and for an agent replaying a
+ * long context the one named `input_tokens` is the smallest of them by orders
+ * of magnitude. A judge that had just read two full candidate sets recorded
+ * `in: 2`, because the other 25,962 tokens were in cache_creation and
+ * cache_read. Codex reports a single total and simply has no such fields, so
+ * summing is correct for both.
+ */
+export function totalInputTokens(usage = {}) {
+  const base = usage.input_tokens ?? usage.inputTokens ?? null;
+  const cached = (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
+  if (base == null && !cached) return null;
+  return (base ?? 0) + cached;
 }
 
 export function backoffMs(attempt, { base = 2_000, random = Math.random } = {}) {
@@ -520,6 +537,16 @@ export async function runAgent(decision, prompt, opts = {}) {
           const parsed = parseClaudeStdout(result.stdout);
           text = parsed.text;
           usage = parsed.usage;
+          // The same free measurement the codex path takes, which claude never
+          // had. Without it `samples.claude` stays empty forever, estimateCost
+          // falls back to the configured default of 1 point, and every claude
+          // agent reserves roughly five times what codex measured itself to
+          // cost — so a concurrent fan-out defers claude work that had headroom
+          // all along. Costs one HTTP GET, and only after the work is done.
+          const after = await refreshClaudeLimits().catch(() => null);
+          if (after && typeof before === 'number' && typeof after.worstPercent === 'number') {
+            await recordSample('claude', after.worstPercent - before).catch(() => {});
+          }
         }
 
         const failure = classifyFailure({ ...result, hasOutput: text.length > 0 });
@@ -566,7 +593,7 @@ export async function runAgent(decision, prompt, opts = {}) {
             failures: attempts.map((a) => a.failure).filter(Boolean),
             durationMs: now() - startedAt,
             tokens: usage ? {
-              in: usage.input_tokens ?? usage.inputTokens ?? null,
+              in: totalInputTokens(usage),
               out: usage.output_tokens ?? usage.outputTokens ?? null,
             } : null,
             node: who.node, project: who.project,
@@ -604,6 +631,12 @@ export async function runAgent(decision, prompt, opts = {}) {
           break;
         }
         if (failure === 'auth' || failure === 'fatal') break;
+        // A timeout is the most expensive failure to repeat and the least
+        // likely to come out differently: the same prompt on the same model
+        // with the same clock will run out of clock again. Three attempts at
+        // the 20-minute default is an hour spent to learn nothing. Move to the
+        // other vendor, which is a genuinely different attempt, or give up.
+        if (failure === 'timeout') break;
         if (attempt + 1 < maxAttempts) await sleep(backoffMs(attempt));
       }
     }

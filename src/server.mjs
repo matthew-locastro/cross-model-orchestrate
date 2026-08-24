@@ -29,6 +29,7 @@ import { dirname, join } from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 
 import { CACHE_DIR } from './config.mjs';
+import { identity } from './remote.mjs';
 
 export const DEFAULT_PORT = 7867;
 const MAX_BODY_BYTES = 256 * 1024;
@@ -49,8 +50,32 @@ function tokenMatches(provided, expected) {
   return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
 }
 
-export function expire(state, now) {
-  const reservations = state.reservations.filter((r) => r && (r.expiresAt ?? 0) > now);
+/**
+ * The one case where a coordinator CAN answer "is that process still alive":
+ * when the reservation came from the box it is running on.
+ *
+ * The general rule — leases, never liveness — is right, and the header above
+ * explains why. But it was being applied to the local node too, and that cost
+ * real time: SIGKILL four dispatches and their headroom stayed reserved for the
+ * full lease (41 minutes at the default timeout), the effective figure stayed
+ * inflated, and `cmo update` refused to run on behalf of processes that no
+ * longer existed. The local ledger collected them instantly; remote state then
+ * overwrote its answer.
+ */
+export function localPidGone(entry, self = identity().node) {
+  if (!entry || entry.node !== self || typeof entry.pid !== 'number') return false;
+  try {
+    process.kill(entry.pid, 0); // signal 0 tests existence without touching it
+    return false;
+  } catch (err) {
+    return err?.code !== 'EPERM'; // EPERM means it exists but is not ours
+  }
+}
+
+export function expire(state, now, { pidGone = localPidGone } = {}) {
+  const reservations = state.reservations.filter(
+    (r) => r && (r.expiresAt ?? 0) > now && !pidGone(r),
+  );
   const probes = {};
   for (const [provider, entry] of Object.entries(state.probes ?? {})) {
     if (entry && now - entry.storedAt < PROBE_MAX_AGE_MS) probes[provider] = entry;
@@ -179,6 +204,8 @@ export function createCoordinator({ token, statePath, now = Date.now } = {}) {
           label: b.label ?? null,
           node: b.node ?? 'unknown',
           project: b.project ?? null,
+          // Only ever consulted for entries from this coordinator's own node.
+          pid: Number.isInteger(b.pid) ? b.pid : null,
           startedAt,
           expiresAt: startedAt + Math.min(Number(b.leaseMs) || DEFAULT_LEASE_MS, 6 * 60 * 60_000),
         };

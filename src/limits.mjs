@@ -29,8 +29,9 @@
 // Both are cached on disk with a TTL so hundreds of dispatch decisions share one
 // probe.
 
-import { readFile, readdir, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { access, readFile, readdir, stat } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { delimiter, join } from 'node:path';
 
 import { CACHE_DIR, loadConfig } from './config.mjs';
 import { applyCommitted, freshProbe, inFlight, mutate, snapshot } from './ledger.mjs';
@@ -39,6 +40,49 @@ export { CACHE_DIR };
 
 const OAUTH_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const FETCH_TIMEOUT_MS = 5_000;
+
+/**
+ * Is the vendor CLI even on PATH?
+ *
+ * This is a different question from "can we read its meter", and conflating
+ * them cost a real dispatch. On a machine with no codex installed, the probe
+ * reported "headroom unknown", the router read unknown as usable, preferred
+ * codex anyway, and every dispatch paid a doomed spawn and an ENOENT before
+ * failing over. Across a 250-agent fan-out that is 250 wasted spawns and a
+ * `fatal` in every receipt.
+ *
+ * The distinction has to be kept, though — it must NOT collapse into "demote
+ * anything unreadable". A freshly installed codex has no session file, so its
+ * meter is legitimately unknown, and the first dispatch is what creates the
+ * file that fixes it. Demote on unknown and codex never gets that first
+ * dispatch, so the meter never becomes readable: a trap that never reopens.
+ *
+ * Absent binary, never dispatch. Present binary, unreadable meter, dispatch.
+ *
+ * Scans PATH directly rather than spawning `which`, because this runs on the
+ * read path of every routing decision.
+ */
+const onPathCache = new Map();
+export async function binaryOnPath(name, { env = process.env, cache = onPathCache } = {}) {
+  if (cache.has(name)) return cache.get(name);
+  const exts = process.platform === 'win32'
+    ? (env.PATHEXT ?? '.EXE;.CMD;.BAT').split(';')
+    : [''];
+  let found = false;
+  for (const dir of (env.PATH ?? '').split(delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      try {
+        await access(join(dir, `${name}${ext}`), constants.X_OK);
+        found = true;
+        break;
+      } catch { /* keep looking */ }
+    }
+    if (found) break;
+  }
+  cache.set(name, found);
+  return found;
+}
 
 // ── shared shaping ────────────────────────────────────────────────────────
 
@@ -432,6 +476,17 @@ export async function readLimits({ refresh = false, now = Date.now(), readers, i
   const codex = includeCommitted ? applyCommitted(codexProbe.value, state, 'codex') : codexProbe.value;
   const claude = includeCommitted ? applyCommitted(claudeProbe.value, state, 'claude') : claudeProbe.value;
 
+  // Recorded on the reading itself so the routing decision can tell an absent
+  // CLI from an unreadable meter. Injected readers (tests) are exempt: they are
+  // deciding what the probe says, so PATH is not theirs to be judged by.
+  if (!readers) {
+    const [codexInstalled, claudeInstalled] = await Promise.all([
+      binaryOnPath('codex'), binaryOnPath('claude'),
+    ]);
+    if (codex && typeof codex === 'object') codex.installed = codexInstalled;
+    if (claude && typeof claude === 'object') claude.installed = claudeInstalled;
+  }
+
   return {
     codex,
     claude,
@@ -460,6 +515,21 @@ export async function refreshCodexLimits({ now = Date.now() } = {}) {
   if (value.available !== true) return null;
   await mutate((st) => {
     st.probes.codex = { storedAt: now, value };
+  }, { now: () => now });
+  return value;
+}
+
+/**
+ * The claude twin of `refreshCodexLimits`. Codex gets its reading for free out
+ * of the exec stream; claude's costs one HTTP GET against the OAuth usage
+ * endpoint, which is cheap enough to do after a dispatch and is the only way
+ * claude can ever measure what one of its own agents costs.
+ */
+export async function refreshClaudeLimits({ now = Date.now() } = {}) {
+  const value = await readClaudeLimits();
+  if (value.available !== true) return null;
+  await mutate((st) => {
+    st.probes.claude = { storedAt: now, value };
   }, { now: () => now });
   return value;
 }

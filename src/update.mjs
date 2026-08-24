@@ -16,11 +16,13 @@
 //               something changed rather than that a command exited 0.
 
 import { execFile } from 'node:child_process';
-import { realpath } from 'node:fs/promises';
+import { lstat, realpath } from 'node:fs/promises';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 import { snapshot } from './ledger.mjs';
-import { identity } from './remote.mjs';
+import { fleetConfig, identity } from './remote.mjs';
+import { SKILL_HOSTS, install } from './install.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -84,7 +86,29 @@ export async function localInFlight() {
   }
 }
 
-export async function plan({ includeSelf = false } = {}) {
+/**
+ * Skill installs that are COPIES rather than symlinks, and therefore do not
+ * follow a self-upgrade.
+ *
+ * This is the gap that made `cmo update --self` a half-measure. A symlinked
+ * skill points into the global package directory, so npm replacing that
+ * directory updates the skill for free. A copy does not, and nothing said so:
+ * you upgraded the CLI, kept last version's skill, and had no way to tell.
+ * npx installs copy automatically, so this is not a rare configuration.
+ */
+export async function staleCopies(skillName = 'cross-model-orchestrate') {
+  const stale = [];
+  for (const host of SKILL_HOSTS) {
+    const target = join(host.dir, skillName);
+    try {
+      const st = await lstat(target);
+      if (!st.isSymbolicLink()) stale.push(host.id);
+    } catch { /* not installed for this host — install would be a new choice, not a refresh */ }
+  }
+  return stale;
+}
+
+export async function plan({ includeSelf = true } = {}) {
   const rows = [];
   for (const t of TARGETS) {
     if (t.self && !includeSelf) continue;
@@ -96,7 +120,7 @@ export async function plan({ includeSelf = false } = {}) {
 
 export async function update({
   yes = false,
-  includeSelf = false,
+  includeSelf = true,
   force = false,
   log = (l) => process.stdout.write(`${l}\n`),
 } = {}) {
@@ -135,6 +159,32 @@ export async function update({
       failures += 1;
       log(`  FAIL   ${r.name.padEnd(24)} ${(err?.message ?? String(err)).split('\n')[0].slice(0, 90)}`);
     }
+  }
+
+  // A self-upgrade that leaves the skill behind has updated the least
+  // important half. Symlinked hosts already followed; copies have not.
+  if (includeSelf && !failures) {
+    const stale = await staleCopies();
+    if (stale.length) {
+      log('');
+      log(`  skill is a copy on: ${stale.join(', ')} — a copy does not follow an upgrade.`);
+      log('  re-linking so the installed skill matches the CLI you just installed:');
+      await install({ log: (l) => log(`    ${l}`) }).catch((err) => {
+        failures += 1;
+        log(`  FAIL   re-install: ${(err?.message ?? String(err)).split('\n')[0].slice(0, 90)}`);
+      });
+    }
+  }
+
+  // The fourth place a version hides. A coordinator started days ago is still
+  // running the code it loaded then, and no amount of npm changes that.
+  if (includeSelf && fleetConfig()) {
+    log('');
+    log('  a fleet coordinator is configured. If `cmo serve` runs on this box it is');
+    log('  still running the code it started with — restart it when nothing is in');
+    log('  flight. Check whether it matters first:');
+    log('    git diff --name-only v<running>..v<new> -- src/server.mjs src/remote.mjs src/ledger.mjs');
+    log('  Empty output means the server loop did not change; leave it alone.');
   }
 
   log('');

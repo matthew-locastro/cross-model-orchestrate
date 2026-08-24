@@ -37,6 +37,34 @@ and it no longer proves what it proved.
 
 ---
 
+## What 0.1.21 fixed, and what that costs
+
+Shipped 2026-08-24, hours after 0.1.20, on the argument that the group had not
+downloaded it yet so there was nothing to churn.
+
+| | Was | Now |
+|---|---|---|
+| **F2** | router preferred codex on a box with no codex installed — a doomed spawn and an ENOENT per dispatch | an absent CLI scores like an exhausted one and is not a candidate; an *unreadable meter* still dispatches, because the first codex run is what creates the session file the meter reads |
+| **F3** | `tokens.in: 2` for a judge that had read two candidate sets | `cache_creation` and `cache_read` are summed in |
+| **F5** | claude never measured its own cost, so it reserved the default 1 against codex's measured 0.22 | `refreshClaudeLimits` + `recordSample('claude', …)` after every claude dispatch |
+| **F8** | a 60s timeout was retried three times before failover — 202s to refuse a hang | one attempt per rung, then the other vendor: 75s, measured |
+| **F9** | SIGKILLed dispatches held headroom for the full lease and blocked `cmo update` | the client sends its pid, and the coordinator honours it for reservations from its own node |
+| `cmo update` | vendor CLIs only; `--self` was opt-in; a copied skill silently stayed stale | everything by default — CLIs, cmo, and a re-link when the skill is a copy — with `--clis-only` to opt out, and an advisory about a long-running `cmo serve` |
+
+Six regression tests were added with the fixes (`test/regressions-0120.test.mjs`),
+including the one that matters most: **an unreadable meter must still dispatch.**
+Demoting on unknown looks like the same fix as F2 and is a trap that never
+reopens — a fresh codex has no session file, so if unknown were demoted, codex
+would never get the first dispatch that would make its meter readable.
+
+**The cost, stated plainly:** phases 01–05 passed on 2026-08-23 against 0.1.20's
+dispatch path, and every fix above changes that path. Their evidence does not
+describe the shipping artifact. This is precisely the drift this file was
+written about, created deliberately and with the clock started fresh rather than
+discovered later. 00, 02 and 03 were re-run against the published 0.1.21
+immediately after release; **01 still needs a fresh Claude Code session**, and 04
+and 05 remain where they were.
+
 ## The drift ledger
 
 What landed after the phases were validated, and what it invalidates.
@@ -50,6 +78,8 @@ What landed after the phases were validated, and what it invalidates.
 | 0.1.17 | a dark meter outranks every other finding | 07 |
 | 0.1.18 | **an expired Claude OAuth token repairs itself** | **00, 01, 02, 03** |
 | 0.1.19 | **the classifier no longer greps the agent's work product** | **01, 02** |
+| 0.1.20 | README, doctor, banner — no dispatch code | nothing; the soak's subject was byte-identical |
+| 0.1.21 | **F2, F3, F5, F8, F9 + `cmo update` covers everything** | **01–05: all of it lands in run/policy/ledger/server** |
 
 0.1.18 is the one to take seriously. It puts a **subprocess spawn inside the
 limits probe** — the probe that 00 gates on, that 01 depends on for every routing
