@@ -383,6 +383,14 @@ does not hold:
   self-heals. But "kill a run, retry it, watch it defer for forty minutes with no
   explanation" is exactly the silent suppression phase 07 warns about.
 
+  **Second symptom, found while exercising `cmo update`:** its in-flight guard
+  counts `state.reservations.filter(r => !r.node || r.node === me)`, and
+  `snapshot()` returns *remote* state on a fleet box. The orphans carry this
+  node's name, so they match. Kill a run and `cmo update` then refuses — "wait
+  for them to finish" — on behalf of processes that are already dead, for the
+  full lease. `--force` escapes it, but only if you know the refusal is bogus.
+  This is more visible than the deferrals and undiagnosable from outside.
+
   Fix for 0.1.21: have the coordinator honour pid liveness for reservations whose
   `node` matches its own hostname — the one case where it can — and keep leases
   for everyone else. Phase 04's criterion as written ("the GC collects them") is
