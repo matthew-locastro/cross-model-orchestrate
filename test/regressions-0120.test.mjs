@@ -85,3 +85,14 @@ test('expire drops dead local reservations as well as expired ones', () => {
   const kept = expire(state, now, { pidGone: (r) => localPidGone(r, 'box-a') }).reservations.map((r) => r.id);
   assert.deepEqual(kept, ['live', 'remote-live']);
 });
+
+// F5's own regression: measuring claude's cost costs a network call, so a wide
+// fan-out finishing together must not burst the usage endpoint into a 429.
+test('claude cost sampling is throttled against a fresh reading', async () => {
+  const { refreshClaudeLimits } = await import('../src/limits.mjs');
+  const now = 1_000_000;
+  // No probe stored at all → nothing to throttle against, so it must proceed
+  // and fail on the (absent) credentials rather than silently skipping.
+  const cold = await refreshClaudeLimits({ now, minAgeMs: 90_000 }).catch(() => null);
+  assert.equal(cold, null, 'an unreadable meter returns null rather than storing a dark value');
+});

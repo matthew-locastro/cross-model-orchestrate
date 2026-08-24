@@ -44,6 +44,13 @@ import { newDispatchId, record } from './audit.mjs';
 import { identity } from './remote.mjs';
 
 export const DEFAULT_TIMEOUT_MS = 20 * 60_000;
+/**
+ * How stale claude's reading must be before a finished dispatch will spend a
+ * network call refreshing it to measure its own cost. Codex pays nothing for
+ * the same measurement; claude pays an HTTP GET, and a wide fan-out finishing
+ * together would otherwise burst the usage endpoint into a 429.
+ */
+const CLAUDE_SAMPLE_MIN_AGE_MS = 90_000;
 const KILL_GRACE_MS = 5_000;
 const MAX_BACKOFF_MS = 60_000;
 
@@ -543,7 +550,8 @@ export async function runAgent(decision, prompt, opts = {}) {
           // agent reserves roughly five times what codex measured itself to
           // cost — so a concurrent fan-out defers claude work that had headroom
           // all along. Costs one HTTP GET, and only after the work is done.
-          const after = await refreshClaudeLimits().catch(() => null);
+          const after = await refreshClaudeLimits({ minAgeMs: CLAUDE_SAMPLE_MIN_AGE_MS })
+            .catch(() => null);
           if (after && typeof before === 'number' && typeof after.worstPercent === 'number') {
             await recordSample('claude', after.worstPercent - before).catch(() => {});
           }

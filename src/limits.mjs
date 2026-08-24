@@ -525,8 +525,27 @@ export async function refreshCodexLimits({ now = Date.now() } = {}) {
  * endpoint, which is cheap enough to do after a dispatch and is the only way
  * claude can ever measure what one of its own agents costs.
  */
-export async function refreshClaudeLimits({ now = Date.now() } = {}) {
+export async function refreshClaudeLimits({ now = Date.now(), minAgeMs = 0 } = {}) {
+  // Throttle, because unlike codex's this reading is a network call.
+  //
+  // Codex harvests its meter out of a file the dispatch just wrote, so doing it
+  // after every agent is free. Claude's costs an HTTP GET against the OAuth
+  // usage endpoint, and "after every agent" on a sixteen-wide claude fan-out is
+  // sixteen requests in a burst against an endpoint that rate-limits. Earning a
+  // 429 to measure cost would trade the meter for a statistic — and a dark
+  // meter is the single worst state this tool can be in, because every routing
+  // decision below it is computed against a reading that no longer exists.
+  //
+  // A sample from some dispatches is plenty; the estimate is a mean over many.
+  if (minAgeMs > 0) {
+    const state = await snapshot({ now: () => now });
+    const storedAt = state.probes?.claude?.storedAt;
+    if (typeof storedAt === 'number' && now - storedAt < minAgeMs) return null;
+  }
   const value = await readClaudeLimits();
+  // Never store a failed read: a 429 must not overwrite a good reading with a
+  // dark one. The previous value stays, ages out on its own TTL, and the next
+  // caller retries.
   if (value.available !== true) return null;
   await mutate((st) => {
     st.probes.claude = { storedAt: now, value };

@@ -46,7 +46,7 @@ downloaded it yet so there was nothing to churn.
 |---|---|---|
 | **F2** | router preferred codex on a box with no codex installed — a doomed spawn and an ENOENT per dispatch | an absent CLI scores like an exhausted one and is not a candidate; an *unreadable meter* still dispatches, because the first codex run is what creates the session file the meter reads |
 | **F3** | `tokens.in: 2` for a judge that had read two candidate sets | `cache_creation` and `cache_read` are summed in |
-| **F5** | claude never measured its own cost, so it reserved the default 1 against codex's measured 0.22 | `refreshClaudeLimits` + `recordSample('claude', …)` after every claude dispatch |
+| **F5** | claude never measured its own cost, so it reserved the default 1 against codex's measured 0.22 | `refreshClaudeLimits` + `recordSample('claude', …)`, throttled — see below |
 | **F8** | a 60s timeout was retried three times before failover — 202s to refuse a hang | one attempt per rung, then the other vendor: 75s, measured |
 | **F9** | SIGKILLed dispatches held headroom for the full lease and blocked `cmo update` | the client sends its pid, and the coordinator honours it for reservations from its own node |
 | `cmo update` | vendor CLIs only; `--self` was opt-in; a copied skill silently stayed stale | everything by default — CLIs, cmo, and a re-link when the skill is a copy — with `--clis-only` to opt out, and an advisory about a long-running `cmo serve` |
@@ -56,6 +56,24 @@ including the one that matters most: **an unreadable meter must still dispatch.*
 Demoting on unknown looks like the same fix as F2 and is a trap that never
 reopens — a fresh codex has no session file, so if unknown were demoted, codex
 would never get the first dispatch that would make its meter readable.
+
+**F5 needed a second pass, within the hour (0.1.22).** As first shipped it took
+a reading after *every* claude dispatch. Codex harvests its meter from a file
+the dispatch just wrote, so doing it every time is free; claude's costs an HTTP
+GET against the OAuth usage endpoint, and a sixteen-wide claude fan-out
+finishing together is sixteen requests in a burst against something that
+rate-limits. Minutes after publishing 0.1.21 the endpoint returned **429** and
+the claude meter went dark — caused by repeated forced `--refresh` calls during
+phase 00, not by a dispatch, but that is the same request against the same
+limiter and it proved the exposure before a fan-out could.
+
+Earning a 429 to measure cost trades the meter for a statistic, and a dark
+meter is the worst state this tool can be in: every routing decision below it
+is computed against a reading that no longer exists. So the post-dispatch
+reading is now skipped when the stored probe is younger than 90 seconds, and a
+failed read is never stored — a 429 leaves the previous good value in place
+rather than overwriting it with darkness. A sample from some dispatches is
+plenty; the estimate is a mean over many.
 
 **The cost, stated plainly:** phases 01–05 passed on 2026-08-23 against 0.1.20's
 dispatch path, and every fix above changes that path. Their evidence does not
