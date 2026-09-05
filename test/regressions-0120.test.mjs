@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { resetConfigCache } from '../src/config.mjs';
-import { mutate } from '../src/ledger.mjs';
+import { mutate, snapshot } from '../src/ledger.mjs';
 import { decide, providerState, rankProviders } from '../src/policy.mjs';
 import { totalInputTokens } from '../src/run.mjs';
 import { expire, localPidGone } from '../src/server.mjs';
@@ -112,9 +112,11 @@ test('claude cost sampling throttles a fresh reading and fetches on the cold pat
   const oldCredentials = process.env.CMO_CLAUDE_CREDENTIALS;
   const oldFetch = globalThis.fetch;
   let fetches = 0;
+  let fetchFails = false;
   process.env.CMO_CLAUDE_CREDENTIALS = credentialsPath;
   globalThis.fetch = async () => {
     fetches += 1;
+    if (fetchFails) return { ok: false, status: 429 };
     return {
       ok: true,
       json: async () => ({ limits: [{ group: 'session', percent: 20 }] }),
@@ -133,6 +135,17 @@ test('claude cost sampling throttles a fresh reading and fetches on the cold pat
     const refreshed = await refreshClaudeLimits({ now, minAgeMs: 90_000 });
     assert.equal(refreshed?.available, true, 'the cold path returns the successful reading');
     assert.equal(fetches, 1, 'without a stored probe the usage endpoint is called exactly once');
+
+    fetchFails = true;
+    const failedAt = now + 90_001;
+    const dark = await refreshClaudeLimits({ now: failedAt, minAgeMs: 90_000 });
+    assert.equal(dark, null, 'a failed refresh returns no reading');
+    assert.equal(fetches, 2, 'a stale reading reaches the usage endpoint');
+    const retained = await snapshot({ now: () => failedAt, local: true });
+    assert.equal(retained.probes.claude.storedAt, now,
+      'a failed refresh must not replace the last good reading');
+    assert.equal(retained.probes.claude.value.available, true,
+      'the stored meter must never be overwritten by a dark reading');
   } finally {
     globalThis.fetch = oldFetch;
     if (oldCredentials === undefined) delete process.env.CMO_CLAUDE_CREDENTIALS;

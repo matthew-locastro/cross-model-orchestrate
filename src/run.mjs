@@ -480,6 +480,19 @@ function normalizeSchemaNode(schema, { closeCurrentObject = true } = {}) {
   if (properties && typeof properties === 'object' && !Array.isArray(properties)) {
     normalized.properties = Object.fromEntries(
       Object.entries(properties).map(([name, child]) => {
+        // Boolean `false` forbids the property outright. Widening it to null
+        // and later requiring it would reverse that contract — the strongest
+        // possible inversion of the author's meaning — so preserve it and never
+        // add it to `required`. The trade is explicit and worth stating: the
+        // strict dialect rejects `false` as a schema value outright, so keeping
+        // it guarantees this dispatch is refused by codex and recovers on the
+        // claude rung. A visible failover beats silently sending the model a
+        // schema that says the opposite of what the caller wrote.
+        //
+        // Boolean `true` is a different case: it already accepts every value,
+        // including null, so it needs no widening and can be required
+        // unchanged. Verified against the endpoint rather than assumed.
+        if (child === false) return [name, false];
         const normalizedChild = normalizeSchemaNode(child);
         return [name, originalRequired.has(name) ? normalizedChild : makeSchemaNullable(normalizedChild)];
       }),
@@ -561,21 +574,29 @@ function normalizeSchemaNode(schema, { closeCurrentObject = true } = {}) {
     // Preserve map schemas. An explicit additionalProperties value is part of
     // the caller's contract; Codex may reject that dialect, but narrowing it
     // would be worse and the visible Claude failover can still honor it. A
-    // composed node's complete property set is not locally knowable, so closing
-    // it here could make every instance invalid.
-    const hasComposition = ['allOf', 'anyOf', 'oneOf', 'if', 'then', 'else',
-      'dependentSchemas', 'dependencies'].some((key) => Object.hasOwn(schema, key));
-    if (closeCurrentObject && hasProperties && !hasComposition
+    // composition, `$ref`, or required name absent from local properties proves
+    // the complete property set is not locally knowable, so closing it here
+    // could make every instance invalid.
+    const propertyNames = hasProperties ? Object.keys(properties) : [];
+    const originalRequiredNames = Array.isArray(schema.required) ? schema.required : [];
+    const hasNonLocalPropertyContributor = ['$ref', '$dynamicRef', '$recursiveRef',
+      'allOf', 'anyOf', 'oneOf',
+      'if', 'then', 'else', 'dependentSchemas', 'dependencies']
+      .some((key) => Object.hasOwn(schema, key));
+    const requiresNonLocalProperty = hasProperties && originalRequiredNames
+      .some((name) => !Object.hasOwn(properties, name));
+    if (closeCurrentObject && hasProperties && !hasNonLocalPropertyContributor
+        && !requiresNonLocalProperty
         && !Object.hasOwn(schema, 'additionalProperties')) {
       normalized.additionalProperties = false;
     }
-    const propertyNames = hasProperties ? Object.keys(properties) : [];
     if (propertyNames.length > 0) {
-      const originalRequiredNames = Array.isArray(schema.required) ? schema.required : [];
-      normalized.required = [
+      const requiredNames = [
         ...originalRequiredNames,
-        ...propertyNames.filter((name) => !originalRequired.has(name)),
+        ...propertyNames.filter((name) => properties[name] !== false && !originalRequired.has(name)),
       ];
+      if (requiredNames.length > 0) normalized.required = requiredNames;
+      else delete normalized.required;
     }
     else if (Array.isArray(schema.required) && schema.required.length === 0) delete normalized.required;
   }

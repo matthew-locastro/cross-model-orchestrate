@@ -530,6 +530,61 @@ test('composed object roots stay open so branch properties remain satisfiable', 
   }
 });
 
+// Named for what it actually asserts. The referring node is left open because a
+// `$ref` contributes properties this node cannot see, so closing it against the
+// local set alone would forbid them. That is the whole claim.
+//
+// It is deliberately NOT a claim that the result is satisfiable: `$defs.base`
+// stays closed, which forbids the sibling `b` the root requires. Closing `$defs`
+// is load bearing for the common case, and the endpoint rejects a `$ref` carrying
+// sibling keywords before satisfiability is ever evaluated, so this shape fails
+// over to claude either way. Naming it "remains satisfiable" would have blessed a
+// property the code does not have.
+test('an object with a ref stays open rather than forbidding the ref\'s properties', () => {
+  const normalized = normalizeSchemaForCodex({
+    type: 'object',
+    $defs: {
+      base: { type: 'object', properties: { a: { type: 'string' } } },
+    },
+    $ref: '#/$defs/base',
+    properties: { b: { type: 'string' } },
+  });
+  assert.equal(Object.hasOwn(normalized, 'additionalProperties'), false);
+  assert.equal(normalized.$defs.base.additionalProperties, false);
+});
+
+test('an object stays open when required names are absent from local properties', () => {
+  const normalized = normalizeSchemaForCodex({
+    type: 'object',
+    properties: { a: { type: 'string' } },
+    required: ['a', 'fromElsewhere'],
+  });
+  assert.equal(Object.hasOwn(normalized, 'additionalProperties'), false);
+  assert.deepEqual(normalized.required, ['a', 'fromElsewhere']);
+});
+
+test('false property schemas stay forbidden while true schemas remain requireable', () => {
+  const normalized = normalizeSchemaForCodex({
+    type: 'object',
+    properties: {
+      banned: false,
+      anything: true,
+      ok: { type: 'string' },
+    },
+    required: ['ok'],
+  });
+  assert.equal(normalized.properties.banned, false);
+  assert.equal(normalized.properties.anything, true);
+  assert.deepEqual(normalized.required, ['ok', 'anything']);
+
+  const forbiddenOnly = normalizeSchemaForCodex({
+    type: 'object',
+    properties: { banned: false },
+  });
+  assert.equal(Object.hasOwn(forbiddenOnly, 'required'), false,
+    'forbidden properties must not synthesize an empty required list');
+});
+
 test('normalization preserves required names contributed outside local properties', () => {
   const normalized = normalizeSchemaForCodex({
     type: 'object',
