@@ -287,6 +287,7 @@ async function main() {
       process.stdout.write(`  ${prov.padEnd(7)} ${String(info.count).padStart(3)}   ${models}\n`);
     }
     if (sum.codexShare != null) process.stdout.write(`\ncodex share: ${sum.codexShare}%\n`);
+    if (sum.failedOver) process.stdout.write(`failovers: ${sum.failedOver}\n`);
     const ind = sum.independence;
     if (ind['cross-vendor'] || ind['same-vendor']) {
       process.stdout.write(`reviews: ${ind['cross-vendor']} cross-vendor, `
@@ -328,7 +329,9 @@ async function main() {
       return 0;
     }
 
-    process.stdout.write(`${sum.total} dispatches · ${sum.failed} failed · codex share ${sum.codexShare}%\n\n`);
+    process.stdout.write(`${sum.total} dispatches · ${sum.failed} failed`
+      + (sum.failedOver ? ` · ${sum.failedOver} failed over` : '')
+      + ` · codex share ${sum.codexShare}%\n\n`);
     for (const [prov, info] of Object.entries(sum.byProvider)) {
       const models = Object.entries(info.models).map(([m, n]) => `${m}x${n}`).join('  ');
       process.stdout.write(`  ${prov.padEnd(7)} ${String(info.count).padStart(4)}   ${models}\n`);

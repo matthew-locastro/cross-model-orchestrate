@@ -8,6 +8,7 @@ import './isolate.mjs'; // MUST be first — see the file
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
+import { readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -29,8 +30,10 @@ import {
   extractJson,
   parseClaudeStdout,
   parseCodexStream,
+  normalizeSchemaForCodex,
   runAgent,
 } from '../src/run.mjs';
+import { readAudit } from '../src/audit.mjs';
 
 const healthy = (percent = 5) => ({
   available: true,
@@ -337,6 +340,245 @@ test('the codex command is non-interactive and takes its prompt on stdin', () =>
   assert.ok(!args.includes('--dangerously-bypass-approvals-and-sandbox'));
 });
 
+// ── OpenAI schema dialect ─────────────────────────────────────────────────
+
+test('codex schema normalization makes optional properties required and nullable', () => {
+  assert.deepEqual(normalizeSchemaForCodex({
+    type: 'object',
+    required: ['ok'],
+    properties: { ok: { type: 'string' }, note: { type: 'string' } },
+  }), {
+    type: 'object',
+    required: ['ok', 'note'],
+    properties: { ok: { type: 'string' }, note: { type: ['string', 'null'] } },
+    additionalProperties: false,
+  });
+});
+
+test('codex schema normalization recurses into nested objects', () => {
+  const normalized = normalizeSchemaForCodex({
+    type: 'object',
+    properties: {
+      child: { type: 'object', properties: { value: { type: 'number' } } },
+    },
+  });
+  assert.deepEqual(normalized.required, ['child']);
+  assert.equal(normalized.additionalProperties, false);
+  assert.deepEqual(normalized.properties.child.type, ['object', 'null']);
+  assert.deepEqual(normalized.properties.child.required, ['value']);
+  assert.equal(normalized.properties.child.additionalProperties, false);
+});
+
+test('codex schema normalization recurses into array items beneath an object root', () => {
+  const normalized = normalizeSchemaForCodex({
+    type: 'object',
+    required: ['rows'],
+    properties: {
+      rows: {
+        type: 'array',
+        items: { type: 'object', required: ['id'], properties: { id: { type: 'integer' } } },
+      },
+    },
+  });
+  assert.deepEqual(normalized.properties.rows.items.required, ['id']);
+  assert.equal(normalized.properties.rows.items.additionalProperties, false);
+});
+
+test('codex schema normalization reaches deeply nested property and item schemas', () => {
+  const normalized = normalizeSchemaForCodex({
+    type: 'object',
+    properties: {
+      a: {
+        type: 'object',
+        properties: {
+          b: {
+            type: 'array',
+            items: { type: 'object', properties: { c: { type: 'string' } } },
+          },
+        },
+      },
+    },
+  });
+  assert.deepEqual(normalized.required, ['a']);
+  assert.deepEqual(normalized.properties.a.required, ['b']);
+  assert.deepEqual(normalized.properties.a.properties.b.items.required, ['c']);
+  assert.equal(normalized.properties.a.properties.b.items.additionalProperties, false);
+});
+
+test('codex schema normalization recurses into a definition used by an object contract', () => {
+  const normalized = normalizeSchemaForCodex({
+    type: 'object',
+    required: ['item'],
+    properties: { item: { $ref: '#/$defs/Item' } },
+    $defs: {
+      Item: { type: 'object', required: ['name'], properties: { name: { type: 'string' } } },
+    },
+  });
+  assert.equal(normalized.additionalProperties, false);
+  assert.equal(normalized.$defs.Item.additionalProperties, false);
+  assert.deepEqual(normalized.$defs.Item.required, ['name']);
+});
+
+test('codex schema normalization preserves map schemas and normalizes their value schema', () => {
+  const normalized = normalizeSchemaForCodex({
+    type: 'object',
+    required: ['labels'],
+    properties: {
+      labels: {
+        type: 'object',
+        additionalProperties: {
+          type: 'object',
+          required: ['value'],
+          properties: { value: { type: 'string' } },
+        },
+      },
+    },
+  });
+  const valueSchema = normalized.properties.labels.additionalProperties;
+  assert.notEqual(valueSchema, false, 'a map must not be silently narrowed to the empty object');
+  assert.equal(valueSchema.additionalProperties, false);
+  assert.deepEqual(valueSchema.required, ['value']);
+});
+
+test('codex schema normalization closes nullable objects', () => {
+  const normalized = normalizeSchemaForCodex({
+    type: 'object',
+    required: ['child'],
+    properties: {
+      child: {
+        type: ['object', 'null'],
+        required: ['value'],
+        properties: { value: { type: 'string' } },
+      },
+    },
+  });
+  assert.equal(normalized.properties.child.additionalProperties, false);
+});
+
+test('an already-strict codex schema is left byte-identical in meaning', () => {
+  const strict = {
+    type: 'object',
+    properties: {
+      nested: {
+        type: 'object',
+        properties: { ok: { type: 'boolean' } },
+        additionalProperties: false,
+        required: ['ok'],
+      },
+    },
+    additionalProperties: false,
+    required: ['nested'],
+  };
+  assert.equal(JSON.stringify(normalizeSchemaForCodex(strict)), JSON.stringify(strict));
+});
+
+test('codex schema normalization never mutates the caller-owned input', () => {
+  const input = {
+    type: 'object',
+    properties: { child: { type: 'object', properties: { ok: { type: 'boolean' } } } },
+  };
+  const deepFreeze = (value) => {
+    if (value && typeof value === 'object') {
+      Object.freeze(value);
+      Object.values(value).forEach(deepFreeze);
+    }
+    return value;
+  };
+  const before = structuredClone(input);
+  deepFreeze(input);
+  const normalized = normalizeSchemaForCodex(input);
+  assert.deepEqual(input, before);
+  assert.notEqual(normalized, input);
+  assert.notEqual(normalized.properties.child, input.properties.child);
+});
+
+test('an opaque object stays open rather than being narrowed to the empty object', () => {
+  const normalized = normalizeSchemaForCodex({ type: 'object', title: 'opaque' });
+  assert.deepEqual(normalized, { type: 'object', title: 'opaque' });
+  assert.equal(Object.hasOwn(normalized, 'required'), false);
+
+  const empty = normalizeSchemaForCodex({ type: 'object', properties: {} });
+  assert.deepEqual(empty, { type: 'object', properties: {}, additionalProperties: false });
+  assert.equal(Object.hasOwn(empty, 'required'), false);
+
+  const explicitEmpty = normalizeSchemaForCodex({ type: 'object', properties: {}, required: [] });
+  assert.deepEqual(explicitEmpty, { type: 'object', properties: {}, additionalProperties: false });
+});
+
+test('an untyped properties map is normalized as an object', () => {
+  const normalized = normalizeSchemaForCodex({
+    properties: { a: { type: 'string' }, b: { type: 'integer' } },
+    required: ['a'],
+  });
+  assert.equal(normalized.additionalProperties, false);
+  assert.deepEqual(normalized.required, ['a', 'b']);
+  assert.deepEqual(normalized.properties.b.type, ['integer', 'null']);
+});
+
+test('composed object roots stay open so branch properties remain satisfiable', () => {
+  for (const keyword of ['allOf', 'anyOf', 'oneOf']) {
+    const normalized = normalizeSchemaForCodex({
+      type: 'object',
+      required: ['v'],
+      properties: { v: { type: 'string' } },
+      [keyword]: [{ type: 'object', properties: { x: { type: 'string' } } }],
+    });
+    assert.equal(Object.hasOwn(normalized, 'additionalProperties'), false, keyword);
+    assert.equal(Object.hasOwn(normalized[keyword][0], 'additionalProperties'), false, keyword);
+    assert.deepEqual(normalized.required, ['v'], keyword);
+    assert.deepEqual(normalized[keyword][0].required, ['x'], keyword);
+  }
+});
+
+test('normalization preserves required names contributed outside local properties', () => {
+  const normalized = normalizeSchemaForCodex({
+    type: 'object',
+    required: ['x', 'v'],
+    properties: { v: { type: 'string' } },
+    allOf: [{ type: 'object', properties: { x: { type: 'string' } } }],
+  });
+  assert.deepEqual(normalized.required, ['x', 'v']);
+  assert.equal(Object.hasOwn(normalized, 'additionalProperties'), false);
+});
+
+test('optional enum and const properties gain a real null branch', () => {
+  const normalized = normalizeSchemaForCodex({
+    type: 'object',
+    properties: {
+      grade: { type: 'string', enum: ['a', 'b'] },
+      fixed: { type: 'string', const: 'x' },
+    },
+  });
+  assert.deepEqual(normalized.properties.grade, {
+    anyOf: [{ type: 'string', enum: ['a', 'b'] }, { type: 'null' }],
+  });
+  assert.deepEqual(normalized.properties.fixed, {
+    anyOf: [{ type: 'string', const: 'x' }, { type: 'null' }],
+  });
+});
+
+test('normalization reaches schema-bearing conditional and map keywords', () => {
+  const objectSchema = { properties: { x: { type: 'string' } } };
+  const normalized = normalizeSchemaForCodex({
+    not: objectSchema,
+    if: objectSchema,
+    then: objectSchema,
+    else: objectSchema,
+    patternProperties: { '^x': objectSchema },
+    dependentSchemas: { x: objectSchema },
+    contains: objectSchema,
+    additionalItems: objectSchema,
+  });
+  for (const key of ['not', 'if', 'then', 'else']) {
+    assert.equal(Object.hasOwn(normalized[key], 'additionalProperties'), false, key);
+  }
+  for (const key of ['contains', 'additionalItems']) {
+    assert.equal(normalized[key].additionalProperties, false, key);
+  }
+  assert.equal(normalized.patternProperties['^x'].additionalProperties, false);
+  assert.equal(Object.hasOwn(normalized.dependentSchemas.x, 'additionalProperties'), false);
+});
+
 test('full access is opt-in and replaces the sandbox flag', () => {
   const { args } = buildCommand(
     { provider: 'codex', model: 'gpt-5.6-luna' },
@@ -373,6 +615,10 @@ test('failures are classified so the right recovery runs', () => {
   assert.equal(classifyFailure({ code: null, timedOut: true }), 'timeout');
   assert.equal(classifyFailure({ code: 1, stderr: 'You have hit your usage limit' }), 'rate-limit');
   assert.equal(classifyFailure({ code: 1, stderr: 'HTTP 429 Too Many Requests' }), 'rate-limit');
+  assert.equal(classifyFailure({
+    code: 1,
+    schemaRejected: true,
+  }), 'schema-rejection');
   assert.equal(classifyFailure({ code: 1, stderr: 'ECONNRESET while streaming' }), 'transient');
   assert.equal(classifyFailure({ code: 1, stderr: 'Please run codex login' }), 'auth');
   assert.equal(classifyFailure({ code: 2, stderr: 'unknown flag --nope' }), 'fatal');
@@ -406,6 +652,19 @@ test('failures are classified so the right recovery runs', () => {
   // 5xx narrowed to the statuses that actually mean retry.
   assert.equal(classifyFailure({ code: 1, stderr: 'HTTP 503 from upstream' }), 'transient');
   assert.equal(classifyFailure({ code: 1, stderr: 'compilation failed at offset 555' }), 'fatal');
+  assert.equal(classifyFailure({
+    code: 1,
+    stdout: JSON.stringify({
+      type: 'item.completed',
+      item: { text: 'the config has an invalid schema, so I fixed it' },
+    }),
+    hasOutput: false,
+  }), 'fatal', 'agent work product is not structured endpoint metadata');
+  assert.equal(classifyFailure({
+    code: 1,
+    stderr: 'ECONNRESET while reading a response_format error',
+    schemaRejected: true,
+  }), 'transient', 'a structured schema signal must not shadow a transport failure');
 });
 
 test('backoff grows and stays bounded', () => {
@@ -431,9 +690,18 @@ test('claude and codex stdout both yield text and usage', () => {
 
   const codex = parseCodexStream([
     JSON.stringify({ type: 'thread.started', thread_id: 'x' }),
+    JSON.stringify({ type: 'error', message: 'invalid_json_schema in response_format' }),
     JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 18861, output_tokens: 19 } }),
   ].join('\n'));
   assert.equal(codex.usage.output_tokens, 19);
+  assert.equal(codex.schemaRejected, true);
+
+  const wrappedError = parseCodexStream(JSON.stringify({
+    type: 'error',
+    payload: { error: { message: 'invalid_json_schema in codex_output_schema' } },
+  }));
+  assert.equal(wrappedError.schemaRejected, true);
+  assert.match(wrappedError.error, /codex_output_schema/);
 });
 
 // ── runner ────────────────────────────────────────────────────────────────
@@ -451,6 +719,93 @@ function fakeSpawn(script) {
 }
 
 const claudeOut = (text) => JSON.stringify({ type: 'result', result: text });
+
+test('the codex runner passes a normalized schema file without changing its prompt contract', async () => {
+  const schema = {
+    type: 'object',
+    required: ['ok'],
+    properties: { ok: { type: 'string' }, note: { type: 'string' } },
+  };
+  let writtenSchema;
+  let capturedInvocation;
+  const spawnImpl = async (invocation) => {
+    capturedInvocation = invocation;
+    const schemaIndex = invocation.args.indexOf('--output-schema');
+    assert.notEqual(schemaIndex, -1, 'the codex argv must retain --output-schema');
+    writtenSchema = JSON.parse(await readFile(invocation.args[schemaIndex + 1], 'utf8'));
+    const messageIndex = invocation.args.indexOf('--output-last-message');
+    await writeFile(invocation.args[messageIndex + 1], '{"ok":"yes","note":"done"}', 'utf8');
+    return { code: 0, signal: null, timedOut: false, stdout: '', stderr: '' };
+  };
+
+  const out = await runAgent(
+    { provider: 'codex', model: 'gpt-5.6-terra', tier: 'balanced', fallback: null },
+    'return a result',
+    { spawnImpl, sleep: async () => {}, schema },
+  );
+
+  assert.equal(out.ok, true);
+  assert.deepEqual(writtenSchema, {
+    ...schema,
+    properties: { ok: { type: 'string' }, note: { type: ['string', 'null'] } },
+    required: ['ok', 'note'],
+    additionalProperties: false,
+  });
+  assert.ok(capturedInvocation.prompt.includes(JSON.stringify(schema, null, 2)));
+  assert.deepEqual(schema.required, ['ok'], 'the caller schema must remain unchanged');
+});
+
+test('a codex JSONL error event reaches the attempt and returned error', async () => {
+  const message = "invalid_json_schema: 'additionalProperties' is required to be supplied and to be false";
+  const spawnImpl = fakeSpawn([{
+    code: 1,
+    stdout: JSON.stringify({ type: 'error', message }),
+    stderr: '',
+  }]);
+  const out = await runAgent(
+    { provider: 'codex', model: 'gpt-5.6-terra', tier: 'balanced', fallback: null },
+    'return a result',
+    { spawnImpl, sleep: async () => {}, maxAttempts: 3 },
+  );
+
+  assert.equal(out.ok, false);
+  assert.equal(spawnImpl.calls.length, 1, 'a malformed request is deterministic and must not be retried');
+  assert.equal(out.attempts[0].failure, 'schema-rejection');
+  assert.match(out.attempts[0].stderr, /additionalProperties/);
+  assert.match(out.error, /additionalProperties/);
+});
+
+test('a rejected codex schema fails over visibly to claude', async () => {
+  const message = "invalid_json_schema: 'additionalProperties' is required to be supplied and to be false";
+  const spawnImpl = fakeSpawn([
+    {
+      code: 1,
+      stdout: JSON.stringify({ type: 'error', message }),
+      stderr: '',
+    },
+    { code: 0, stdout: claudeOut('{"x":"y"}') },
+  ]);
+  const out = await runAgent({
+    provider: 'codex',
+    model: 'gpt-5.6-terra',
+    tier: 'balanced',
+    fallback: { provider: 'claude', model: 'sonnet', tier: 'balanced', effort: 'medium' },
+  }, 'return a result', {
+    spawnImpl,
+    sleep: async () => {},
+    schema: { type: 'object', properties: { x: { type: 'totally-not-a-type' } } },
+  });
+
+  assert.equal(out.ok, true);
+  assert.equal(out.provider, 'claude');
+  assert.equal(spawnImpl.calls.length, 2);
+  assert.equal(out.failedOver, true);
+  assert.equal(out.attempts[0].failure, 'schema-rejection');
+  const receipt = (await readAudit()).find((row) => row.id === out.dispatchId);
+  assert.equal(receipt?.provider, 'claude');
+  assert.equal(receipt?.failedOver, true);
+  assert.deepEqual(receipt?.failures, ['schema-rejection']);
+});
 
 test('a rate-limited primary fails over to the other vendor immediately', async () => {
   const spawnImpl = fakeSpawn([

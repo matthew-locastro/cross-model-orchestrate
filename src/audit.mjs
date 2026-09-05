@@ -76,6 +76,7 @@ export function summarise(rows, { expected = null } = {}) {
   const byRole = {};
   const independence = { 'cross-vendor': 0, 'same-vendor': 0 };
   let failed = 0;
+  let failedOver = 0;
 
   for (const r of rows) {
     const p = (byProvider[r.provider] ??= { count: 0, models: {} });
@@ -84,6 +85,7 @@ export function summarise(rows, { expected = null } = {}) {
     byRole[r.role ?? 'unknown'] = (byRole[r.role ?? 'unknown'] ?? 0) + 1;
     if (r.independence && independence[r.independence] !== undefined) independence[r.independence] += 1;
     if (r.ok === false) failed += 1;
+    if (r.failedOver) failedOver += 1;
   }
 
   const total = rows.length;
@@ -91,6 +93,7 @@ export function summarise(rows, { expected = null } = {}) {
   return {
     total,
     failed,
+    failedOver,
     byProvider,
     byRole,
     independence,
@@ -202,6 +205,16 @@ export function findings(rows, { perAgentCost = null, limits = null } = {}) {
       severity: 'medium',
       finding: `${retried} dispatches (${pct(retried, total)}%) needed more than one attempt`,
       action: 'Retries are wasted spend. Check whether one provider is flaky, or a tier is too small for its role.',
+    });
+  }
+
+  const failedOver = rows.filter((r) => r.failedOver).length;
+  if (failedOver) {
+    out.push({
+      severity: 'medium',
+      finding: `${failedOver} of ${total} dispatches ran on a fallback provider (${pct(failedOver, total)}%)`,
+      action: 'These dispatches did not run where policy planned. Inspect their failure labels; '
+        + 'schema-rejection means Codex refused its enforced schema while Claude completed from the prompt contract.',
     });
   }
 

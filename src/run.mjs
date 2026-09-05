@@ -57,6 +57,7 @@ const MAX_BACKOFF_MS = 60_000;
 // ── failure classification ────────────────────────────────────────────────
 
 const RATE_LIMIT_RE = /\b(rate[ _-]?limit|usage limit|quota exceeded|429|too many requests|out of (?:credits|usage)|limit reached)\b/i;
+const STRUCTURED_SCHEMA_REJECTION_RE = /\b(?:invalid[ _-]?json[ _-]?schema|response_format|codex_output_schema)\b/i;
 // 5\d\d matched any number from 500 to 599 — line numbers, byte counts, pixel
 // values, durations. Name the statuses that actually mean "retry" instead.
 const TRANSIENT_RE = /\b(ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|network error|stream (?:closed|error)|5(?:00|02|03|04|29)\b|overloaded|temporarily unavailable|service unavailable)\b/i;
@@ -86,13 +87,34 @@ const AUTH_RE = /\b(unauthori[sz]ed|401|403|invalid[ _-]?api[ _-]?key|not logged
  * words are in it. Only when there is no usable output is stdout worth reading
  * as a log — that is the case where a CLI printed its error there and exited.
  */
-export function classifyFailure({ code, signal, timedOut, stderr = '', stdout = '', hasOutput = false }) {
+export function classifyFailure({
+  code, signal, timedOut, stderr = '', stdout = '', hasOutput = false, schemaRejected = false,
+  structuredError = '',
+}) {
   if (timedOut) return 'timeout';
   if (code === 0 && !signal && hasOutput) return 'none';
   const text = hasOutput ? stderr : `${stderr}\n${stdout}`;
-  if (RATE_LIMIT_RE.test(text)) return 'rate-limit';
-  if (AUTH_RE.test(text)) return 'auth';
-  if (TRANSIENT_RE.test(text)) return 'transient';
+  // When the endpoint rejects a schema it quotes the caller's offending
+  // subschema back in the message. So a schema that merely CONTAINS 429, 503 or
+  // 403 — an enum of HTTP status codes, a `maximum`, a `const` — would match
+  // RATE_LIMIT_RE, TRANSIENT_RE or AUTH_RE below and be misread as a transport
+  // condition. The rate-limit branch is the expensive one: it calls
+  // markExhausted('codex'), which writes `hardBlocked: true` into the ledger
+  // every orchestrator on this machine shares, so one malformed schema would
+  // route all of them away from codex until the window reset.
+  //
+  // The fix is to narrow what the regexes read, not to reorder them. Subtract
+  // the structured error payload — which is quoted user input — and scan only
+  // what the transport itself said. A genuine ECONNRESET reported alongside a
+  // schema rejection still lives outside that payload, still matches, and still
+  // wins, because a transport failure is worth a retry and a bad schema is not.
+  const scanText = structuredError ? text.split(structuredError).join(' ') : text;
+  if (RATE_LIMIT_RE.test(scanText)) return 'rate-limit';
+  if (AUTH_RE.test(scanText)) return 'auth';
+  if (TRANSIENT_RE.test(scanText)) return 'transient';
+  // Trusted only when parseCodexStream saw a structured error event. Agent
+  // stdout is work product and may discuss invalid schemas in prose.
+  if (schemaRejected) return 'schema-rejection';
   if (signal) return 'transient';
   if (code === 0) return 'none';
   return 'fatal';
@@ -304,6 +326,8 @@ function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env }) {
 export function parseCodexStream(stdout) {
   let rateLimits = null;
   let usage = null;
+  let error = null;
+  let schemaRejected = false;
   for (const line of stdout.split('\n')) {
     if (!line || line[0] !== '{') continue;
     let event;
@@ -314,11 +338,22 @@ export function parseCodexStream(stdout) {
     }
     const payload = event.payload ?? event.msg ?? event;
     if (payload?.rate_limits) rateLimits = payload.rate_limits;
+    const isErrorEvent = event?.type === 'error' || payload?.type === 'error';
+    if (isErrorEvent) {
+      const message = payload?.message ?? payload?.error?.message
+        ?? event?.message ?? event?.error?.message
+        ?? (typeof payload?.error === 'string' ? payload.error : null)
+        ?? (typeof event?.error === 'string' ? event.error : null);
+      if (typeof message === 'string' && message) error = message;
+      // Search only this structured error envelope. Other JSONL events contain
+      // agent work product, where the same words are ordinary task content.
+      schemaRejected ||= STRUCTURED_SCHEMA_REJECTION_RE.test(JSON.stringify(event));
+    }
     if (event?.type === 'turn.completed' && event.usage) usage = event.usage;
     else if (payload?.info?.total_token_usage) usage = payload.info.total_token_usage;
     else if (payload?.type === 'token_count' && payload.info) usage = payload.info;
   }
-  return { rateLimits, usage };
+  return { rateLimits, usage, error, schemaRejected };
 }
 
 /** `claude -p --output-format json` returns one envelope; be liberal about it. */
@@ -390,6 +425,164 @@ export function schemaContract(schema) {
   ].join('\n');
 }
 
+function schemaAllowsNull(schema) {
+  if (schema === true) return true;
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return false;
+  if (schema.type === 'null') return true;
+  if (Array.isArray(schema.type) && schema.type.includes('null')) return true;
+  if (schema.const === null) return true;
+  if (Array.isArray(schema.enum) && schema.enum.includes(null)) return true;
+  return ['anyOf', 'oneOf'].some((key) => (
+    Array.isArray(schema[key]) && schema[key].some((child) => schemaAllowsNull(child))
+  ));
+}
+
+function makeSchemaNullable(schema) {
+  if (schemaAllowsNull(schema)) return schema;
+  if (schema && typeof schema === 'object' && !Array.isArray(schema)) {
+    // `type` is conjunctive with enum/const. Widening only the type would claim
+    // null is allowed while those siblings still reject it.
+    if (!Object.hasOwn(schema, 'enum') && !Object.hasOwn(schema, 'const')) {
+      if (typeof schema.type === 'string') return { ...schema, type: [schema.type, 'null'] };
+      if (Array.isArray(schema.type)) return { ...schema, type: [...schema.type, 'null'] };
+    }
+  }
+  return { anyOf: [schema, { type: 'null' }] };
+}
+
+/**
+ * OpenAI's structured-output endpoint accepts a narrower dialect than ordinary
+ * JSON Schema. Close objects whose full property set is declared locally and
+ * require those properties; leave opaque and composed objects open rather than
+ * inventing an unsatisfiable contract. Caller-optional properties are widened
+ * to accept null. Rebuild only schema-bearing branches so caller-owned schemas
+ * are never mutated and annotation payloads such as `default` stay untouched.
+ */
+export function normalizeSchemaForCodex(schema) {
+  return normalizeSchemaNode(schema);
+}
+
+function normalizeSchemaNode(schema, { closeCurrentObject = true } = {}) {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return schema;
+
+  const normalized = { ...schema };
+
+  for (const key of ['$defs', 'definitions']) {
+    const entries = schema[key];
+    if (!entries || typeof entries !== 'object' || Array.isArray(entries)) continue;
+    normalized[key] = Object.fromEntries(
+      Object.entries(entries).map(([name, child]) => [name, normalizeSchemaNode(child)]),
+    );
+  }
+
+  const properties = schema.properties;
+  const originalRequired = new Set(Array.isArray(schema.required) ? schema.required : []);
+  if (properties && typeof properties === 'object' && !Array.isArray(properties)) {
+    normalized.properties = Object.fromEntries(
+      Object.entries(properties).map(([name, child]) => {
+        const normalizedChild = normalizeSchemaNode(child);
+        return [name, originalRequired.has(name) ? normalizedChild : makeSchemaNullable(normalizedChild)];
+      }),
+    );
+  }
+
+  if (schema.additionalProperties && typeof schema.additionalProperties === 'object'
+      && !Array.isArray(schema.additionalProperties)) {
+    normalized.additionalProperties = normalizeSchemaNode(schema.additionalProperties);
+  }
+
+  if (Array.isArray(schema.items)) {
+    normalized.items = schema.items.map((child) => normalizeSchemaNode(child));
+  } else if (schema.items && typeof schema.items === 'object') {
+    normalized.items = normalizeSchemaNode(schema.items);
+  }
+
+  for (const key of ['allOf', 'anyOf', 'oneOf']) {
+    if (Array.isArray(schema[key])) {
+      // These branches constrain the same instance as their parent. Closing a
+      // branch around only its own properties would forbid properties supplied
+      // by the parent or a sibling branch and make the composition impossible.
+      normalized[key] = schema[key].map((child) => (
+        normalizeSchemaNode(child, { closeCurrentObject: false })
+      ));
+    }
+  }
+
+  if (Array.isArray(schema.prefixItems)) {
+    normalized.prefixItems = schema.prefixItems.map((child) => normalizeSchemaNode(child));
+  }
+
+  for (const key of ['not', 'if', 'then', 'else']) {
+    const child = schema[key];
+    if (child && typeof child === 'object' && !Array.isArray(child)) {
+      normalized[key] = normalizeSchemaNode(child, { closeCurrentObject: false });
+    }
+  }
+
+  for (const key of ['propertyNames', 'contains', 'additionalItems',
+    'unevaluatedProperties', 'unevaluatedItems']) {
+    const child = schema[key];
+    if (child && typeof child === 'object' && !Array.isArray(child)) {
+      normalized[key] = normalizeSchemaNode(child);
+    }
+  }
+
+  const patternProperties = schema.patternProperties;
+  if (patternProperties && typeof patternProperties === 'object'
+      && !Array.isArray(patternProperties)) {
+    normalized.patternProperties = Object.fromEntries(
+      Object.entries(patternProperties).map(([name, child]) => [
+        name,
+        child && typeof child === 'object' && !Array.isArray(child)
+          ? normalizeSchemaNode(child)
+          : child,
+      ]),
+    );
+  }
+
+  for (const key of ['dependentSchemas', 'dependencies']) {
+    const entries = schema[key];
+    if (!entries || typeof entries !== 'object' || Array.isArray(entries)) continue;
+    normalized[key] = Object.fromEntries(
+      Object.entries(entries).map(([name, child]) => [
+        name,
+        child && typeof child === 'object' && !Array.isArray(child)
+          ? normalizeSchemaNode(child, { closeCurrentObject: false })
+          : child,
+      ]),
+    );
+  }
+
+  const hasProperties = properties && typeof properties === 'object' && !Array.isArray(properties);
+  const isObject = hasProperties
+    || schema.type === 'object'
+    || (Array.isArray(schema.type) && schema.type.includes('object'));
+  if (isObject) {
+    // Preserve map schemas. An explicit additionalProperties value is part of
+    // the caller's contract; Codex may reject that dialect, but narrowing it
+    // would be worse and the visible Claude failover can still honor it. A
+    // composed node's complete property set is not locally knowable, so closing
+    // it here could make every instance invalid.
+    const hasComposition = ['allOf', 'anyOf', 'oneOf', 'if', 'then', 'else',
+      'dependentSchemas', 'dependencies'].some((key) => Object.hasOwn(schema, key));
+    if (closeCurrentObject && hasProperties && !hasComposition
+        && !Object.hasOwn(schema, 'additionalProperties')) {
+      normalized.additionalProperties = false;
+    }
+    const propertyNames = hasProperties ? Object.keys(properties) : [];
+    if (propertyNames.length > 0) {
+      const originalRequiredNames = Array.isArray(schema.required) ? schema.required : [];
+      normalized.required = [
+        ...originalRequiredNames,
+        ...propertyNames.filter((name) => !originalRequired.has(name)),
+      ];
+    }
+    else if (Array.isArray(schema.required) && schema.required.length === 0) delete normalized.required;
+  }
+
+  return normalized;
+}
+
 /** The provider's last reported percentage, ignoring committed reservations. */
 async function percentFor(provider) {
   try {
@@ -437,10 +630,14 @@ export async function runAgent(decision, prompt, opts = {}) {
   const attempts = [];
   const workdir = await mkdtemp(join(tmpdir(), 'cmo-'));
   const lastMessageFile = join(workdir, 'last-message.txt');
-  let schemaFile = null;
+  let codexSchemaFile = null;
   if (schema) {
-    schemaFile = join(workdir, 'schema.json');
-    await writeFile(schemaFile, JSON.stringify(schema), 'utf8');
+    codexSchemaFile = join(workdir, 'schema.json');
+    // This asymmetry is deliberate. Codex's endpoint requires its strict
+    // dialect on disk, while Claude receives the caller's original schema as a
+    // prompt contract; normalising that prompt would silently change the
+    // contract the caller wrote.
+    await writeFile(codexSchemaFile, JSON.stringify(normalizeSchemaForCodex(schema)), 'utf8');
   }
 
   // A grader running on the vendor that produced the artifact is predisposed to
@@ -482,7 +679,7 @@ export async function runAgent(decision, prompt, opts = {}) {
         const { binary, args } = buildCommand(target, {
           cwd,
           lastMessageFile,
-          schemaFile: target.provider === 'codex' ? schemaFile : null,
+          schemaFile: target.provider === 'codex' ? codexSchemaFile : null,
           fullAccess,
           sandbox,
           allowedTools,
@@ -519,10 +716,23 @@ export async function runAgent(decision, prompt, opts = {}) {
 
         let text = '';
         let usage = null;
+        let schemaRejected = false;
+        // The endpoint's own error message, kept apart from the transport's.
+        // classifyFailure subtracts it before pattern-matching, because it
+        // quotes the caller's schema back and that is user input, not a signal.
+        let structuredError = '';
 
         if (target.provider === 'codex') {
           const stream = parseCodexStream(result.stdout);
           usage = stream.usage;
+          schemaRejected = stream.schemaRejected;
+          structuredError = stream.error ?? '';
+          if (stream.error) {
+            result = {
+              ...result,
+              stderr: [result.stderr?.trim(), stream.error].filter(Boolean).join('\n'),
+            };
+          }
           // Free headroom refresh. The exec stream does not carry rate limits
           // (they live in the session rollout this run just wrote), so prefer
           // the stream when a build does inline them and re-read the rollout
@@ -557,7 +767,12 @@ export async function runAgent(decision, prompt, opts = {}) {
           }
         }
 
-        const failure = classifyFailure({ ...result, hasOutput: text.length > 0 });
+        const failure = classifyFailure({
+          ...result,
+          hasOutput: text.length > 0,
+          schemaRejected,
+          structuredError,
+        });
         const succeeded = failure === 'none' && text.length > 0;
 
         attempts.push({
@@ -631,13 +846,20 @@ export async function runAgent(decision, prompt, opts = {}) {
           };
         }
 
-        lastError = result.stderr.slice(-2_000) || `exit ${result.code}`;
+        const providerError = result.stderr.slice(-2_000) || `exit ${result.code}`;
+        lastError = failure === 'schema-rejection'
+          ? `schema rejected: ${providerError}`
+          : providerError;
 
         if (failure === 'rate-limit') {
           // Do not sleep out a rate limit when the other vendor is idle.
           await markExhausted(target.provider).catch(() => {});
           break;
         }
+        // Codex alone enforces the on-disk schema dialect. A rejection is
+        // deterministic for this rung, but Claude can still honor the caller's
+        // original prompt contract, so advance to the next provider.
+        if (failure === 'schema-rejection') break;
         if (failure === 'auth' || failure === 'fatal') break;
         // A timeout is the most expensive failure to repeat and the least
         // likely to come out differently: the same prompt on the same model
@@ -649,6 +871,7 @@ export async function runAgent(decision, prompt, opts = {}) {
       }
     }
 
+    const failedOver = attempts.some((attempt) => attempt.provider !== decision.provider);
     await record({
       at: now(), id: dispatchId, ok: false,
       provider: decision.provider, model: decision.model, tier: decision.tier ?? null,
@@ -658,6 +881,7 @@ export async function runAgent(decision, prompt, opts = {}) {
       length: decision.factors?.length ?? null,
       independence: decision.independence ?? null,
       attempts: attempts.length,
+      failedOver,
       failures: attempts.map((a) => a.failure).filter(Boolean),
       durationMs: now() - startedAt,
       error: (lastError ?? 'all providers failed').slice(0, 200),
@@ -669,6 +893,7 @@ export async function runAgent(decision, prompt, opts = {}) {
       dispatchId,
       provider: decision.provider,
       model: decision.model,
+      failedOver,
       attempts,
       durationMs: now() - startedAt,
       error: lastError ?? 'all providers failed',

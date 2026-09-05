@@ -36,6 +36,14 @@ test('codex share answers the balance question directly', () => {
   assert.equal(summarise(rows).codexShare, 75);
 });
 
+test('provider failover is counted so planned-vendor drift is visible', () => {
+  const rows = [
+    row({ provider: 'claude', model: 'sonnet', failedOver: true }),
+    row({ provider: 'codex', model: 'terra', failedOver: false }),
+  ];
+  assert.equal(summarise(rows).failedOver, 1);
+});
+
 test('review independence is counted, so a degraded verdict cannot hide in a pile', () => {
   const rows = [
     row({ provider: 'claude', model: 'sonnet', role: 'judge', independence: 'cross-vendor' }),

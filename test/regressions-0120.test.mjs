@@ -1,7 +1,12 @@
 import './isolate.mjs'; // MUST be first — see the file
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
+import { resetConfigCache } from '../src/config.mjs';
+import { mutate } from '../src/ledger.mjs';
 import { decide, providerState, rankProviders } from '../src/policy.mjs';
 import { totalInputTokens } from '../src/run.mjs';
 import { expire, localPidGone } from '../src/server.mjs';
@@ -88,11 +93,54 @@ test('expire drops dead local reservations as well as expired ones', () => {
 
 // F5's own regression: measuring claude's cost costs a network call, so a wide
 // fan-out finishing together must not burst the usage endpoint into a 429.
-test('claude cost sampling is throttled against a fresh reading', async () => {
+test('claude cost sampling throttles a fresh reading and fetches on the cold path', async () => {
   const { refreshClaudeLimits } = await import('../src/limits.mjs');
   const now = 1_000_000;
-  // No probe stored at all → nothing to throttle against, so it must proceed
-  // and fail on the (absent) credentials rather than silently skipping.
-  const cold = await refreshClaudeLimits({ now, minAgeMs: 90_000 }).catch(() => null);
-  assert.equal(cold, null, 'an unreadable meter returns null rather than storing a dark value');
+  await mutate((state) => {
+    state.probes.claude = { storedAt: now - 1_000, value: { available: true } };
+  }, { now: () => now });
+
+  // The old test assumed credentials were absent. That passes in CI and fails
+  // on a developer machine where the live endpoint answers, without testing
+  // throttling at all. Give the unthrottled path valid credentials and a fake
+  // endpoint so crossing that boundary is deterministic and observable.
+  const dir = await mkdtemp(join(tmpdir(), 'cmo-throttle-'));
+  const credentialsPath = join(dir, '.credentials.json');
+  await writeFile(credentialsPath, JSON.stringify({
+    claudeAiOauth: { accessToken: 'tok-live', expiresAt: Date.now() + 3_600_000 },
+  }));
+  const oldCredentials = process.env.CMO_CLAUDE_CREDENTIALS;
+  const oldFetch = globalThis.fetch;
+  let fetches = 0;
+  process.env.CMO_CLAUDE_CREDENTIALS = credentialsPath;
+  globalThis.fetch = async () => {
+    fetches += 1;
+    return {
+      ok: true,
+      json: async () => ({ limits: [{ group: 'session', percent: 20 }] }),
+    };
+  };
+  resetConfigCache();
+
+  try {
+    const skipped = await refreshClaudeLimits({ now, minAgeMs: 90_000 });
+    assert.equal(skipped, null, 'a fresh reading skips the cost-sampling probe');
+    assert.equal(fetches, 0, 'throttling must happen before the usage endpoint is called');
+
+    await mutate((state) => {
+      delete state.probes.claude;
+    }, { now: () => now });
+    const refreshed = await refreshClaudeLimits({ now, minAgeMs: 90_000 });
+    assert.equal(refreshed?.available, true, 'the cold path returns the successful reading');
+    assert.equal(fetches, 1, 'without a stored probe the usage endpoint is called exactly once');
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldCredentials === undefined) delete process.env.CMO_CLAUDE_CREDENTIALS;
+    else process.env.CMO_CLAUDE_CREDENTIALS = oldCredentials;
+    resetConfigCache();
+    await mutate((state) => {
+      delete state.probes.claude;
+    });
+    await rm(dir, { recursive: true, force: true });
+  }
 });

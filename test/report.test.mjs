@@ -49,6 +49,14 @@ test('retries are treated as waste, not noise', () => {
   assert.equal(f.severity, 'medium');
 });
 
+test('provider failover is reported as visible policy drift', () => {
+  const rows = [...many(9, {}), row({ provider: 'claude', model: 'sonnet', failedOver: true })];
+  const f = findings(rows).find((x) => /fallback provider/.test(x.finding));
+  assert.equal(f.severity, 'medium');
+  assert.match(f.action, /did not run where policy planned/);
+  assert.match(f.action, /schema-rejection/);
+});
+
 test('a tier that always finishes instantly is over-provisioned', () => {
   const rows = many(12, { tier: 'frontier', durationMs: 5_000 });
   const f = findings(rows).find((x) => /frontier tier/.test(x.finding));
