@@ -61,9 +61,11 @@ Everything below assumes the Claude Code harness.
 cmo limits --refresh --human
 ```
 
-This costs nothing: Codex is read from local session logs, Claude from an OAuth
-usage endpoint that runs no inference. Report both numbers to the user in your
-first message, because they decide how big a run you are allowed to plan.
+This costs next to nothing: Codex is read from local session logs, Claude from an
+OAuth usage endpoint that runs no inference — or, on macOS, where Claude Code
+keeps its credentials in the Keychain and there is no file to read, from one
+minimal haiku turn through the `claude` CLI. Report both numbers to the user in
+your first message, because they decide how big a run you are allowed to plan.
 
 **Those numbers are contended, and they lag.** Other orchestrators on other
 projects are draining the same two windows right now, and the vendor's figure

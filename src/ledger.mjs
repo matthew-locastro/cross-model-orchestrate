@@ -180,12 +180,16 @@ export async function snapshot({ now = Date.now, local = false } = {}) {
 /**
  * Return a cached probe if it is younger than maxAgeMs, otherwise take one.
  *
+ * `maxAgeMs` is a number, or a function of the cached entry when how long a
+ * reading stays good depends on how it was taken.
+ *
  * Single-flight across processes: the lock means a hundred concurrent
  * dispatches produce one probe, not a hundred. Whoever gets the lock probes;
  * everyone else finds the fresh answer already there.
  */
 export async function freshProbe(provider, maxAgeMs, read, { now = Date.now } = {}) {
   const fleet = fleetConfig();
+  const maxAge = (entry) => (typeof maxAgeMs === 'function' ? maxAgeMs(entry) : maxAgeMs);
 
   // A reading taken on any box is a reading for the whole fleet — the windows
   // are per-subscription, not per-machine — so check the coordinator first and
@@ -193,14 +197,14 @@ export async function freshProbe(provider, maxAgeMs, read, { now = Date.now } = 
   if (fleet) {
     const remote = await remoteState();
     const entry = remote?.probes?.[provider];
-    if (entry && now() - entry.storedAt < maxAgeMs) {
+    if (entry && now() - entry.storedAt < maxAge(entry)) {
       return { value: entry.value, cached: true, from: entry.node ?? 'fleet' };
     }
   }
 
   const local = await readState();
   const localEntry = local.probes?.[provider];
-  if (!fleet && localEntry && now() - localEntry.storedAt < maxAgeMs) {
+  if (!fleet && localEntry && now() - localEntry.storedAt < maxAge(localEntry)) {
     return { value: localEntry.value, cached: true };
   }
 

@@ -219,6 +219,15 @@ doesn't persist the rolling-window snapshot locally, so there's no offline
 alternative. If you're not comfortable with that call, `cmo` degrades gracefully:
 an unavailable probe reports `unknown` and is treated as usable.
 
+On **macOS** that file does not exist: Claude Code keeps its credentials in the
+login Keychain, so the endpoint cannot be read and the meter used to stay dark on
+every Mac. There, `cmo` asks the CLI instead. `claude -p --output-format
+stream-json` emits a `rate_limit_event` carrying both windows on every turn, so
+one minimal haiku turn — tools and MCP switched off, about a thousand input
+tokens — yields the same reading without `cmo` ever touching the Keychain. A
+reading taken this way is reused for two minutes rather than 45 seconds
+(`freshness.claudeCli`), and `CMO_CLAUDE_CLI_PROBE=0` switches the fallback off.
+
 ### The one exception: a lapsed OAuth token
 
 That token lives for hours, not days, and when it expires the usage endpoint

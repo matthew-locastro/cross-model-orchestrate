@@ -170,6 +170,12 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
     // different remedies. Saying only "unreadable" makes the reader guess.
     if (!claudeVersion) {
       line(WARN, 'claude oauth', 'no claude CLI yet, so there are no credentials to read');
+    } else if (process.platform === 'darwin' && config.claudeCliProbe !== false) {
+      // Not a fault. Claude Code on macOS keeps its credentials in the login
+      // Keychain, so this file never exists there; the meter reads the windows
+      // through the CLI instead, and the headroom section below shows whether
+      // that worked.
+      line(OK, 'claude oauth', 'credentials are in the macOS Keychain — the meter reads through the claude CLI');
     } else {
       line(WARN, 'claude oauth', `not logged in — run \`claude\` once (expected ${config.claudeCredentials})`);
       todo.push(['claude', 'log in, then quit — this writes the credentials the meter reads']);
@@ -202,7 +208,8 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
         log('       this is read from; no session, no meter.');
         if (codexVersion) todo.push(['codex', 'send it one message, then quit — writes the session cmo meters']);
       } else if (provider === 'claude' && /ENOENT|credential|expired|oauth/i.test(error)) {
-        log('       run claude once to log in; the meter reads its stored credentials.');
+        log('       run claude once to log in; the meter reads its stored credentials,');
+        log('       or asks the claude CLI where there is no credentials file (macOS).');
       }
       continue;
     }

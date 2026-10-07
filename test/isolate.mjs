@@ -23,6 +23,11 @@ if (!process.env.CMO_CONFIG_DIR || process.env.CMO_CONFIG_DIR.includes('.config/
   process.env.CMO_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'cmo-test-config-'));
 }
 
+// And the meter's CLI fallback. On a Mac there is no credentials file, so an
+// un-injected claude read would otherwise spawn the real CLI and spend a real
+// turn — slow, billed, and a different answer on every machine.
+process.env.CMO_CLAUDE_CLI_PROBE = '0';
+
 // And any fleet settings inherited from the shell, for the same reason.
 delete process.env.CMO_FLEET_URL;
 delete process.env.CMO_FLEET_TOKEN;

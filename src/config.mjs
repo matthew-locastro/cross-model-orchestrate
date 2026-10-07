@@ -56,6 +56,7 @@ export const DEFAULT_MODELS = {
 export const DEFAULT_FRESHNESS = {
   codex: 10_000, // a local file read — effectively free, so keep it tight
   claude: 45_000, // a network call, shared across every process on this machine
+  claudeCli: 120_000, // read through the CLI instead (macOS): a small turn, not a GET
 };
 
 /**
@@ -161,6 +162,13 @@ export function loadConfig({ file = CONFIG_FILE, reload = false } = {}) {
     claudeCredentials: process.env.CMO_CLAUDE_CREDENTIALS
       ?? fromFile.claudeCredentials
       ?? join(homedir(), '.claude', '.credentials.json'),
+    // Whether the claude meter may fall back to asking the CLI when there is no
+    // credentials file to read (see limits.mjs). On by default, because on macOS
+    // it is the only source there is. `CMO_CLAUDE_CLI_PROBE=0` turns it off:
+    // the test suite does, so `npm test` never spends a real turn.
+    claudeCliProbe: process.env.CMO_CLAUDE_CLI_PROBE !== undefined
+      ? !/^(0|false|no|off)$/i.test(process.env.CMO_CLAUDE_CLI_PROBE)
+      : fromFile.claudeCliProbe !== false,
     configFile: file,
     configFileFound: Object.keys(fromFile).length > 0,
   };

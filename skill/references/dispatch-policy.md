@@ -122,6 +122,11 @@ token from `~/.claude/.credentials.json`. No inference, so no token cost. Claude
 Code does not persist the rolling-window snapshot locally, so there is no
 offline alternative.
 
+On macOS the credentials are in the Keychain and that file never exists, so the
+reader falls back to the CLI: one minimal `claude -p --output-format stream-json`
+turn, whose `rate_limit_event` carries the same two windows. About a thousand
+input tokens, reused for two minutes.
+
 ### Contention
 
 Both readings live in one machine-wide file, `~/.cache/cross-model-orchestrate/state.json`,

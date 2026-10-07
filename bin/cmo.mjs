@@ -72,7 +72,8 @@ function renderLimits(limits) {
   for (const provider of ['codex', 'claude']) {
     const p = limits[provider];
     const state = providerState(p).state;
-    lines.push(`${provider.padEnd(7)} ${state.padEnd(9)} ${p.plan ? `plan=${p.plan} ` : ''}${p.available ? '' : `unavailable: ${p.error}`}`);
+    const via = p.available && typeof p.source === 'string' && p.source.startsWith('claude -p') ? 'via the claude CLI ' : '';
+    lines.push(`${provider.padEnd(7)} ${state.padEnd(9)} ${p.plan ? `plan=${p.plan} ` : ''}${via}${p.available ? '' : `unavailable: ${p.error}`}`);
     for (const w of p.windows ?? []) {
       const reset = w.resetsAt ? ` resets ${w.resetsAt.replace('T', ' ').slice(0, 16)}Z` : '';
       lines.push(`        ${w.label.padEnd(6)} ${bar(w.percentUsed)}${reset}`);

@@ -21,10 +21,33 @@
 //         5-hour window in `primary`. Classify by `window_minutes`, never by
 //         field name.
 //
-// claude  Live authenticated read of the OAuth usage endpoint, which costs zero
-//         tokens (no inference). Claude Code does not persist the rolling-window
-//         snapshot anywhere local — `~/.claude/stats-cache.json` is historical
-//         counts only — so this is the only honest source.
+// claude  Two sources, tried in order.
+//
+//         1. A live authenticated read of the OAuth usage endpoint, which costs
+//            zero tokens (no inference). It needs the token Claude Code keeps in
+//            `~/.claude/.credentials.json`, and that file only exists where
+//            Claude Code stores its credentials on disk — Linux, mostly.
+//
+//         2. The CLI's own stream. On macOS Claude Code keeps its credentials in
+//            the login Keychain, so there is no file, source 1 answers ENOENT
+//            forever, and the meter is dark on every Mac. But the CLI reports
+//            the windows itself: `claude -p --output-format stream-json` emits
+//            one `rate_limit_event` per turn —
+//
+//              {"type":"rate_limit_event","rate_limit_info":{"status":"allowed",
+//               "unifiedWindows":{
+//                 "five_hour":{"utilization":0.01,"resetsAt":1791404400},
+//                 "seven_day":{"utilization":0.65,"resetsAt":1791475200}}}}
+//
+//            — so when source 1 cannot answer, the meter asks the CLI, which
+//            already knows how to authenticate wherever it is installed. This
+//            tool never touches the Keychain. The price is one minimal haiku
+//            turn (about a thousand input tokens with tools and MCP switched
+//            off), which is why a reading from this source is reused for longer.
+//
+//         Claude Code does not persist the rolling-window snapshot anywhere
+//         local — `~/.claude/stats-cache.json` is historical counts only — so
+//         these are the only honest sources.
 //
 // Both are cached on disk with a TTL so hundreds of dispatch decisions share one
 // probe.
@@ -40,6 +63,11 @@ export { CACHE_DIR };
 
 const OAUTH_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const FETCH_TIMEOUT_MS = 5_000;
+
+/** Stamped on a reading taken through the CLI, so its longer TTL can be told apart. */
+export const CLAUDE_CLI_SOURCE = 'claude -p stream-json rate_limit_event';
+const CLI_PROBE_TIMEOUT_MS = 60_000;
+const PROBE_MODEL = 'claude-haiku-4-5-20251001';
 
 /**
  * Is the vendor CLI even on PATH?
@@ -399,7 +427,7 @@ async function readOAuthToken(credentialsPath) {
   return token;
 }
 
-export async function readClaudeLimits({ credentialsPath, fetchImpl, refresh = attemptTokenRefresh } = {}) {
+async function readClaudeLimitsViaOAuth({ credentialsPath, fetchImpl, refresh = attemptTokenRefresh } = {}) {
   const doFetch = fetchImpl ?? globalThis.fetch;
   try {
     let token;
@@ -444,6 +472,161 @@ export async function readClaudeLimits({ credentialsPath, fetchImpl, refresh = a
   }
 }
 
+// ── claude, second source: the CLI's own stream ───────────────────────────
+
+/**
+ * Pull the plan windows out of a `claude -p --output-format stream-json` run.
+ *
+ * Every turn carries one `rate_limit_event`. The last one on the stream is the
+ * newest, so that is the one kept. `utilization` here is a FRACTION — 0.65 is
+ * 65% — unlike the OAuth endpoint, which reports percentages. A value above 1
+ * is therefore read as a percentage already, so a CLI that changes its mind
+ * about the unit does not turn 65% into 6500% and get clamped to "exhausted".
+ *
+ * Only the two account-wide windows are read. The per-model weekly windows are
+ * real, but they bind one model each, and folding them into `worstPercent`
+ * would mark the whole provider spent because one model was.
+ *
+ * Returns null when the stream carries no usable event, which is what an older
+ * CLI, an API-key login or a Bedrock/Vertex session produces: none of those
+ * has plan windows to report.
+ */
+export function parseClaudeRateLimitEvents(stdout) {
+  if (typeof stdout !== 'string' || stdout.length === 0) return null;
+  let info = null;
+  for (const line of stdout.split('\n')) {
+    if (!line.includes('rate_limit_event')) continue;
+    try {
+      const event = JSON.parse(line);
+      if (event?.type === 'rate_limit_event' && event.rate_limit_info && typeof event.rate_limit_info === 'object') {
+        info = event.rate_limit_info;
+      }
+    } catch { /* a torn line is not a reading */ }
+  }
+  if (!info) return null;
+
+  const toPercent = (utilization) => {
+    const n = typeof utilization === 'number' ? utilization : Number(utilization);
+    if (utilization == null || !Number.isFinite(n)) return null;
+    return clampPercent(n <= 1 ? n * 100 : n);
+  };
+  const NAMES = { five_hour: ['5h', '5hr'], seven_day: ['weekly', 'Wkly'] };
+  const windows = [];
+  const unified = info.unifiedWindows && typeof info.unifiedWindows === 'object' ? info.unifiedWindows : {};
+  for (const [field, [key, label]] of Object.entries(NAMES)) {
+    const entry = unified[field];
+    if (!entry || typeof entry !== 'object') continue;
+    const percentUsed = toPercent(entry.utilization);
+    if (percentUsed == null) continue;
+    windows.push({ key, label, percentUsed, resetsAt: normalizeReset(entry.resetsAt) });
+  }
+  // Before `unifiedWindows` existed the event described a single window — the
+  // one closest to its limit — at the top level. One window beats none.
+  if (windows.length === 0 && NAMES[info.rateLimitType]) {
+    const percentUsed = toPercent(info.utilization);
+    if (percentUsed != null) {
+      const [key, label] = NAMES[info.rateLimitType];
+      windows.push({ key, label, percentUsed, resetsAt: normalizeReset(info.resetsAt) });
+    }
+  }
+  if (windows.length === 0) return null;
+  const hardBlocked = info.status === 'rejected' || windows.some((w) => w.percentUsed >= 100);
+  return { windows, hardBlocked };
+}
+
+/**
+ * The smallest turn the CLI will run, and what it prints.
+ *
+ * Same shape as the token refresh above, plus the two flags that take the cost
+ * from about 34,000 input tokens to about 1,000: `--tools ""` drops every tool
+ * definition and `--strict-mcp-config` loads no MCP server. Stdin is closed
+ * because the CLI otherwise waits three seconds for a pipe that never speaks.
+ *
+ * The exit code is ignored on purpose. A rate-limited account exits non-zero
+ * and still prints the event — and that is the reading that matters most.
+ */
+async function runClaudeProbe({ lean = true } = {}) {
+  const { spawn } = await import('node:child_process');
+  const { tmpdir } = await import('node:os');
+  const args = [
+    '-p', 'ok',
+    '--model', PROBE_MODEL,
+    '--system-prompt', 'Reply with the single word: ok',
+    '--disable-slash-commands',
+    '--no-session-persistence',
+    ...(lean ? ['--tools', '', '--strict-mcp-config'] : []),
+    '--output-format', 'stream-json',
+    '--verbose',
+  ];
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn('claude', args, { cwd: tmpdir(), stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    let stdout = '';
+    const timer = setTimeout(() => { child.kill('SIGKILL'); }, CLI_PROBE_TIMEOUT_MS);
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.on('error', (err) => { clearTimeout(timer); reject(err); });
+    child.on('close', () => { clearTimeout(timer); resolve(stdout); });
+  });
+}
+
+/**
+ * Read claude's windows by asking the CLI rather than the usage endpoint.
+ *
+ * Tries the lean turn first. An older CLI rejects the flags that make it lean,
+ * prints nothing useful and exits; the plain turn costs more but runs anywhere
+ * `claude -p` does, so it is the second attempt rather than the only one.
+ */
+export async function readClaudeLimitsViaCli({ probe = runClaudeProbe } = {}) {
+  try {
+    let parsed = parseClaudeRateLimitEvents(await probe({ lean: true }));
+    if (!parsed) parsed = parseClaudeRateLimitEvents(await probe({ lean: false }));
+    if (!parsed) return unavailable('claude', 'the claude CLI reported no plan windows');
+    return summarize('claude', parsed.windows, {
+      hardBlocked: parsed.hardBlocked,
+      source: CLAUDE_CLI_SOURCE,
+    });
+  } catch (err) {
+    const message = err?.code === 'ENOENT' ? 'claude is not on PATH' : (err instanceof Error ? err.message : String(err));
+    return unavailable('claude', message);
+  }
+}
+
+/**
+ * Claude's headroom, from whichever source can answer.
+ *
+ * The usage endpoint first, because it is free. The CLI second, because on a
+ * Mac it is the only one that works. A caller that injects a credentials path
+ * or a fetch is asking about the first source specifically — that is every
+ * existing test — so the CLI is not consulted behind its back; pass `cli` to
+ * exercise the fallback deliberately.
+ *
+ * When both fail the error names both, because "ENOENT …credentials.json" on
+ * its own sends a Mac user looking for a file that will never exist.
+ */
+export async function readClaudeLimits({ credentialsPath, fetchImpl, refresh, cli } = {}) {
+  const viaOAuth = await readClaudeLimitsViaOAuth({
+    credentialsPath,
+    fetchImpl,
+    ...(refresh ? { refresh } : {}),
+  });
+  if (viaOAuth.available === true) return viaOAuth;
+
+  const injected = credentialsPath !== undefined || fetchImpl !== undefined;
+  const allowed = !injected && loadConfig().claudeCliProbe !== false;
+  const readCli = cli ?? (allowed ? readClaudeLimitsViaCli : null);
+  if (!readCli) return viaOAuth;
+
+  const viaCli = await readCli();
+  if (viaCli?.available === true) return viaCli;
+  return unavailable('claude', `${viaOAuth.error}; and through the CLI: ${viaCli?.error ?? 'no reading'}`);
+}
+
 // ── shared state ──────────────────────────────────────────────────────────
 //
 // The cache lives in ledger.mjs because it is not this process's cache — it is
@@ -469,7 +652,13 @@ export async function readLimits({ refresh = false, now = Date.now(), readers, i
 
   const [codexProbe, claudeProbe] = await Promise.all([
     freshProbe('codex', refresh ? -1 : cfg.freshness.codex, readCodex, { now: nowFn }),
-    freshProbe('claude', refresh ? -1 : cfg.freshness.claude, readClaude, { now: nowFn }),
+    // A reading taken through the CLI cost a turn rather than a GET, so it is
+    // reused for longer. Decided per entry: the same machine can hold either.
+    freshProbe('claude', refresh ? -1 : (entry) => (
+      entry?.value?.source === CLAUDE_CLI_SOURCE
+        ? Math.max(cfg.freshness.claude, cfg.freshness.claudeCli ?? 0)
+        : cfg.freshness.claude
+    ), readClaude, { now: nowFn }),
   ]);
 
   const state = await snapshot({ now: nowFn });
@@ -522,8 +711,9 @@ export async function refreshCodexLimits({ now = Date.now() } = {}) {
 /**
  * The claude twin of `refreshCodexLimits`. Codex gets its reading for free out
  * of the exec stream; claude's costs one HTTP GET against the OAuth usage
- * endpoint, which is cheap enough to do after a dispatch and is the only way
- * claude can ever measure what one of its own agents costs.
+ * endpoint — or, where there is no credentials file to read, one minimal turn
+ * through the CLI — which is cheap enough to do after a dispatch and is the
+ * only way claude can ever measure what one of its own agents costs.
  */
 export async function refreshClaudeLimits({ now = Date.now(), minAgeMs = 0 } = {}) {
   // Throttle, because unlike codex's this reading is a network call.
