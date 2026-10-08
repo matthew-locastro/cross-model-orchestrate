@@ -13,6 +13,19 @@ const HEALTHY = { available: true, worstPercent: 5, nextResetAt: null, hardBlock
 const TIGHT = { available: true, worstPercent: 72, nextResetAt: null, hardBlocked: false, windows: [{ key: '5h', percentUsed: 72 }] };
 const SPENT = { available: true, worstPercent: 99, nextResetAt: '2026-08-22T00:00:00.000Z', hardBlocked: true, windows: [{ key: '5h', percentUsed: 99 }] };
 
+// Pace cases need reset times relative to the clock the decision will read.
+const from = (ms) => new Date(Date.now() + ms).toISOString();
+const HOUR = 3_600_000;
+const weekly = (used, leftMs) => ({ key: 'weekly', label: 'Wkly', percentUsed: used, resetsAt: from(leftMs) });
+const fiveHour = (used, leftMs) => ({ key: '5h', label: '5hr', percentUsed: used, resetsAt: from(leftMs) });
+const paced = (windows) => {
+  const worst = windows.reduce((a, w) => (w.percentUsed > a.percentUsed ? w : a));
+  return { available: true, worstPercent: worst.percentUsed, worstWindow: worst.key, nextResetAt: worst.resetsAt, hardBlocked: false, windows };
+};
+const WEEK_SQUEEZED = paced([weekly(80, 120 * HOUR)]); // 20% must last five days
+const WEEK_EXPIRING = paced([weekly(80, 12 * HOUR)]); // 20% for twelve hours
+const BLIP = paced([fiveHour(70, HOUR / 3), weekly(10, 144 * HOUR)]); // clears in twenty minutes
+
 const CASES = [
   {
     name: 'mechanical work goes to the cheapest preferred-vendor model',
@@ -31,6 +44,24 @@ const CASES = [
     task: { role: 'implement', complexity: 3, length: 'm' },
     limits: { codex: SPENT, claude: HEALTHY },
     expect: (d) => d.provider === 'claude',
+  },
+  {
+    name: 'a weekly squeeze with days to go loses to a 5-hour blip about to clear',
+    task: { role: 'implement', complexity: 3, length: 'm' },
+    limits: { codex: WEEK_SQUEEZED, claude: BLIP },
+    expect: (d) => d.provider === 'claude' && d.states.codex.state === 'critical' && d.states.claude.state === 'ok',
+  },
+  {
+    name: 'weekly budget about to expire is spent, not hoarded',
+    task: { role: 'implement', complexity: 3, length: 'm' },
+    limits: { codex: WEEK_EXPIRING, claude: HEALTHY },
+    expect: (d) => d.provider === 'codex' && d.states.codex.state === 'ok',
+  },
+  {
+    name: 'a pace-critical provider still serves the cross-vendor review only it can do',
+    task: { role: 'review', complexity: 3, length: 's', independentOf: 'claude' },
+    limits: { codex: WEEK_SQUEEZED, claude: HEALTHY },
+    expect: (d) => d.provider === 'codex' && d.independence === 'cross-vendor',
   },
   {
     name: 'review of codex output is forced onto claude',

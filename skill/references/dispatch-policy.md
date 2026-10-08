@@ -59,7 +59,8 @@ Strict precedence:
    indistinguishable from a real cross-vendor verdict. `--strict-independence`
    restores the refuse-instead behaviour.
 3. **Headroom** — a provider at ≥95% used, or flagged `rate_limit_reached`, is
-   not a candidate.
+   not a candidate. Between usable providers, the one under less *pressure*
+   wins (see below): usage weighed against how long the remainder must last.
 4. **Preferred vendor first** — Codex by default. Deliberate load-balancing: the
    orchestrator is usually itself a Claude session, so Claude's window is already
    being consumed by the run doing the dispatching. The preference is worth
@@ -68,9 +69,59 @@ Strict precedence:
    `CMO_PREFER=claude` or `preference.first` in the config file — worth doing if
    you drive this from a shell script or cron rather than from a Claude session.
 
+### Pressure: usage weighed against time to reset
+
+Every band and every comparison below acts on **pressure**, not on the raw
+percentage. A raw number says how much is used; routing needs to know how long
+what is left has to last. For each window:
+
+```text
+runway r = (fraction of budget left) / (fraction of the window's time left)
+
+r = 1   on even pace                      pressure = raw
+r < 1   the remainder must be rationed    pressure = 100 − (100 − raw) · r   (capped at 94)
+r > 1   the reset beats even-pace use     pressure = raw / √r
+raw ≥ 95                                  never adjusted
+```
+
+| window | raw | time to reset | allowance vs even pace | pressure | band |
+| --- | --- | --- | --- | --- | --- |
+| weekly | 80% | 5 days | 4%/day vs 14.3%/day | 94% | critical |
+| weekly | 80% | 12 hours | 40%/day vs 14.3%/day | 48% | ok |
+| weekly | 50% | 6.5 days | 7.7%/day vs 14.3%/day | 73% | tight |
+| weekly | 30% | 4.9 days (on pace) | 14.3%/day vs 14.3%/day | 30% | ok |
+| 5-hour | 70% | 4 hours | 7.5%/hour vs 20%/hour | 89% | critical |
+| 5-hour | 70% | 20 minutes | 90%/hour vs 20%/hour | 33% | ok |
+| 5-hour | 97% | 2 minutes | — | 97% | exhausted |
+
+A provider's pressure is that of its most-pressured window, so the 5-hour and
+weekly windows of both vendors are balanced together. Three consequences worth
+knowing:
+
+- **A weekly squeeze outranks a 5-hour blip.** Raw percentages called "codex 80%
+  weekly, five days left" and "claude 70% of five hours, twenty minutes left"
+  the same thing — tight — and kept the default vendor. Pressure sends the work
+  to Claude and stretches Codex's week.
+- **Pace alone never exhausts a provider.** The cap at 94 keeps a rationed
+  window in the candidate list on a cheaper tier, because budget that exists
+  can still be spent on what only that vendor can do — a cross-vendor review.
+  Only a raw reading ≥95%, or an explicit rate-limit error, removes it.
+- **Budget about to expire is room.** Unused weekly budget hours before its
+  reset is the cheapest quota there is; pressure falls so it gets spent.
+
+Pace is computed at decision time from the window's reset time, never cached. A
+window whose reset time is missing, already in the past (a stale reading), or
+further away than the window is long (clock skew, or a reset paired with the
+previous window's usage) falls back to its raw percentage: inconsistent data
+must not be turned into scarcity. `cmo limits --human` prints the pace line per
+window; `cmo limits` (JSON) carries `pressurePercent`, `pressureWindow` and a
+`pace` array per provider; `cmo plan` shows the binding window in its `why`.
+
 ### Headroom bands
 
-| band | used | effect |
+Bands of pressure, as defined above.
+
+| band | pressure | effect |
 | --- | --- | --- |
 | ok | <65% | normal |
 | tight | ≥65% | deprioritised; the other provider wins ties |

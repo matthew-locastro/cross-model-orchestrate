@@ -28,11 +28,20 @@
 //                         itself a Claude session, so Claude's window is already
 //                         being spent by the run doing the dispatching
 //
+// "Headroom" is pace-aware. A provider is judged on the PRESSURE of its most
+// binding window — the raw percentage adjusted for how long the remainder has
+// to last (see pace.mjs). 80% of a weekly window with five days to go is a
+// durable constraint and reads as critical; 80% with twelve hours to go, or a
+// 5-hour window that resets in twenty minutes, is not. Both windows of both
+// vendors are weighed this way, so the weekly budgets are balanced across the
+// week instead of the side with the lower raw number being drained days early.
+//
 // Token efficiency is not a fourth weight; it is a set of corrections applied
 // after the tier is set (see `applyEfficiency`). Bulk reading is cheap work on
 // an expensive model, and that is the most common way a fan-out wastes quota.
 
 import { loadConfig, TIERS } from './config.mjs';
+import { providerPressure } from './pace.mjs';
 
 export { TIERS };
 
@@ -55,7 +64,7 @@ export function pressure() {
   return loadConfig().pressure;
 }
 
-export function providerState(limits, bands = pressure()) {
+export function providerState(limits, bands = pressure(), now = Date.now()) {
   // A CLI that is not installed cannot run anything, which is a stronger claim
   // than "its meter did not answer" and has to outrank the default preference.
   if (limits && limits.installed === false) {
@@ -65,14 +74,30 @@ export function providerState(limits, bands = pressure()) {
     // A dead probe must not stop the run. Unknown means usable.
     return { state: 'unknown', percent: null, resetsAt: null };
   }
-  const percent = typeof limits.worstPercent === 'number' ? limits.worstPercent : 0;
-  const resetsAt = limits.nextResetAt ?? null;
-  if (limits.hardBlocked || percent >= bands.exhausted) {
-    return { state: 'exhausted', percent, resetsAt };
-  }
-  if (percent >= bands.critical) return { state: 'critical', percent, resetsAt };
-  if (percent >= bands.tight) return { state: 'tight', percent, resetsAt };
-  return { state: 'ok', percent, resetsAt };
+  // `percent` is pace-adjusted pressure, not the raw reading: how much is used,
+  // weighed against how long what is left has to last. The raw figure and the
+  // window that binds travel alongside so every message can show both.
+  const p = providerPressure(limits, { now, exhausted: bands.exhausted });
+  const percent = p.percent;
+  const resetsAt = p.resetsAt ?? limits.nextResetAt ?? null;
+  const detail = {
+    percent,
+    resetsAt,
+    rawPercent: p.rawPercent,
+    window: p.window,
+    paceAware: p.paceAware,
+    ...(p.note ? { pace: p.note } : {}),
+  };
+  if (limits.hardBlocked || percent >= bands.exhausted) return { state: 'exhausted', ...detail };
+  if (percent >= bands.critical) return { state: 'critical', ...detail };
+  if (percent >= bands.tight) return { state: 'tight', ...detail };
+  return { state: 'ok', ...detail };
+}
+
+/** "94% — Wkly 80% used, 20% left for 5.0d = …" when pace moved the figure, else "80%". */
+function describeHeadroom(s) {
+  const pct = `${s.percent ?? '?'}%`;
+  return s.pace ? `pressure ${pct} — ${s.pace}` : pct;
 }
 
 function clampComplexity(value) {
@@ -161,18 +186,18 @@ export function rankProviders(task, states, preference = loadConfig().preference
       why.push(`${id} CLI is not installed`);
     } else if (s.state === 'exhausted') {
       score -= 1000;
-      why.push(`${id} exhausted (${s.percent ?? '?'}%)`);
+      why.push(`${id} exhausted (${describeHeadroom(s)})`);
     } else if (s.state === 'critical') {
       score -= 40;
-      why.push(`${id} critical (${s.percent}%)`);
+      why.push(`${id} critical (${describeHeadroom(s)})`);
     } else if (s.state === 'tight') {
       score -= 15;
-      why.push(`${id} tight (${s.percent}%)`);
+      why.push(`${id} tight (${describeHeadroom(s)})`);
     } else if (s.state === 'unknown') {
       score -= 2;
       why.push(`${id} headroom unknown`);
     } else {
-      why.push(`${id} healthy (${s.percent}%)`);
+      why.push(`${id} healthy (${describeHeadroom(s)})`);
     }
 
     // The configured tie-break vendor. Worth `weightPoints` percentage points
@@ -183,10 +208,21 @@ export function rankProviders(task, states, preference = loadConfig().preference
       why.push(`${id} preferred by default so the fan-out does not compete with the orchestrator`);
     }
 
-    // Prefer whichever provider is genuinely emptier when both are usable.
+    // Prefer whichever provider genuinely has more room when both are usable.
+    // `percent` is pace-adjusted, so budget that expires soon counts as room
+    // and budget that must last days does not.
     if (typeof s.percent === 'number') score += (100 - s.percent) / 10;
 
-    return { provider: id, score, state: s.state, percent: s.percent, resetsAt: s.resetsAt, why };
+    return {
+      provider: id,
+      score,
+      state: s.state,
+      percent: s.percent,
+      rawPercent: s.rawPercent ?? null,
+      window: s.window ?? null,
+      resetsAt: s.resetsAt,
+      why,
+    };
   });
 
   scored.sort((a, b) => b.score - a.score);
@@ -205,8 +241,10 @@ export function rankProviders(task, states, preference = loadConfig().preference
  *   pin             'codex'|'claude' — caller overrides provider selection
  *   pinModel        exact model id, bypassing the tier map
  * @param {object} limits  { codex, claude } from limits.mjs
+ * @param {object} opts    { now } — epoch ms, so pace is testable; defaults to the clock
  */
-export function decide(task = {}, limits = {}) {
+export function decide(task = {}, limits = {}, opts = {}) {
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now();
   const normalized = {
     role: ROLES[task.role] != null ? task.role : 'implement',
     complexity: clampComplexity(task.complexity),
@@ -238,8 +276,8 @@ export function decide(task = {}, limits = {}) {
   const notes = [...efficiency.notes];
 
   const states = {
-    codex: providerState(limits.codex),
-    claude: providerState(limits.claude),
+    codex: providerState(limits.codex, pressure(), now),
+    claude: providerState(limits.claude, pressure(), now),
   };
 
   let ranked = rankProviders(normalized, states);
@@ -329,7 +367,7 @@ export function decide(task = {}, limits = {}) {
   // model, so the last of the quota goes further.
   if (chosen.state === 'critical' && tier === 'frontier' && normalized.role !== 'judge') {
     tier = shiftTier(tier, -1);
-    notes.push(`${chosen.provider} is at ${chosen.percent}% — downgraded frontier→balanced to stretch the remaining window`);
+    notes.push(`${chosen.provider} is at ${chosen.percent}% pressure — downgraded frontier→balanced to stretch the remaining window`);
   }
 
   const primary = modelFor(chosen.provider, tier);

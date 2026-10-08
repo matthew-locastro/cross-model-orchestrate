@@ -76,15 +76,49 @@ machine-wide state at the moment of every dispatch, and that reading is the one
 that decides. When the effective figure sits well above the reported one, other
 runs are in flight — plan smaller and say so.
 
+**Read the pressure, not the bar.** Each provider has two windows — a 5-hour one
+and a weekly one — and the raw percentage alone says nothing about how long what
+is left has to last. So every window carries a second line:
+
+```text
+codex   critical  pressure 94% (weekly) plan=pro
+        Wkly   ████████··  80% resets 2026-10-14 03:35Z
+               pace: 20% left for 5.0d = 4%/day vs 14.3%/day even → pressure 94%
+```
+
+*Pressure* is the raw figure weighed against time to reset, on the same 0–100
+scale, and it is what the bands and the dispatcher act on:
+
+- a window whose remainder must be rationed reads **higher** than its raw
+  number — 80% of a week with five days to go is critical, not "20% free";
+- a window about to reset reads **lower** — a 5-hour window at 70% with twenty
+  minutes left barely constrains, and weekly budget still unused twelve hours
+  before its reset is budget to spend, because the reset destroys it;
+- a raw reading at ≥95% is never relaxed.
+
+The provider's figure is its most-pressured window, so both windows of both
+vendors are balanced at once. When you size a run against a weekly window, the
+number to plan with is the `%/day` allowance on the pace line, not the raw
+remainder: a fan-out that spends three days of allowance in an afternoon is the
+mistake this line exists to prevent. Report it to the user in those terms.
+
 If a fleet coordinator is configured, those figures cover every machine, and
 `cmo limits` names which box and project the in-flight work belongs to. If it
 warns that the coordinator is unreachable, you are seeing only this machine —
 say so before planning a large run, because the real number is higher.
 
+All bands below are bands of **pressure**:
+
 - Either provider **exhausted** (≥95%) — plan the run for the other one alone
   and say so. Halve the fan-out width.
+- A provider **critical on its weekly window** (≥85% pressure, days to reset) —
+  that is a durable squeeze, not a blip. Plan the bulk of the run for the other
+  vendor and keep this one for the work only it can do: the cross-vendor
+  reviews. Say how many days the squeeze lasts.
 - Both **tight** (≥65%) — propose the smaller version of the run and let the
   user choose. Do not quietly start a 250-agent fan-out on a quarter tank.
+- A window that is tight only on its **5-hour** reading and resets soon — say
+  when it clears; a run that can wait until then should.
 - The probe **fails** — proceed, and say the meter is unavailable. A broken
   meter never blocks work. `cmo doctor` explains why it failed.
 
@@ -292,9 +326,12 @@ is competing with something else, so shrink it or wait.
 Codex readings refresh themselves for free after every Codex subagent,
 so this is nearly free.
 
-React to what you see:
+React to what you see — in pressure, which moves with the clock as well as
+with spend, so a window can cross a band without a single new token:
 
 - a provider crosses **tight** — send the next stage to the other one;
+- a **weekly** window's `%/day` allowance drops below what the remaining stages
+  will cost — shrink the remaining stages or move them, and say which;
 - a provider crosses **critical** — the dispatcher downgrades its model
   automatically; note it in the run log so the drop in quality is not a mystery;
 - both **exhausted** — stop dispatching, report the earliest reset time, and
@@ -318,7 +355,7 @@ not.
 
 ```text
 CROSS_MODEL_ORCHESTRATE
-HEADROOM: codex <n>% · claude <n>%
+HEADROOM: codex <pressure>% (<binding window>, raw <n>%, resets in <t>) · claude <pressure>% (…)
 SHAPE: fan <N units × K attempts, judged by <vendor>> | queue → <what instead>
 DISPATCH: <role>→<provider>/<model>, … (one per distinct subagent kind)
 BARRIERS: <where, and why the whole set is needed there>

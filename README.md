@@ -153,7 +153,28 @@ Vendor, in strict precedence:
    it's always labelled. `--strict-independence` refuses instead.
 3. Headroom — a provider ≥95% used, or flagged `rate_limit_reached`, isn't a
    candidate.
-4. Preferred vendor (Codex by default), then whichever is genuinely emptier.
+4. Preferred vendor (Codex by default), then whichever is under less
+   *pressure*.
+
+Headroom is **pace-aware**. Both vendors have a 5-hour and a weekly window, and
+a raw percentage can't tell 80% of a week with five days to go (20% must last
+five days: 4%/day against an even pace of 14.3%/day) from 80% with twelve hours
+to go (plenty, and whatever is left at the reset is lost). So each window gets a
+*pressure* — usage weighed against time to reset, on the same 0–100 scale — and
+the bands, the tie-break and the model downgrade all act on the most-pressured
+window. A weekly squeeze outranks a 5-hour blip that is about to clear; budget
+about to expire gets spent; and pace alone never takes a provider out of the
+running, so it can still serve the cross-vendor reviews only it can do.
+`cmo limits --human` prints the pace line for every window:
+
+```text
+codex   critical  pressure 94% (weekly) plan=pro
+        Wkly   ████████··  80% resets 2026-10-14 03:35Z
+               pace: 20% left for 5.0d = 4%/day vs 14.3%/day even → pressure 94%
+```
+
+The arithmetic and a table of worked cases are in
+[`skill/references/dispatch-policy.md`](skill/references/dispatch-policy.md).
 
 Plus four token-efficiency corrections, each of which shows up in `notes`:
 

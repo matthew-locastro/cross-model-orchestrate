@@ -16,6 +16,7 @@ import { readFile } from 'node:fs/promises';
 
 import { readLimits } from '../src/limits.mjs';
 import { decide, providerState, pressure } from '../src/policy.mjs';
+import { formatDuration, providerPressure } from '../src/pace.mjs';
 import { runAgent, DEFAULT_TIMEOUT_MS } from '../src/run.mjs';
 import { doctor } from '../src/doctor.mjs';
 import { install, uninstall } from '../src/install.mjs';
@@ -67,16 +68,34 @@ function bar(percent) {
   return `${'█'.repeat(filled)}${'·'.repeat(10 - filled)} ${String(percent).padStart(3)}%`;
 }
 
-function renderLimits(limits) {
+function renderLimits(limits, now = Date.now()) {
   const lines = [];
+  const bandsNow = pressure();
   for (const provider of ['codex', 'claude']) {
     const p = limits[provider];
-    const state = providerState(p).state;
+    const s = providerState(p, bandsNow, now);
+    const pp = providerPressure(p, { now, exhausted: bandsNow.exhausted });
+    const paced = new Map(pp.windows.map((w) => [w.key, w]));
+    const headline = pp.paceAware && typeof s.percent === 'number'
+      ? `pressure ${s.percent}%${s.window ? ` (${s.window})` : ''} `
+      : '';
     const via = p.available && typeof p.source === 'string' && p.source.startsWith('claude -p') ? 'via the claude CLI ' : '';
-    lines.push(`${provider.padEnd(7)} ${state.padEnd(9)} ${p.plan ? `plan=${p.plan} ` : ''}${via}${p.available ? '' : `unavailable: ${p.error}`}`);
+    lines.push(`${provider.padEnd(7)} ${s.state.padEnd(9)} ${headline}${p.plan ? `plan=${p.plan} ` : ''}${via}${p.available ? '' : `unavailable: ${p.error}`}`);
     for (const w of p.windows ?? []) {
       const reset = w.resetsAt ? ` resets ${w.resetsAt.replace('T', ' ').slice(0, 16)}Z` : '';
       lines.push(`        ${w.label.padEnd(6)} ${bar(w.percentUsed)}${reset}`);
+      // The raw bar says how much is used; this says how long the rest must
+      // last, which is the half of the picture that decides routing.
+      const pw = paced.get(w.key);
+      if (pw?.known) {
+        const unit = pw.windowMinutes >= 2880 ? 'day' : 'hour';
+        const per = unit === 'day' ? 1 : 24;
+        const rate = (v) => Math.round((v / per) * 10) / 10;
+        lines.push(`               pace: ${Math.round((100 - pw.percentUsed) * 10) / 10}% left for ${formatDuration(pw.minutesLeft)}`
+          + ` = ${rate(pw.leftPerDay)}%/${unit} vs ${rate(pw.evenPerDay)}%/${unit} even → pressure ${pw.pressure}%`);
+      } else if (pw?.stale) {
+        lines.push('               pace: reset time has passed — this reading is stale');
+      }
     }
     // What the vendor reported vs what this machine has already committed.
     // Under several concurrent orchestrators the gap is the whole story.
@@ -88,7 +107,7 @@ function renderLimits(limits) {
   }
   lines.push('');
   const bands = pressure();
-  lines.push(`bands: tight ≥${bands.tight}%  critical ≥${bands.critical}%  exhausted ≥${bands.exhausted}%`);
+  lines.push(`bands (on pressure — usage weighed against time to reset): tight ≥${bands.tight}%  critical ≥${bands.critical}%  exhausted ≥${bands.exhausted}%`);
   const flight = (limits.inFlight?.codex ?? 0) + (limits.inFlight?.claude ?? 0);
   const scope = limits.fleet ? 'the fleet' : 'this machine';
   lines.push(flight === 0

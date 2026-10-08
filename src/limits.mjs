@@ -58,6 +58,7 @@ import { delimiter, join } from 'node:path';
 
 import { CACHE_DIR, loadConfig } from './config.mjs';
 import { applyCommitted, freshProbe, inFlight, mutate, snapshot } from './ledger.mjs';
+import { providerPressure } from './pace.mjs';
 
 export { CACHE_DIR };
 
@@ -676,9 +677,24 @@ export async function readLimits({ refresh = false, now = Date.now(), readers, i
     if (claude && typeof claude === 'object') claude.installed = claudeInstalled;
   }
 
+  // Pace-adjusted pressure, attached to the reading so a JSON consumer sees the
+  // same figure routing uses. Computed here, at read time, and never persisted:
+  // it depends on the clock, so a cached copy would be wrong a minute later.
+  const withPressure = (reading) => {
+    if (!reading || typeof reading !== 'object' || reading.available !== true) return reading;
+    const pr = providerPressure(reading, { now, exhausted: cfg.pressure.exhausted });
+    return {
+      ...reading,
+      pressurePercent: pr.percent,
+      pressureWindow: pr.window,
+      paceAware: pr.paceAware,
+      pace: pr.windows,
+    };
+  };
+
   return {
-    codex,
-    claude,
+    codex: withPressure(codex),
+    claude: withPressure(claude),
     cached: { codex: codexProbe.cached, claude: claudeProbe.cached },
     inFlight: {
       codex: inFlight(state, 'codex'),
