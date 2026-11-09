@@ -41,8 +41,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  markExhausted, markGrokUnverified, readGrokLimits, recordCodexRateLimits, refreshClaudeLimits,
-  refreshCodexLimits, refreshGrokLimits,
+  markClaudeSignedOut, markExhausted, markGrokUnverified, readGrokLimits, recordCodexRateLimits,
+  refreshClaudeLimits, refreshCodexLimits, refreshGrokLimits,
 } from './limits.mjs';
 import { loadConfig } from './config.mjs';
 import {
@@ -74,7 +74,9 @@ const STRUCTURED_SCHEMA_REJECTION_RE = /\b(?:invalid[ _-]?json[ _-]?schema|respo
 // 5\d\d matched any number from 500 to 599 — line numbers, byte counts, pixel
 // values, durations. Name the statuses that actually mean "retry" instead.
 const TRANSIENT_RE = /\b(ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|network error|stream (?:closed|error)|5(?:00|02|03|04|29)\b|overloaded|temporarily unavailable|service unavailable)\b/i;
-const AUTH_RE = /\b(unauthori[sz]ed|401|403|invalid[ _-]?api[ _-]?key|not logged in|not signed in|please (?:run )?(?:codex )?login|token (?:has )?expired|re-?authenticate)\b/i;
+// "Failed to authenticate: OAuth session expired" is how the claude CLI says
+// its own login lapsed; without those phrases that was a bare `exit 1`.
+const AUTH_RE = /\b(unauthori[sz]ed|401|403|invalid[ _-]?api[ _-]?key|not logged in|not signed in|please (?:run )?(?:codex )?login|(?:token|session) (?:has )?expired|re-?authenticate|failed to authenticate|authentication[_ ]failed)\b/i;
 
 /**
  * Decide what a failed attempt was. The classification drives everything: a
@@ -415,6 +417,15 @@ export function parseClaudeStdout(stdout) {
   if (!trimmed) return { text: '', usage: null };
   try {
     const parsed = JSON.parse(trimmed);
+    // A run that failed still prints a result, its text the error ("Failed to
+    // authenticate: …"). That is a diagnosis, never an answer: it goes to the
+    // caller as `error` so the failure is classified by what it says.
+    if (parsed?.type === 'result' && parsed.is_error === true) {
+      const said = typeof parsed.result === 'string' && parsed.result.trim()
+        ? parsed.result.trim()
+        : `claude reported an error (${parsed.subtype ?? 'no detail'})`;
+      return { text: '', usage: parsed.usage ?? null, error: said };
+    }
     if (typeof parsed?.result === 'string') {
       return { text: parsed.result, usage: parsed.usage ?? null, cost: parsed.total_cost_usd ?? null };
     }
@@ -926,6 +937,12 @@ export async function runAgent(decision, prompt, opts = {}) {
           const parsed = parseClaudeStdout(result.stdout);
           text = parsed.text;
           usage = parsed.usage;
+          if (parsed.error) {
+            result = {
+              ...result,
+              stderr: [result.stderr?.trim(), parsed.error].filter(Boolean).join('\n'),
+            };
+          }
           // The same free measurement the codex path takes, which claude never
           // had. Without it `samples.claude` stays empty forever, estimateCost
           // falls back to the configured default of 1 point, and every claude
@@ -1041,6 +1058,11 @@ export async function runAgent(decision, prompt, opts = {}) {
         // deterministic for this rung, but Claude can still honor the caller's
         // original prompt contract, so advance to the next provider.
         if (failure === 'schema-rejection') break;
+        if (failure === 'auth' && target.provider === 'claude') {
+          // Tell every orchestrator on this machine, so the next decision
+          // routes around claude instead of failing the same way.
+          await markClaudeSignedOut(providerError.split('\n').pop().slice(0, 300)).catch(() => {});
+        }
         if (failure === 'auth' || failure === 'fatal') break;
         // A timeout is the most expensive failure to repeat and the least
         // likely to come out differently: the same prompt on the same model

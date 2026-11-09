@@ -231,11 +231,21 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
       // Keychain, so this file never exists there; the meter reads the windows
       // through the CLI instead, and the headroom section below shows whether
       // that worked.
-      line(OK, 'claude oauth', 'credentials are in the macOS Keychain — the meter reads through the claude CLI');
+      if (limits.claude?.auth?.ok !== false) {
+        line(OK, 'claude oauth', 'credentials are in the macOS Keychain — the meter reads through the claude CLI');
+      }
     } else {
       line(WARN, 'claude oauth', `not logged in — run \`claude\` once (expected ${config.claudeCredentials})`);
       todo.push(['claude', 'log in, then quit — this writes the credentials the meter reads']);
     }
+  }
+
+  // The terminal CLI keeps its own login, apart from the desktop app's, and it
+  // is what every claude dispatch runs. When it lapses the app keeps working
+  // and only dispatches fail, so nothing else would say so.
+  if (claudeVersion && limits.claude?.auth?.ok === false) {
+    line(WARN, 'claude sign-in', `${limits.claude.auth.reason} — claude is not routable`);
+    todo.push(['claude', 'then type /login and finish in the browser — the terminal CLI is signed out, so claude dispatches fail']);
   }
 
   // Grok: is it the subscription, and can anything make it the API instead?
@@ -283,6 +293,10 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
   for (const provider of ['codex', 'claude', 'grok']) {
     const p = limits[provider];
     if (provider === 'grok' && !grokVersion) continue;
+    if (p?.auth && p.auth.ok === false) {
+      line(WARN, provider, `not read — ${p.auth.reason}`);
+      continue;
+    }
     if (provider === 'grok' && p?.auth && !p.auth.ok) {
       line(WARN, provider, `not read — ${p.auth.reason}`);
       continue;

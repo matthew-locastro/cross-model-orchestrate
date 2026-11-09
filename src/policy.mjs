@@ -114,6 +114,17 @@ export function providerState(limits, bands = pressure(), now = Date.now(), id =
       reason: limits?.auth?.reason ?? `${id} has not been checked for a subscription sign-in`,
     };
   }
+  // Any vendor whose own CLI said it is signed out cannot run anything: every
+  // dispatch to it would fail on auth. Explicit evidence only — a reading with
+  // no auth field is "unknown", not signed out.
+  if (limits?.auth?.ok === false) {
+    return {
+      state: 'unauthenticated',
+      percent: null,
+      resetsAt: null,
+      reason: limits.auth.reason ?? `${id} is signed out`,
+    };
+  }
   if (!limits || limits.available !== true) {
     // A dead probe must not stop the run. Unknown means usable.
     return { state: 'unknown', percent: null, resetsAt: null };

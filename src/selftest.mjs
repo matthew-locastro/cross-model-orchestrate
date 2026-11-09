@@ -7,7 +7,8 @@
 // doubles as a check that an override landed.
 
 import { decide } from './policy.mjs';
-import { buildCommand, childEnv, classifyFailure, extractJson } from './run.mjs';
+import { buildCommand, childEnv, classifyFailure, extractJson, parseClaudeStdout } from './run.mjs';
+import { parseClaudeAuthFailure } from './limits.mjs';
 import { grokAuthFrom, offSubscriptionReason, parseGrokModels } from './grok.mjs';
 
 const HEALTHY = { available: true, worstPercent: 5, nextResetAt: null, hardBlocked: false, windows: [{ key: '5h', percentUsed: 5 }] };
@@ -28,6 +29,11 @@ const SUBSCRIBED = { ok: true, method: 'oauth', authMode: 'Oidc', tier: 'SuperGr
 const GROK_OK = { ...paced([weekly(9, 108 * HOUR)]), provider: 'grok', auth: SUBSCRIBED };
 const GROK_SIGNED_OUT = { available: false, provider: 'grok', windows: [], auth: { ok: false, method: 'none', reason: 'not signed in' } };
 const GROK_ON_KEY = { ...GROK_OK, auth: { ok: false, method: 'api-key', reason: 'XAI_API_KEY' } };
+const CLAUDE_SIGNED_OUT = { available: false, provider: 'claude', windows: [], auth: { ok: false, method: 'none', reason: 'the claude CLI is signed out' } };
+const CLAUDE_AUTH_RESULT = JSON.stringify({
+  type: 'result', subtype: 'success', is_error: true, total_cost_usd: 0,
+  result: 'Failed to authenticate: OAuth session expired and could not be refreshed',
+});
 const WEEK_SQUEEZED = paced([weekly(80, 120 * HOUR)]); // 20% must last five days
 const WEEK_EXPIRING = paced([weekly(80, 12 * HOUR)]); // 20% for twelve hours
 const BLIP = paced([fiveHour(70, HOUR / 3), weekly(10, 144 * HOUR)]); // clears in twenty minutes
@@ -137,6 +143,12 @@ const CASES = [
     expect: (d) => d.provider === 'grok' && d.independence === 'cross-vendor',
   },
   {
+    name: 'a signed-out claude CLI is never routed to',
+    task: { role: 'review', complexity: 3, length: 's', independentOf: 'codex' },
+    limits: { codex: HEALTHY, claude: CLAUDE_SIGNED_OUT, grok: GROK_OK },
+    expect: (d) => d.provider === 'grok' && !d.fallbacks.some((f) => f.provider === 'claude'),
+  },
+  {
     name: 'bulk reading does not get a frontier model',
     task: { role: 'synthesis', complexity: 3, length: 'xl', contextTokens: 250_000 },
     limits: { codex: HEALTHY, claude: HEALTHY },
@@ -216,6 +228,15 @@ const UNIT = [
   {
     name: 'a usage-limit message is classified as rate-limit, not fatal',
     run: () => classifyFailure({ code: 1, stderr: 'You have hit your usage limit' }) === 'rate-limit',
+  },
+  {
+    name: 'a signed-out claude run is an auth failure, never an answer',
+    run: () => {
+      const parsed = parseClaudeStdout(CLAUDE_AUTH_RESULT);
+      return parsed.text === ''
+        && classifyFailure({ code: 1, stderr: parsed.error }) === 'auth'
+        && /OAuth session expired/.test(parseClaudeAuthFailure(CLAUDE_AUTH_RESULT) ?? '');
+    },
   },
   {
     name: 'a fenced JSON verdict is recovered',

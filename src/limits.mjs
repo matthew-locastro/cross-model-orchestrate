@@ -543,6 +543,60 @@ export function parseClaudeRateLimitEvents(stdout) {
   return { windows, hardBlocked };
 }
 
+/** The words the claude CLI uses when its login has lapsed or never existed. */
+export const CLAUDE_SIGNED_OUT_RE = /failed to authenticate|authentication[_ ]failed|not logged in|run \/login|(?:oauth )?(?:session|token) (?:has )?expired|invalid api key/i;
+
+/**
+ * Did a `claude -p` turn fail because the CLI is signed out?
+ *
+ * The CLI says so in its own output, not on stderr: a synthetic assistant
+ * message carrying `"error": "authentication_failed"`, then a result with
+ * `is_error: true` whose text is the reason —
+ *
+ *   {"type":"result","is_error":true,"total_cost_usd":0,
+ *    "result":"Failed to authenticate: OAuth session expired and could not be refreshed"}
+ *
+ * — and it exits 1, having spent nothing. The terminal CLI keeps a login of
+ * its own (the macOS Keychain), separate from the desktop app's, so it can
+ * lapse while every app session keeps working. Before this was read, the meter
+ * said only "the claude CLI reported no plan windows", which reads like an old
+ * CLI rather than a lapsed login; headroom became "unknown", unknown routes
+ * as usable, and every claude dispatch then failed on auth.
+ *
+ * Reads stream-json and json output alike. Returns the CLI's own words, or
+ * null when the turn did not fail on auth.
+ */
+export function parseClaudeAuthFailure(stdout) {
+  if (typeof stdout !== 'string' || stdout.length === 0) return null;
+  let reason = null;
+  for (const line of stdout.split('\n')) {
+    if (!/authenticat|log ?in|expired|api key/i.test(line)) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event?.type === 'assistant' && event.error === 'authentication_failed') {
+      const content = Array.isArray(event.message?.content) ? event.message.content : [];
+      const text = content.map((c) => (typeof c?.text === 'string' ? c.text : '')).join(' ').trim();
+      reason = text || reason || 'authentication failed';
+    } else if (event?.type === 'result' && event.is_error === true
+      && CLAUDE_SIGNED_OUT_RE.test(String(event.result ?? ''))) {
+      reason = String(event.result).trim();
+    }
+  }
+  return reason;
+}
+
+/** A claude reading that says why it cannot run, and what fixes it. */
+function claudeSignedOut(reason) {
+  return {
+    ...unavailable('claude', `the claude CLI is signed out (${reason}) — run \`claude\` in a terminal, then /login`),
+    auth: { ok: false, method: 'none', reason: `the claude CLI is signed out: ${reason}` },
+  };
+}
+
 /**
  * The smallest turn the CLI will run, and what it prints.
  *
@@ -593,8 +647,20 @@ async function runClaudeProbe({ lean = true } = {}) {
  */
 export async function readClaudeLimitsViaCli({ probe = runClaudeProbe } = {}) {
   try {
-    let parsed = parseClaudeRateLimitEvents(await probe({ lean: true }));
-    if (!parsed) parsed = parseClaudeRateLimitEvents(await probe({ lean: false }));
+    const lean = await probe({ lean: true });
+    let parsed = parseClaudeRateLimitEvents(lean);
+    if (!parsed) {
+      // A lapsed login is not an old CLI: the plain turn would fail the same
+      // way, so it is not run.
+      const signedOut = parseClaudeAuthFailure(lean);
+      if (signedOut) return claudeSignedOut(signedOut);
+      const plain = await probe({ lean: false });
+      parsed = parseClaudeRateLimitEvents(plain);
+      if (!parsed) {
+        const reason = parseClaudeAuthFailure(plain);
+        if (reason) return claudeSignedOut(reason);
+      }
+    }
     if (!parsed) return unavailable('claude', 'the claude CLI reported no plan windows');
     return summarize('claude', parsed.windows, {
       hardBlocked: parsed.hardBlocked,
@@ -633,6 +699,9 @@ export async function readClaudeLimits({ credentialsPath, fetchImpl, refresh, cl
 
   const viaCli = await readCli();
   if (viaCli?.available === true) return viaCli;
+  // A signed-out CLI is the answer that matters: claude cannot run at all, and
+  // "ENOENT …credentials.json" in front of it would hide the remedy.
+  if (viaCli?.auth?.ok === false) return viaCli;
   return unavailable('claude', `${viaOAuth.error}; and through the CLI: ${viaCli?.error ?? 'no reading'}`);
 }
 
@@ -880,6 +949,18 @@ export async function markGrokUnverified(reason, { now = Date.now() } = {}) {
       storedAt: now,
       value: { ...previous, auth: { ok: false, method: 'api-key', reason } },
     };
+  }, { now: () => now });
+}
+
+/**
+ * Record that claude's CLI turned out to be signed out, as a dispatch just
+ * found. Shared, so the next decision on this machine routes around claude
+ * instead of finding out the same way. Not sticky: the next probe after the
+ * claude TTL replaces it, so logging in fixes routing within a minute.
+ */
+export async function markClaudeSignedOut(reason, { now = Date.now() } = {}) {
+  await mutate((st) => {
+    st.probes.claude = { storedAt: now, value: claudeSignedOut(reason) };
   }, { now: () => now });
 }
 

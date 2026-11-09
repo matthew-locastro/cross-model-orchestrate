@@ -186,6 +186,14 @@ export async function snapshot({ now = Date.now, local = false } = {}) {
 // ── probe cache ───────────────────────────────────────────────────────────
 
 /**
+ * A reading that says this machine's CLI cannot run the vendor (signed out, or
+ * on the wrong kind of login). True of this box only, so it stays here.
+ */
+function isMachineLocal(value) {
+  return value?.auth?.ok === false;
+}
+
+/**
  * Return a cached probe if it is younger than maxAgeMs, otherwise take one.
  *
  * `maxAgeMs` is a number, or a function of the cached entry when how long a
@@ -199,10 +207,19 @@ export async function freshProbe(provider, maxAgeMs, read, { now = Date.now } = 
   const fleet = fleetConfig();
   const maxAge = (entry) => (typeof maxAgeMs === 'function' ? maxAgeMs(entry) : maxAgeMs);
 
+  const local = await readState();
+  const localEntry = local.probes?.[provider];
+  const localFresh = Boolean(localEntry) && now() - localEntry.storedAt < maxAge(localEntry);
+  // The windows are per-subscription, but a sign-in is per machine. This box's
+  // own word that its CLI is signed out outranks another box's healthy
+  // reading — that box can run the vendor, this one cannot — and it is never
+  // published to them (below).
+  const signedOutHere = localFresh && isMachineLocal(localEntry.value);
+
   // A reading taken on any box is a reading for the whole fleet — the windows
   // are per-subscription, not per-machine — so check the coordinator first and
   // let one probe serve everyone.
-  if (fleet) {
+  if (fleet && !signedOutHere) {
     const remote = await remoteState();
     const entry = remote?.probes?.[provider];
     if (entry && now() - entry.storedAt < maxAge(entry)) {
@@ -210,9 +227,7 @@ export async function freshProbe(provider, maxAgeMs, read, { now = Date.now } = 
     }
   }
 
-  const local = await readState();
-  const localEntry = local.probes?.[provider];
-  if (!fleet && localEntry && now() - localEntry.storedAt < maxAge(localEntry)) {
+  if ((!fleet || signedOutHere) && localFresh) {
     return { value: localEntry.value, cached: true };
   }
 
@@ -223,7 +238,7 @@ export async function freshProbe(provider, maxAgeMs, read, { now = Date.now } = 
     const current = s.probes[provider];
     if (!current || current.storedAt < storedAt) s.probes[provider] = { storedAt, value };
   }, { now });
-  if (fleet) await remoteProbe(provider, value, storedAt);
+  if (fleet && !isMachineLocal(value)) await remoteProbe(provider, value, storedAt);
   return { value, cached: false };
 }
 

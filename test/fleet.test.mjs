@@ -150,6 +150,42 @@ test('one probe serves the whole fleet', async () => {
   });
 });
 
+test('a sign-out is one machine\'s: it outranks the fleet there and is never published', async () => {
+  await withCoordinator(async (url) => {
+    const healthy = `{ available: true, worstPercent: 30, windows: [] }`;
+    const signedOut = `{ available: false, windows: [], auth: { ok: false, method: 'none', reason: 'the claude CLI is signed out' } }`;
+    // Box A is signed in and publishes a healthy claude reading.
+    await box(url, 'mac-a', `
+      import { freshProbe } from '${SRC}ledger.mjs';
+      await freshProbe('claude', 60000, async () => (${healthy}));
+      console.log('ok');
+    `);
+    // Box B's own CLI is signed out: a dispatch found it, or its probe did.
+    const b = JSON.parse(await box(url, 'mac-b', `
+      import { freshProbe } from '${SRC}ledger.mjs';
+      import { markClaudeSignedOut } from '${SRC}limits.mjs';
+      await markClaudeSignedOut('OAuth session expired');
+      const marked = await freshProbe('claude', 60000, async () => (${healthy}));
+      const probed = await freshProbe('grok', 60000, async () => (${signedOut}));
+      console.log(JSON.stringify({ marked: marked.value.auth?.ok ?? null, from: marked.from ?? null, probed: probed.value.auth?.ok ?? null }));
+    `));
+    assert.equal(b.marked, false, 'box B must not route to a claude it cannot run');
+    assert.equal(b.from, null, 'its own reading, not the fleet\'s');
+    // Box C is signed in: box B's sign-outs must not reach it.
+    const c = JSON.parse(await box(url, 'mac-c', `
+      import { freshProbe } from '${SRC}ledger.mjs';
+      let grokProbed = 0;
+      const claude = await freshProbe('claude', 60000, async () => { throw new Error('should be cached'); });
+      const grok = await freshProbe('grok', 60000, async () => { grokProbed++; return { available: true, worstPercent: 1, windows: [], auth: { ok: true } }; });
+      console.log(JSON.stringify({ claude: claude.value.available, from: claude.from ?? null, grokProbed, grok: grok.value.auth?.ok }));
+    `));
+    assert.equal(c.claude, true, 'box A\'s healthy reading still serves the fleet');
+    assert.equal(c.from, 'mac-a');
+    assert.equal(c.grokProbed, 1, 'box B\'s signed-out grok was never published, so C reads its own');
+    assert.equal(c.grok, true);
+  });
+});
+
 test('cost samples are pooled — the fleet learns from every box', async () => {
   await withCoordinator(async (url) => {
     await box(url, 'vps-a', `
