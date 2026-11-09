@@ -30,7 +30,9 @@
 //   4. least-used       — headroom is the dominant score. A provider whose
 //                         pressure sits `powerGap` points below every other
 //                         provider that is actually competing gets a power-use
-//                         bonus, so a differentially idle subscription is spent
+//                         bonus, so a differentially idle subscription is spent.
+//                         The bonus is withheld when any usable competitor's
+//                         pressure is unknown: an unread meter is still in the race
 //   5. orchestrator     — the vendor driving the run loses `penalty` points on
 //                         every dispatch, and at or above `reserveAt` pressure
 //                         it ranks below every usable alternative
@@ -138,8 +140,13 @@ export function providerState(limits, bands = pressure(), now = Date.now(), id =
   // weighed against how long what is left has to last. The raw figure and the
   // window that binds travel alongside so every message can show both.
   const p = providerPressure(limits, { now, exhausted: bands.exhausted });
-  const percent = p.percent;
+  const percent = Number.isFinite(p.percent) ? p.percent : null;
   const resetsAt = p.resetsAt ?? limits.nextResetAt ?? null;
+  // A probe that answered but produced no finite pressure is the same fact as
+  // one that did not answer. Treating it as 0% would crown it least-used.
+  if (percent == null && !limits.hardBlocked) {
+    return { state: 'unknown', percent: null, resetsAt };
+  }
   const detail = {
     percent,
     resetsAt,
@@ -244,6 +251,8 @@ function formatPoints(n) {
  *   + powerBonus                                default 25, when its pressure is
  *                                               ≥ powerGap (default 20) below
  *                                               every other competing provider
+ *                                               AND every usable competitor has
+ *                                               a finite pressure
  *   + affinity                                  research and web, on grok
  *   + preference.weightPoints / 10              tie-break, default 2.5
  *
@@ -355,9 +364,12 @@ export function rankProviders(task, states, preference = loadConfig().preference
 
   // Power-use peers are the providers that can actually take the work. The
   // orchestrator's vendor, once it has crossed reserveAt, is held back, so it
-  // is not a competitor the gap has to clear.
-  const peers = scored.filter((c) => isUsable(c) && !reserved(c) && typeof c.percent === 'number');
-  if (peers.length >= 2 && Number.isFinite(powerGap) && powerBonus) {
+  // is not a competitor the gap has to clear. A usable provider with unknown
+  // pressure still is: the bonus waits until every competitor has a finite
+  // pressure, so an unread meter cannot be skipped and then lose to the bonus.
+  const competitors = scored.filter((c) => isUsable(c) && !reserved(c));
+  const peers = competitors.filter((c) => Number.isFinite(c.percent));
+  if (peers.length === competitors.length && peers.length >= 2 && Number.isFinite(powerGap) && powerBonus) {
     let winner = null;
     let nearest = null;
     let nearestGap = Infinity;
@@ -421,7 +433,10 @@ export function formatRoutingLine(ranked) {
     // name it as least-used. Otherwise the reserve is the whole status line.
     if (held && !(asLead && !power)) return `${c.provider} reserved for orchestrator`;
     if (!isUsable(c)) return `${c.provider} ${c.state}`;
-    const pct = typeof c.percent === 'number' ? `${c.percent}%` : 'unknown';
+    const pct = Number.isFinite(c.percent) ? `${c.percent}%` : 'unknown';
+    // No numeric lead means no least-used comparison happened. Name the
+    // tie-break vendor in parentheses so the line still says who would run.
+    if (asLead && !Number.isFinite(c.percent)) return `headroom unknown (${c.provider})`;
     if (asLead && power) return `power-use ${c.provider} (${pct})`;
     if (asLead) return `least-used ${c.provider} (${pct})`;
     return `${c.provider} ${pct}`;

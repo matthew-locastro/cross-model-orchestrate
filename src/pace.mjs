@@ -180,7 +180,9 @@ export function describePace(p) {
  * the worst raw window, so that is the window they are added to.
  *
  * @returns {{
- *   percent: number,          pace-adjusted pressure of the binding window
+ *   percent: number|null,     pace-adjusted pressure of the binding window.
+ *                             null when the reading has no finite pressure —
+ *                             never coerced to 0, which would look unused
  *   window: string|null,      which window binds
  *   resetsAt: string|null,    when the binding window resets
  *   rawPercent: number|null,  the worst raw reading, for display
@@ -205,7 +207,8 @@ export function providerPressure(limits, { now = Date.now(), exhausted = 95 } = 
     .filter(Boolean);
 
   const fallback = {
-    percent: rawPercent ?? 0,
+    // No finite reading is not 0% used. Callers treat a null pressure as unknown.
+    percent: rawPercent,
     window: rawWindow,
     resetsAt: limits?.nextResetAt ?? null,
     rawPercent,
@@ -223,7 +226,7 @@ export function providerPressure(limits, { now = Date.now(), exhausted = 95 } = 
   if (rawPercent != null && rawPercent >= exhausted && binding.pressure < rawPercent) return fallback;
 
   return {
-    percent: binding.pressure,
+    percent: Number.isFinite(binding.pressure) ? binding.pressure : rawPercent,
     window: binding.key,
     resetsAt: binding.resetsAt ?? limits?.nextResetAt ?? null,
     rawPercent,

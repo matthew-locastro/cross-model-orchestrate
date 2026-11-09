@@ -8,7 +8,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { loadConfig, resetConfigCache } from '../src/config.mjs';
-import { decide, routingLine } from '../src/policy.mjs';
+import { providerPressure } from '../src/pace.mjs';
+import { decide, providerState, routingLine } from '../src/policy.mjs';
 
 const reading = (percent, extra = {}) => ({
   available: true,
@@ -122,6 +123,49 @@ test('orchestrator.vendor null turns the reserve off', () => {
     assert.equal(open.provider, 'claude');
     assert.equal(open.notes.some((n) => /reserved for the orchestrator/.test(n)), false);
   });
+});
+
+test('a usable provider with unknown pressure blocks the power-use bonus', () => {
+  // Codex 50%, Claude 5%, Grok signed in but unreadable. Claude's 45-point gap
+  // over Codex is not a comparison against every competitor: Grok can still run.
+  const unread = { provider: 'grok', available: false, auth: SUB, error: 'meter unreadable' };
+  const d = decide({ role: 'implement', complexity: 3, length: 'm' }, limits(50, 5, unread));
+  assert.equal(d.states.grok.state, 'unknown');
+  assert.equal(d.states.grok.percent, null);
+  assert.equal(/power-use:/.test(d.reason), false);
+  assert.equal(d.provider, 'codex');
+  assert.notEqual(d.provider, 'claude');
+});
+
+test('an available reading with no pressure stays null and does not win as least-used', () => {
+  const blank = { available: true, worstPercent: null, windows: [], hardBlocked: false };
+  assert.equal(providerPressure(blank).percent, null);
+  const state = providerState(blank);
+  assert.equal(state.state, 'unknown');
+  assert.equal(state.percent, null);
+
+  // A coerced 0% would outrank a provider genuinely at 5%.
+  const d = decide(
+    { role: 'implement', complexity: 3, length: 'm' },
+    { codex: blank, claude: reading(5), grok: grok(99, { hardBlocked: true }) },
+  );
+  assert.equal(d.states.codex.state, 'unknown');
+  assert.equal(d.states.codex.percent, null);
+  assert.equal(d.provider, 'claude');
+});
+
+test('limits --human says headroom unknown when the lead has no numeric pressure', () => {
+  const dark = { available: false, error: 'no reading' };
+  const line = routingLine({
+    codex: dark,
+    claude: dark,
+    grok: { provider: 'grok', available: false, auth: SUB, error: 'meter unreadable' },
+  });
+  assert.equal(
+    line,
+    'routing: headroom unknown (codex) · grok unknown · claude unknown',
+  );
+  assert.equal(/least-used/.test(line), false);
 });
 
 test('a configured powerGap is what the bonus actually uses', () => {

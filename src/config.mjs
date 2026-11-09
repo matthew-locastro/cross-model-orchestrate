@@ -113,7 +113,8 @@ export const DEFAULT_PREFERENCE = {
  * Headroom is the dominant term: `headroomWeight` points at 0% pressure,
  * scaled linearly down to 0 at 100%. A power-use bonus lands on the one
  * usable provider whose pressure sits at least `powerGap` points below every
- * other provider that is actually competing for the dispatch.
+ * other provider that is actually competing for the dispatch. It is withheld
+ * when any usable competitor's pressure is unknown.
  */
 export const DEFAULT_ROUTING = {
   headroomWeight: 40,
