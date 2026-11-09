@@ -6,11 +6,13 @@
 // usage endpoint that will not answer. Check all five and say which.
 
 import { execFile } from 'node:child_process';
-import { readFile, lstat, readlink, realpath } from 'node:fs/promises';
+import { readFile, lstat, readlink, realpath, stat } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 import { loadConfig, TIERS } from './config.mjs';
+import { GROK_KEY_VARS, lockGrokEnv, parseGrokModels } from './grok.mjs';
 import { readLimits } from './limits.mjs';
 import { AGENT_DIR, SKILL_HOSTS } from './install.mjs';
 import { health } from './remote.mjs';
@@ -30,7 +32,49 @@ const FAIL = 'FAIL';
 const INSTALL_COMMAND = {
   codex: 'npm install -g @openai/codex',
   claude: 'npm install -g @anthropic-ai/claude-code',
+  grok: 'curl -fsSL https://x.ai/cli/install.sh | bash',
 };
+
+/**
+ * What `grok models` says under the same locked environment cmo dispatches
+ * with: the sign-in line, any model carrying its own API key, and the model ids
+ * this account offers. Free — no session, no model call.
+ */
+async function grokModels(binary) {
+  try {
+    const { stdout } = await execFileAsync(binary, ['models'], {
+      timeout: 30_000, cwd: tmpdir(), env: lockGrokEnv(process.env),
+    });
+    return parseGrokModels(stdout);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Settings in ~/.grok/config.toml that outrank the subscription sign-in: a
+ * per-model `api_key` or `env_key` bills that model to a key, and
+ * `preferred_method = "api_key"` pins key auth. Only the setting NAMES are
+ * looked at — never a value.
+ */
+async function grokKeySettings() {
+  const path = join(process.env.GROK_HOME ?? join(homedir(), '.grok'), 'config.toml');
+  let text;
+  try {
+    text = await readFile(path, 'utf8');
+  } catch {
+    return { path, found: [] };
+  }
+  const found = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/#.*/, '').trim();
+    const m = line.match(/^(api_key|env_key|preferred_method)\s*=\s*(.*)$/);
+    if (!m) continue;
+    if (m[1] === 'preferred_method' && !/api_key/.test(m[2])) continue;
+    found.push(m[1] === 'preferred_method' ? 'preferred_method = "api_key"' : m[1]);
+  }
+  return { path, found };
+}
 
 /**
  * How a CLI got onto this machine, so the upgrade advice is the command that
@@ -58,7 +102,7 @@ async function upgradeCommand(binary) {
 
 async function binaryVersion(binary) {
   try {
-    const { stdout } = await execFileAsync(binary, ['--version'], { timeout: 15_000 });
+    const { stdout } = await execFileAsync(binary, ['--version'], { timeout: 15_000, env: lockGrokEnv(process.env) });
     return stdout.trim().split('\n')[0];
   } catch {
     return null;
@@ -94,7 +138,10 @@ async function shadowed(binary) {
   try {
     const { stdout } = await execFileAsync(process.platform === 'win32' ? 'where' : 'which', ['-a', binary]);
     const paths = [...new Set(stdout.trim().split('\n').filter(Boolean))];
-    return paths.length > 1 ? paths : null;
+    // Two names for one file is not a shadow: installers commonly symlink their
+    // binary into ~/.local/bin as well (grok's does). Only distinct targets count.
+    const targets = new Set(await Promise.all(paths.map((p) => realpath(p).catch(() => p))));
+    return targets.size > 1 ? paths : null;
   } catch {
     return null;
   }
@@ -132,22 +179,27 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
   };
 
   log('provider CLIs');
-  const [codexVersion, claudeVersion] = await Promise.all([
+  const grokBinary = config.grokBinary ?? 'grok';
+  const [codexVersion, claudeVersion, grokVersion] = await Promise.all([
     binaryVersion('codex'),
     binaryVersion('claude'),
+    binaryVersion(grokBinary),
   ]);
   const todo = []; // what a human has to type to finish setup, in order
   line(codexVersion ? OK : WARN, 'codex',
     codexVersion ?? `not on PATH — ${INSTALL_COMMAND.codex}`);
   line(claudeVersion ? OK : WARN, 'claude',
     claudeVersion ?? `not on PATH — ${INSTALL_COMMAND.claude}`);
+  line(grokVersion ? OK : WARN, 'grok',
+    grokVersion ? `${grokVersion}  (${grokBinary})` : `not installed — ${INSTALL_COMMAND.grok}`);
   if (!codexVersion) todo.push([INSTALL_COMMAND.codex, 'the vendor cmo prefers — without it every dispatch fails over']);
   if (!claudeVersion) todo.push([INSTALL_COMMAND.claude, 'the orchestrator itself runs here']);
+  if (!grokVersion) todo.push([INSTALL_COMMAND.grok, 'optional third vendor: web research and link checks, on a SuperGrok plan']);
   if (!codexVersion && !claudeVersion) {
     line(FAIL, 'at least one provider', 'install codex or claude and log in');
   }
 
-  for (const binary of ['codex', 'claude']) {
+  for (const binary of ['codex', 'claude', 'grok']) {
     const paths = await shadowed(binary);
     if (paths) {
       // Which one runs depends on PATH, and an agent's PATH is rarely a login
@@ -155,6 +207,10 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
       line(WARN, `${binary} is shadowed`, `${paths.length} on PATH: ${paths.join('  ')}`);
     }
   }
+
+  // One reading for both the auth and the headroom sections. For grok it is the
+  // same call routing makes, so what doctor says is what dispatch will do.
+  const limits = await readLimits({ refresh: true });
 
   log('\nauth');
   try {
@@ -182,6 +238,35 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
     }
   }
 
+  // Grok: is it the subscription, and can anything make it the API instead?
+  let grokListing = null;
+  if (grokVersion) {
+    const g = limits.grok;
+    const a = g?.auth;
+    if (a?.ok) {
+      line(OK, 'grok sign-in', `${a.authMode} (OAuth) on ${a.tier} — dispatches bill the subscription`);
+    } else if (a?.method === 'none') {
+      line(WARN, 'grok sign-in', 'not signed in — grok is not routable until you run `grok login`');
+      todo.push(['grok login', 'browser OAuth to the SuperGrok account; cmo never uses an API key']);
+    } else {
+      line(FAIL, 'grok sign-in', `${a?.reason ?? 'unverified'} — grok is not routable`);
+    }
+    grokListing = await grokModels(grokBinary);
+    if (grokListing?.modelKeys?.length) {
+      line(FAIL, 'grok per-model keys', `${grokListing.modelKeys.join(', ')} use their own API key — those models bill the API`);
+    }
+    const settings = await grokKeySettings();
+    if (settings.found.length) {
+      line(WARN, 'grok config keys', `${settings.found.join(', ')} in ${settings.path} — a key setting outranks the sign-in`);
+    }
+  }
+  // Presence only: the value is never read, printed or passed on.
+  const keysInEnv = GROK_KEY_VARS.filter((name) => process.env[name]);
+  if (keysInEnv.length) {
+    line(WARN, 'xAI API key in env', `${keysInEnv.join(', ')} set in this shell — cmo strips it from every child,`
+      + ' but grok run by hand would bill it');
+  }
+
   log('\nfleet');
   const fleet = await health();
   if (!fleet.configured) {
@@ -195,9 +280,13 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
   }
 
   log('\nheadroom');
-  const limits = await readLimits({ refresh: true });
-  for (const provider of ['codex', 'claude']) {
+  for (const provider of ['codex', 'claude', 'grok']) {
     const p = limits[provider];
+    if (provider === 'grok' && !grokVersion) continue;
+    if (provider === 'grok' && p?.auth && !p.auth.ok) {
+      line(WARN, provider, `not read — ${p.auth.reason}`);
+      continue;
+    }
     if (!p.available) {
       line(WARN, provider, p.error ?? 'unavailable');
       // A dark meter is not cosmetic: routing runs off it, so every decision
@@ -214,7 +303,8 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
       continue;
     }
     const windows = p.windows.map((w) => `${w.label} ${w.percentUsed}%`).join('  ');
-    line(OK, provider, `${windows}${p.plan ? `  plan=${p.plan}` : ''}`);
+    const shared = provider === 'grok' && p.unifiedBilling ? '  (shared with the Grok apps)' : '';
+    line(OK, provider, `${windows}${p.plan ? `  plan=${p.plan}` : ''}${shared}`);
   }
 
   const missingCodexModels = [];
@@ -222,7 +312,8 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
   log(`  ${config.configFileFound ? 'from' : 'defaults; no config at'} ${config.configFile}`);
   const cache = await codexKnownModels();
   const known = cache?.ids ?? null;
-  for (const provider of ['codex', 'claude']) {
+  const grokOffered = grokListing?.models?.length ? new Set(grokListing.models) : null;
+  for (const provider of ['codex', 'claude', 'grok']) {
     for (const tier of TIERS) {
       const spec = config.models[provider][tier];
       const extra = spec.effort ? `effort=${spec.effort}` : spec.reasoning ? `reasoning=${spec.reasoning}` : '';
@@ -232,6 +323,10 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
         state = FAIL;
         note = `${extra} — this codex CLI does not offer it`.trim();
         missingCodexModels.push(spec.model);
+      }
+      if (provider === 'grok' && grokOffered && !grokOffered.has(spec.model)) {
+        state = FAIL;
+        note = `${extra} — this grok account offers ${[...grokOffered].join(', ')}`.trim();
       }
       line(state, `${provider} ${tier}`, `${spec.model} ${note}`.trim());
     }

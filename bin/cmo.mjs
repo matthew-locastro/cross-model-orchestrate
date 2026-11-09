@@ -4,7 +4,7 @@
 //
 //   cmo install                                # wire the skill into every host
 //   cmo doctor                                 # will this work on my machine?
-//   cmo limits --human                         # what's left, both providers
+//   cmo limits --human                         # what's left, every provider
 //   cmo plan --role judge --complexity 4 --length s
 //   cmo run  --role implement --complexity 3 --prompt-file p.md
 //   echo "do the thing" | cmo run --role mechanical --length xs
@@ -15,7 +15,7 @@
 import { readFile } from 'node:fs/promises';
 
 import { readLimits } from '../src/limits.mjs';
-import { decide, providerState, pressure } from '../src/policy.mjs';
+import { decide, isUsable, providerState, pressure, PROVIDERS } from '../src/policy.mjs';
 import { formatDuration, providerPressure } from '../src/pace.mjs';
 import { runAgent, DEFAULT_TIMEOUT_MS } from '../src/run.mjs';
 import { doctor } from '../src/doctor.mjs';
@@ -55,6 +55,8 @@ function taskFromArgs(args) {
     contextTokens: args['context-tokens'],
     needsSchema: Boolean(args.schema),
     needsRepoWrite: Boolean(args.write),
+    needsWeb: Boolean(args.web),
+    fullAccess: Boolean(args['full-access']),
     independentOf: args['independent-of'] || null,
     strictIndependence: Boolean(args['strict-independence']),
     pin: args.pin || null,
@@ -71,16 +73,23 @@ function bar(percent) {
 function renderLimits(limits, now = Date.now()) {
   const lines = [];
   const bandsNow = pressure();
-  for (const provider of ['codex', 'claude']) {
+  for (const provider of PROVIDERS) {
     const p = limits[provider];
-    const s = providerState(p, bandsNow, now);
+    if (!p) continue;
+    const s = providerState(p, bandsNow, now, provider);
     const pp = providerPressure(p, { now, exhausted: bandsNow.exhausted });
     const paced = new Map(pp.windows.map((w) => [w.key, w]));
     const headline = pp.paceAware && typeof s.percent === 'number'
       ? `pressure ${s.percent}%${s.window ? ` (${s.window})` : ''} `
       : '';
     const via = p.available && typeof p.source === 'string' && p.source.startsWith('claude -p') ? 'via the claude CLI ' : '';
-    lines.push(`${provider.padEnd(7)} ${s.state.padEnd(9)} ${headline}${p.plan ? `plan=${p.plan} ` : ''}${via}${p.available ? '' : `unavailable: ${p.error}`}`);
+    // For grok the sign-in is the headline: an unverified grok is not routable
+    // however much allowance it has, and the reason is the thing to fix.
+    const auth = provider === 'grok' && p.auth
+      ? (p.auth.ok ? `auth=${p.auth.authMode ?? p.auth.method} ` : `NOT ROUTABLE: ${p.auth.reason} `)
+      : '';
+    const why = p.available || (provider === 'grok' && p.auth && !p.auth.ok) ? '' : `unavailable: ${p.error}`;
+    lines.push(`${provider.padEnd(7)} ${s.state.padEnd(9)} ${headline}${p.plan ? `plan=${p.plan} ` : ''}${auth}${via}${why}`);
     for (const w of p.windows ?? []) {
       const reset = w.resetsAt ? ` resets ${w.resetsAt.replace('T', ' ').slice(0, 16)}Z` : '';
       lines.push(`        ${w.label.padEnd(6)} ${bar(w.percentUsed)}${reset}`);
@@ -108,7 +117,7 @@ function renderLimits(limits, now = Date.now()) {
   lines.push('');
   const bands = pressure();
   lines.push(`bands (on pressure — usage weighed against time to reset): tight ≥${bands.tight}%  critical ≥${bands.critical}%  exhausted ≥${bands.exhausted}%`);
-  const flight = (limits.inFlight?.codex ?? 0) + (limits.inFlight?.claude ?? 0);
+  const flight = PROVIDERS.reduce((n, p) => n + (limits.inFlight?.[p] ?? 0), 0);
   const scope = limits.fleet ? 'the fleet' : 'this machine';
   lines.push(flight === 0
     ? `no dispatches in flight across ${scope}`
@@ -152,7 +161,7 @@ setup
 dispatch
   audit       what was ACTUALLY dispatched — the receipt for a fan-out
   report      read the soak log back: reliability, balance, and what to change
-  limits      report remaining subscription headroom for codex and claude
+  limits      report remaining subscription headroom for codex, claude and grok
   plan        show which provider/model/effort a task would get, and why
   run         plan, then execute the subagent and print a JSON envelope
   selftest    offline checks of the decision table
@@ -186,14 +195,18 @@ task options (plan, run)
   --length          xs|s|m|l|xl                (default m)
   --context-tokens  rough input size the agent must read
   --write           the agent edits files in the working tree
-  --independent-of  codex|claude — prefer the OTHER vendor (adversarial review).
-                    If that vendor is spent it degrades to a fresh agent on the
-                    producer's own vendor and LABELS the verdict same-vendor,
-                    because a flagged review beats no review.
+  --web             the agent must open live URLs (research, link checks). Never
+                    routed to codex, whose sandbox has no network; grok first.
+  --independent-of  codex|claude|grok — run on a vendor OTHER than this one
+                    (adversarial review). If none of the others can run it
+                    degrades to a fresh agent on the producer's own vendor and
+                    LABELS the verdict same-vendor, because a flagged review
+                    beats no review.
   --strict-independence
                     never degrade: defer instead of reviewing on the producer's
                     vendor. For verdicts that must be cross-vendor or absent.
-  --pin             codex|claude — override provider selection
+  --pin             codex|claude|grok — override provider selection. Grok is
+                    still refused unless signed in to a subscription.
   --model           exact model id, bypassing the tier map
 
 run options
@@ -306,7 +319,13 @@ async function main() {
       const models = Object.entries(info.models).map(([m, n]) => `${m}x${n}`).join(' ');
       process.stdout.write(`  ${prov.padEnd(7)} ${String(info.count).padStart(3)}   ${models}\n`);
     }
-    if (sum.codexShare != null) process.stdout.write(`\ncodex share: ${sum.codexShare}%\n`);
+    if (sum.codexShare != null) {
+      process.stdout.write(`\nshare: ${PROVIDERS.map((p) => `${p} ${sum.shares?.[p] ?? 0}%`).join(' · ')}\n`);
+    }
+    if (sum.grokAuth) {
+      process.stdout.write(`grok billing: ${sum.grokAuth.oauth} verified subscription (oauth)`
+        + (sum.grokAuth.unverified ? `, ${sum.grokAuth.unverified} NOT verified — see cmo report` : '') + '\n');
+    }
     if (sum.failedOver) process.stdout.write(`failovers: ${sum.failedOver}\n`);
     const ind = sum.independence;
     if (ind['cross-vendor'] || ind['same-vendor']) {
@@ -351,7 +370,7 @@ async function main() {
 
     process.stdout.write(`${sum.total} dispatches · ${sum.failed} failed`
       + (sum.failedOver ? ` · ${sum.failedOver} failed over` : '')
-      + ` · codex share ${sum.codexShare}%\n\n`);
+      + ` · share ${PROVIDERS.map((p) => `${p} ${sum.shares?.[p] ?? 0}%`).join(' / ')}\n\n`);
     for (const [prov, info] of Object.entries(sum.byProvider)) {
       const models = Object.entries(info.models).map(([m, n]) => `${m}x${n}`).join('  ');
       process.stdout.write(`  ${prov.padEnd(7)} ${String(info.count).padStart(4)}   ${models}\n`);
@@ -387,9 +406,9 @@ async function main() {
     } else {
       process.stdout.write(`${JSON.stringify(limits, null, 2)}\n`);
     }
-    // Non-zero when neither provider has room, so a shell caller can branch.
-    const states = ['codex', 'claude'].map((p) => providerState(limits[p]).state);
-    return states.every((s) => s === 'exhausted') ? 3 : 0;
+    // Non-zero when no provider can take work, so a shell caller can branch.
+    const usable = PROVIDERS.some((p) => isUsable({ state: providerState(limits[p], pressure(), Date.now(), p).state }));
+    return usable ? 0 : 3;
   }
 
   if (command === 'plan') {
@@ -414,7 +433,9 @@ async function main() {
         + indep
         + `why: ${decision.reason}\n`
         + (decision.notes.length ? `notes:\n${decision.notes.map((n) => `  - ${n}`).join('\n')}\n` : '')
-        + (decision.fallback ? `fallback: ${decision.fallback.provider} ${decision.fallback.model}\n` : ''),
+        + (decision.fallbacks?.length
+          ? `fallback: ${decision.fallbacks.map((f) => `${f.provider} ${f.model}`).join(' → ')}\n`
+          : ''),
       );
       return 0;
     }

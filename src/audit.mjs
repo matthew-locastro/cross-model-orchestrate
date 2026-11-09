@@ -19,7 +19,7 @@ import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
-import { CACHE_DIR } from './config.mjs';
+import { CACHE_DIR, PROVIDERS } from './config.mjs';
 
 export const AUDIT_FILE = join(CACHE_DIR, 'dispatches.jsonl');
 
@@ -75,10 +75,17 @@ export function summarise(rows, { expected = null } = {}) {
   const byProvider = {};
   const byRole = {};
   const independence = { 'cross-vendor': 0, 'same-vendor': 0 };
+  // Grok receipts carry the auth source the session's own stream reported. A
+  // grok dispatch that does not say "oauth" was not proven subscription-billed.
+  const grokAuth = { oauth: 0, unverified: 0 };
   let failed = 0;
   let failedOver = 0;
 
   for (const r of rows) {
+    if (r.provider === 'grok' && r.ok !== false) {
+      if (r.auth === 'oauth') grokAuth.oauth += 1;
+      else grokAuth.unverified += 1;
+    }
     const p = (byProvider[r.provider] ??= { count: 0, models: {} });
     p.count += 1;
     p.models[r.model] = (p.models[r.model] ?? 0) + 1;
@@ -90,6 +97,7 @@ export function summarise(rows, { expected = null } = {}) {
 
   const total = rows.length;
   const codex = byProvider.codex?.count ?? 0;
+  const share = (n) => (total ? Math.round((n / total) * 100) : null);
   return {
     total,
     failed,
@@ -97,7 +105,9 @@ export function summarise(rows, { expected = null } = {}) {
     byProvider,
     byRole,
     independence,
-    codexShare: total ? Math.round((codex / total) * 100) : null,
+    codexShare: share(codex),
+    shares: Object.fromEntries(PROVIDERS.map((p) => [p, share(byProvider[p]?.count ?? 0)])),
+    ...(byProvider.grok ? { grokAuth } : {}),
     ...(expected != null
       ? { expected, undispatched: Math.max(0, expected - total) }
       : {}),
@@ -165,8 +175,22 @@ export function findings(rows, { perAgentCost = null, limits = null } = {}) {
   // the first day of a soak: an expired Claude OAuth token silently blinded the
   // Claude side, and the tool carried on dispatching as if the window were
   // unknown-and-usable.
-  for (const provider of ['codex', 'claude']) {
+  // Grok first: an unverified sign-in is not a dark meter, it is a vendor that
+  // cannot be used at all — and the fix is one command.
+  const grok = limits?.grok;
+  if (grok?.auth && grok.auth.ok === false && !/probe (is )?disabled|not probed/.test(grok.auth.reason ?? '')) {
+    out.push({
+      severity: 'medium',
+      finding: `grok is not routable: ${grok.auth.reason}`,
+      action: 'Run `grok login` (browser OAuth to the SuperGrok account). cmo never dispatches to grok on an '
+        + 'API key, so until then its allowance goes unused and its research work lands on claude.',
+    });
+  }
+
+  for (const provider of PROVIDERS) {
     const p = limits?.[provider];
+    // An unverified grok has no meter to read; that is the finding above.
+    if (provider === 'grok' && p?.auth?.ok === false) continue;
     if (p && p.available === false) {
       out.push({
         severity: 'high',
@@ -218,14 +242,29 @@ export function findings(rows, { perAgentCost = null, limits = null } = {}) {
     });
   }
 
+  // The orchestrator is a Claude session, so the question is how much of the
+  // fan-out went OFF claude — to codex or to grok — not how much went to codex.
   const codex = rows.filter((r) => r.provider === 'codex').length;
-  const share = pct(codex, total);
-  if (share < 50) {
+  const grokRows = rows.filter((r) => r.provider === 'grok');
+  const offClaude = pct(codex + grokRows.length, total);
+  if (offClaude < 50) {
     out.push({
       severity: 'high',
-      finding: `only ${share}% of dispatches went to codex`,
+      finding: `only ${offClaude}% of dispatches went off claude (codex ${pct(codex, total)}%, grok ${pct(grokRows.length, total)}%)`,
       action: 'The orchestrator is a Claude session and cannot move. Route more fan-out through codex-runner, '
         + 'or the run competes with the thing driving it.',
+    });
+  }
+
+  // Every completed grok dispatch should carry the stream's own word that it ran
+  // on the subscription. One that does not is the finding that matters most.
+  const unproven = grokRows.filter((r) => r.ok !== false && r.auth !== 'oauth').length;
+  if (unproven) {
+    out.push({
+      severity: 'high',
+      finding: `${unproven} grok dispatch(es) completed without the stream confirming subscription (oauth) billing`,
+      action: 'Check console.x.ai for API usage at those times, run `grok login`, and report it: cmo is built to make '
+        + 'this impossible, so a row here is a bug.',
     });
   }
 

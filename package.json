@@ -1,7 +1,7 @@
 {
   "name": "cross-model-orchestrate",
   "version": "0.1.25",
-  "description": "Run agent fan-outs across two AI subscriptions at once: pick each subagent's model by complexity, length and token efficiency against live usage limits, spend Codex before Claude, and always grade work on the vendor that did not produce it.",
+  "description": "Run agent fan-outs across your AI subscriptions at once (Claude, Codex and optionally Grok): pick each subagent's model by complexity, length and token efficiency against live usage limits, spend Codex before Claude, and always grade work on a vendor that did not produce it.",
   "type": "module",
   "bin": {
     "cmo": "bin/cmo.mjs",
@@ -28,6 +28,7 @@
     "claude",
     "claude-code",
     "codex",
+    "grok",
     "subagents",
     "multi-agent",
     "rate-limits",

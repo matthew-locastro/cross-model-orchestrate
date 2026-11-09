@@ -54,7 +54,15 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function acquire(now) {
+// The lock runs on the WALL clock, never the injected one. Its age is read off
+// the lock file's mtime, which the filesystem stamps in real time; measuring
+// that against a caller's simulated `now` (a test pinned to 2027, say) made
+// every contender see the lock as years stale and delete it, so concurrent
+// probes raced and lost each other's writes. It surfaced when a third provider
+// made three probes write at once. The injected clock is for the ledger's
+// contents — reservations, probe ages — not for timing a mutex.
+async function acquire() {
+  const now = Date.now;
   const deadline = now() + LOCK_WAIT_MS;
   for (;;) {
     try {
@@ -134,7 +142,7 @@ export function gcReservations(reservations, now) {
  * to a possible lost update, never to a stalled dispatch.
  */
 export async function mutate(fn, { now = Date.now } = {}) {
-  const locked = await acquire(now);
+  const locked = await acquire();
   try {
     const state = await readState();
     state.reservations = gcReservations(state.reservations, now());

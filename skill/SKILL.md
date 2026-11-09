@@ -2,13 +2,14 @@
 name: cross-model-orchestrate
 description: >
   Run a request as a dynamic workflow: a deterministic script that fans out to
-  disposable subagents, dispatching each one to Codex or Claude by a
+  disposable subagents, dispatching each one to Codex, Claude or Grok by a
   multi-factor analysis of complexity, task length and token efficiency against
-  live subscription headroom. Preferred vendor first, the other on failover, and
-  adversarial review always on the vendor that did not produce the work.
+  live subscription headroom. Preferred vendor first, the others on failover,
+  web research and link checks on Grok, and adversarial review always on a
+  vendor that did not produce the work.
 when_to_use: >
   Invoke when the user says orchestrate this, run a dynamic workflow, spin up
-  subagents, fan this out, or use both my subscriptions. This skill plans and
+  subagents, fan this out, or use all my subscriptions. This skill plans and
   executes the fan-out itself; it hands the work back when the work is a
   sequential queue rather than a fan.
 disable-model-invocation: false
@@ -64,8 +65,15 @@ cmo limits --refresh --human
 This costs next to nothing: Codex is read from local session logs, Claude from an
 OAuth usage endpoint that runs no inference — or, on macOS, where Claude Code
 keeps its credentials in the Keychain and there is no file to read, from one
-minimal haiku turn through the `claude` CLI. Report both numbers to the user in
-your first message, because they decide how big a run you are allowed to plan.
+minimal haiku turn through the `claude` CLI — and Grok from two account queries
+to the `grok` CLI's agent protocol, also no inference. Report every number to
+the user in your first message, because they decide how big a run you are
+allowed to plan.
+
+Grok's line also says whether it is **routable**. Grok runs only on a verified
+SuperGrok sign-in, never on an API key; if the line says `NOT ROUTABLE`, tell
+the user to run `grok login` themselves and plan the run without Grok. Never
+sign in for them, and never set or suggest `XAI_API_KEY`.
 
 **Those numbers are contended, and they lag.** Other orchestrators on other
 projects are draining the same two windows right now, and the vendor's figure
@@ -162,27 +170,58 @@ The four factors you are analysing, and what each one means:
 - **token efficiency** — `--context-tokens` for how much the agent must read.
   Bulk reading on an expensive model is the most common way a fan-out wastes a
   subscription.
+- **web** — `--web` (or `web: true` in a dispatch file) when the agent must open
+  live URLs: link checks, citations, "is this still true", vendor docs. Codex's
+  sandbox has no network at all, so web work is never routed there.
 
 The tool combines them into a tier (fast / balanced / frontier), maps that to a
 model and an effort level per vendor, and picks the vendor from live headroom:
-preferred vendor first, the other on failover, the emptier subscription when
-they are uneven, and a **defer** with a reset time when neither can finish the
-job. Its reasoning is in `notes` — put the ones that changed the outcome in your
+preferred vendor first, every other usable vendor on failover in rank order, the
+emptier subscription when they are uneven, and a **defer** with a reset time
+when none can finish the job. Its reasoning is in `notes` — put the ones that changed the outcome in your
 plan.
 
 Full rubric, bands and the reason behind each correction:
 `references/dispatch-policy.md`.
 
+### When Grok is the right vendor
+
+Grok (xAI's Grok Build CLI on the SuperGrok plan) is the third subscription. It
+runs unsandboxed on this machine with live web search and fetch, so it can open
+a URL and see what is actually there. Codex cannot: its sandbox has no DNS, and
+a Codex agent asked to verify links guesses them, in prose indistinguishable
+from having checked.
+
+Send these to Grok — the dispatcher already leans them there when Grok is
+signed in and not tight, so describe the task honestly rather than pinning:
+
+- **research** that reads the web: vendor docs, release notes, prices, "what
+  does the current API look like";
+- **link and fact verification**: every URL in a document resolves, every
+  citation says what it is cited for (`role: research`, `web: true`);
+- **cross-vendor review** of Codex or Claude work, as a third grader — it
+  spreads review load off the two windows the build itself is draining.
+
+Keep these off it: anything that must not touch the network or the wider
+filesystem (Grok, like Claude, is not sandboxed), and work whose output must be
+a schema-enforced object (Grok gets the schema as a prompt contract, as Claude
+does, not a hard constraint like Codex's).
+
+Grok's allowance is shared with the Grok apps (`isUnifiedBillingUser`), so the
+`cmo limits` figure is what the user sees in the app. Spend the window that
+resets soonest: the pace line already prices that in.
+
 ### Cross-model review is not optional
 
-An artifact is reviewed by a subagent on the **other vendor**. Pass
+An artifact is reviewed by a subagent on **another vendor** — with three, the
+dispatcher picks whichever of the other two has more room. Pass
 `--independent-of <the vendor that produced it>`. A grader that shares a model
 with the producer shares its blind spots: it has already decided that the thing
 in front of it is correct. This is the single largest quality lever in the
 pattern, and it is why the dispatcher exists rather than a hardcoded model name.
 
-If the required side is out of headroom, the dispatcher **degrades rather than
-refuses**: a fresh agent on the producer's own vendor still did not make the
+If no other vendor can run it — spent, not installed, or (Grok) not signed in —
+the dispatcher **degrades rather than refuses**: a fresh agent on the producer's own vendor still did not make the
 thing, which is the larger half of independence, and a good review beats no
 review. It is labelled `independence: same-vendor`, raised a tier (a grader
 sharing the producer's priors needs the headroom), and told about its own
@@ -222,8 +261,10 @@ files ships perfect assets into a page that ruins them.
 
 ### Spending the other subscription
 
-Workflow scripts have no shell, so a Codex subagent is reached through a shim.
-**Write each task to a file first, and give the shim only the path.**
+Workflow scripts have no shell, so a Codex or Grok subagent is reached through a
+shim — the `codex-runner` agent runs `cmo run --dispatch`, which goes wherever
+the decision says, Grok included. **Write each task to a file first, and give
+the shim only the path.**
 
 ```js
 // Before invoking Workflow, the orchestrator writes one file per unit:
@@ -267,13 +308,15 @@ one measured fan-out, 9.6k tokens went through the shim and 557k to plain
 
 So generation, research, implementation, mechanical passes, grading and
 synthesis all go through the shim unless they *cannot*. Keep a plain `agent()`
-only for work Codex has no access to:
+only for work neither Codex nor Grok can do:
 
 - MCP servers wired into this Claude session;
 - the harness's own browser, for looking at a rendered page;
 - an agent you intend to resume later with `SendMessage`.
 
 Ordinary file work is not on that list — Codex reads, writes and greps fine.
+Neither is web research: put `web: true` in the dispatch file and it goes to
+Grok, off the Claude window.
 
 The shim costs roughly 10–15k Haiku tokens per dispatch, mostly its own prompt.
 Trivial against a substantial agent, absurd against a trivial one: batch small
@@ -296,8 +339,11 @@ cmo audit --since 30 --expected <number of subagents you spawned> --human
 
 `undispatched` above zero means that many subagents lied. Treat their output as
 unverified: re-dispatch them, and say so in your report. Also read the two other
-lines it prints — `codex share` answers whether the run actually balanced, and
-the cross-vendor / same-vendor split tells you how many verdicts were degraded.
+lines it prints — the `share` line answers whether the run actually balanced,
+`grok billing` confirms every Grok dispatch ran on the subscription (its stream
+said `oauth`), and the cross-vendor / same-vendor split tells you how many
+verdicts were degraded. A Grok dispatch that is not verified is a bug: stop and
+tell the user.
 
 ### After a run, read the log back
 
@@ -323,7 +369,8 @@ orchestrator on this box are counted. Plan against the effective one — a run
 that looks affordable on the reported number and impossible on the effective one
 is competing with something else, so shrink it or wait.
 
-Codex readings refresh themselves for free after every Codex subagent,
+Codex readings refresh themselves for free after every Codex subagent, and
+Claude and Grok re-read theirs after a dispatch at most every ninety seconds,
 so this is nearly free.
 
 React to what you see — in pressure, which moves with the clock as well as
@@ -334,7 +381,7 @@ with spend, so a window can cross a band without a single new token:
   will cost — shrink the remaining stages or move them, and say which;
 - a provider crosses **critical** — the dispatcher downgrades its model
   automatically; note it in the run log so the drop in quality is not a mystery;
-- both **exhausted** — stop dispatching, report the earliest reset time, and
+- every provider **exhausted** — stop dispatching, report the earliest reset time, and
   tell the user the run resumes from cache. Do not spend the last of a window on
   agents that will die halfway.
 
@@ -349,13 +396,16 @@ not.
 - Do not pin a model by name because it feels right. Pin only when you can say
   what the dispatcher got wrong, and say it in the plan.
 - Never run a review on the vendor that produced the work.
+- Never send link or citation checking to Codex: it cannot reach the network.
+- Grok runs on the SuperGrok subscription or not at all. If `cmo` says Grok is
+  not routable, the fix is the user running `grok login`; never an API key.
 - Never start a fan-out you have not costed against the current headroom.
 
 ## Required output before you start work
 
 ```text
 CROSS_MODEL_ORCHESTRATE
-HEADROOM: codex <pressure>% (<binding window>, raw <n>%, resets in <t>) · claude <pressure>% (…)
+HEADROOM: codex <pressure>% (<binding window>, raw <n>%, resets in <t>) · claude <pressure>% (…) · grok <pressure>% (…) | grok not routable: <why>
 SHAPE: fan <N units × K attempts, judged by <vendor>> | queue → <what instead>
 DISPATCH: <role>→<provider>/<model>, … (one per distinct subagent kind)
 BARRIERS: <where, and why the whole set is needed there>

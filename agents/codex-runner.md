@@ -1,6 +1,6 @@
 ---
 name: codex-runner
-description: Executes one prepared dispatch file with `cmo run --dispatch <path>` and returns its result. The prompt gives it a PATH, never the task itself. Use as agentType from a dynamic workflow so work is billed to the Codex subscription rather than to Claude.
+description: Executes one prepared dispatch file with `cmo run --dispatch <path>` and returns its result. The prompt gives it a PATH, never the task itself. Use as agentType from a dynamic workflow so work is billed to the Codex or Grok subscription — wherever cmo routes it — rather than to Claude.
 tools: Bash
 model: haiku
 ---

@@ -22,9 +22,14 @@
 // Provider selection, in strict precedence:
 //
 //   1. pin              — caller forced it
-//   2. independentOf    — adversarial review MUST run on the other vendor
-//   3. headroom         — an exhausted provider is not a candidate
-//   4. preferred vendor — default codex, because the orchestrator is usually
+//   2. independentOf    — adversarial review MUST run on a vendor other than the
+//                         one that produced the artifact (any of the others)
+//   3. can it run       — not installed, not signed in to a subscription (grok),
+//                         exhausted, or unable to do the task (codex has no
+//                         network, so it cannot do web work): not a candidate
+//   4. affinity         — grok is preferred for research and web work, because
+//                         it can open and check URLs live
+//   5. preferred vendor — default codex, because the orchestrator is usually
 //                         itself a Claude session, so Claude's window is already
 //                         being spent by the run doing the dispatching
 //
@@ -40,12 +45,40 @@
 // after the tier is set (see `applyEfficiency`). Bulk reading is cheap work on
 // an expensive model, and that is the most common way a fan-out wastes quota.
 
-import { loadConfig, TIERS } from './config.mjs';
+import { loadConfig, PROVIDERS, TIERS } from './config.mjs';
 import { providerPressure } from './pace.mjs';
 
-export { TIERS };
+export { PROVIDERS, TIERS };
 
-export const BINARIES = { codex: 'codex', claude: 'claude' };
+export const BINARIES = { codex: 'codex', claude: 'claude', grok: 'grok' };
+
+/**
+ * What each vendor's agent can reach. Codex runs in a sandbox with no network —
+ * no DNS at all — so a Codex agent asked to check a link cannot, and guesses.
+ * Claude has WebFetch and WebSearch; grok has web search and fetch and runs
+ * unsandboxed on this machine.
+ */
+export const CAPABILITIES = {
+  codex: { web: false },
+  claude: { web: true },
+  grok: { web: true },
+};
+
+/**
+ * Vendors that must prove a subscription sign-in before they are routable.
+ * The grok CLI falls back to pay-per-token API billing when it is not signed
+ * in, so an unverified grok is treated exactly like an uninstalled one.
+ */
+export const REQUIRES_SUBSCRIPTION_CHECK = new Set(['grok']);
+
+const UNUSABLE = new Set(['exhausted', 'missing', 'unauthenticated']);
+
+/** Can a candidate run at all? */
+export function isUsable(candidate) {
+  return !UNUSABLE.has(candidate.state) && !candidate.incapable;
+}
+
+const isProvider = (value) => PROVIDERS.includes(value);
 
 export const ROLES = {
   mechanical: 0.05, // renames, formatting, fixture generation, file moves
@@ -64,11 +97,22 @@ export function pressure() {
   return loadConfig().pressure;
 }
 
-export function providerState(limits, bands = pressure(), now = Date.now()) {
+export function providerState(limits, bands = pressure(), now = Date.now(), id = limits?.provider ?? null) {
   // A CLI that is not installed cannot run anything, which is a stronger claim
   // than "its meter did not answer" and has to outrank the default preference.
   if (limits && limits.installed === false) {
     return { state: 'missing', percent: null, resetsAt: null };
+  }
+  // Fail closed on billing. A vendor that can silently bill an API key when its
+  // sign-in lapses is routable only on a verified subscription session — and an
+  // absent or unreadable reading is NOT verification.
+  if (REQUIRES_SUBSCRIPTION_CHECK.has(id) && limits?.auth?.ok !== true) {
+    return {
+      state: 'unauthenticated',
+      percent: null,
+      resetsAt: null,
+      reason: limits?.auth?.reason ?? `${id} has not been checked for a subscription sign-in`,
+    };
   }
   if (!limits || limits.available !== true) {
     // A dead probe must not stop the run. Unknown means usable.
@@ -154,10 +198,6 @@ export function applyEfficiency(tier, task) {
   return { tier: next, notes };
 }
 
-function otherProvider(id) {
-  return id === 'codex' ? 'claude' : 'codex';
-}
-
 function modelFor(providerId, tier, models = loadConfig().models) {
   const spec = models[providerId][tier];
   return {
@@ -171,19 +211,22 @@ function modelFor(providerId, tier, models = loadConfig().models) {
 }
 
 /**
- * Rank the two providers for this task. Returns candidates best-first, each with
+ * Rank every provider for this task. Returns candidates best-first, each with
  * the reason it landed where it did.
  */
-export function rankProviders(task, states, preference = loadConfig().preference) {
-  const ids = ['codex', 'claude'];
-  const scored = ids.map((id) => {
-    const s = states[id];
+export function rankProviders(task, states, preference = loadConfig().preference, affinity = loadConfig().affinity) {
+  const scored = PROVIDERS.map((id) => {
+    const s = states[id] ?? { state: 'unknown', percent: null, resetsAt: null };
     let score = 0;
     const why = [];
+    let incapable = false;
 
     if (s.state === 'missing') {
       score -= 1000;
       why.push(`${id} CLI is not installed`);
+    } else if (s.state === 'unauthenticated') {
+      score -= 1000;
+      why.push(`${id} is not verified as a subscription sign-in: ${s.reason}`);
     } else if (s.state === 'exhausted') {
       score -= 1000;
       why.push(`${id} exhausted (${describeHeadroom(s)})`);
@@ -198,6 +241,26 @@ export function rankProviders(task, states, preference = loadConfig().preference
       why.push(`${id} headroom unknown`);
     } else {
       why.push(`${id} healthy (${describeHeadroom(s)})`);
+    }
+
+    // Work that has to open live URLs cannot run where there is no network.
+    if (task.needsWeb && CAPABILITIES[id]?.web === false && !(id === 'codex' && task.fullAccess)) {
+      incapable = true;
+      score -= 1000;
+      why.push(`${id} has no network in its sandbox, so it cannot open or verify URLs`);
+    }
+
+    // What a vendor is better placed to do than the others. Applied only to a
+    // candidate that can run, so it reorders the usable field and never
+    // resurrects a spent or unverified one.
+    const aff = affinity?.[id];
+    if (aff && !incapable && !UNUSABLE.has(s.state)) {
+      const roleMatch = Array.isArray(aff.roles) && aff.roles.includes(task.role);
+      const webMatch = aff.web && task.needsWeb;
+      if (roleMatch || webMatch) {
+        score += Number(aff.points) || 0;
+        why.push(`${id} preferred for ${webMatch ? 'web work' : task.role}: it can search and fetch live URLs`);
+      }
     }
 
     // The configured tie-break vendor. Worth `weightPoints` percentage points
@@ -217,6 +280,7 @@ export function rankProviders(task, states, preference = loadConfig().preference
       provider: id,
       score,
       state: s.state,
+      ...(incapable ? { incapable: true } : {}),
       percent: s.percent,
       rawPercent: s.rawPercent ?? null,
       window: s.window ?? null,
@@ -237,10 +301,11 @@ export function rankProviders(task, states, preference = loadConfig().preference
  *   contextTokens   rough size of what the agent must read (default 0)
  *   needsSchema     the caller wants a validated object back
  *   needsRepoWrite  the agent edits files in the working tree
- *   independentOf   'codex'|'claude' — must NOT run on that vendor
- *   pin             'codex'|'claude' — caller overrides provider selection
+ *   needsWeb        the agent must open live URLs (research, link checks)
+ *   independentOf   'codex'|'claude'|'grok' — must NOT run on that vendor
+ *   pin             'codex'|'claude'|'grok' — caller overrides provider selection
  *   pinModel        exact model id, bypassing the tier map
- * @param {object} limits  { codex, claude } from limits.mjs
+ * @param {object} limits  { codex, claude, grok } from limits.mjs
  * @param {object} opts    { now } — epoch ms, so pace is testable; defaults to the clock
  */
 export function decide(task = {}, limits = {}, opts = {}) {
@@ -252,12 +317,13 @@ export function decide(task = {}, limits = {}, opts = {}) {
     contextTokens: Number.isFinite(Number(task.contextTokens)) ? Number(task.contextTokens) : 0,
     needsSchema: Boolean(task.needsSchema),
     needsRepoWrite: Boolean(task.needsRepoWrite),
-    independentOf: task.independentOf === 'codex' || task.independentOf === 'claude'
-      ? task.independentOf
-      : null,
+    needsWeb: Boolean(task.needsWeb),
+    // codex run with --full-access has a network, so it can do web work.
+    fullAccess: Boolean(task.fullAccess),
+    independentOf: isProvider(task.independentOf) ? task.independentOf : null,
     // Opt out of degrading: refuse rather than review on the producer's vendor.
     strictIndependence: Boolean(task.strictIndependence),
-    pin: task.pin === 'codex' || task.pin === 'claude' ? task.pin : null,
+    pin: isProvider(task.pin) ? task.pin : null,
     pinModel: typeof task.pinModel === 'string' && task.pinModel ? task.pinModel : null,
   };
 
@@ -275,10 +341,8 @@ export function decide(task = {}, limits = {}, opts = {}) {
   let tier = efficiency.tier;
   const notes = [...efficiency.notes];
 
-  const states = {
-    codex: providerState(limits.codex, pressure(), now),
-    claude: providerState(limits.claude, pressure(), now),
-  };
+  const bands = pressure();
+  const states = Object.fromEntries(PROVIDERS.map((id) => [id, providerState(limits[id], bands, now, id)]));
 
   let ranked = rankProviders(normalized, states);
 
@@ -299,35 +363,52 @@ export function decide(task = {}, limits = {}, opts = {}) {
   let degraded = false;
 
   if (normalized.independentOf && !normalized.pin) {
-    const required = otherProvider(normalized.independentOf);
-    const requiredState = states[required].state;
-    // "Not installed" is as impossible as "spent", and has to reach the same
-    // branch: otherwise a box with one CLI silently forces every review onto a
-    // vendor that cannot run, and the run defers instead of degrading.
-    const requiredUnusable = requiredState === 'exhausted' || requiredState === 'missing';
-    if (requiredUnusable && !normalized.strictIndependence) {
+    const producer = normalized.independentOf;
+    const others = ranked.filter((c) => c.provider !== producer);
+    // "Not installed", "not signed in" and "cannot do this task" are as
+    // impossible as "spent", and have to reach the same branch: otherwise a
+    // box with one CLI silently forces every review onto a vendor that cannot
+    // run, and the run defers instead of degrading.
+    const anyOtherUsable = others.some(isUsable);
+    if (!anyOtherUsable && !normalized.strictIndependence) {
       independence = 'same-vendor';
       degraded = true;
-      ranked = ranked.filter((c) => c.provider === normalized.independentOf);
+      ranked = ranked.filter((c) => c.provider === producer);
+      const why = others.map((c) => `${c.provider} ${c.state === 'missing' ? 'not installed'
+        : c.state === 'unauthenticated' ? 'not signed in'
+          : c.incapable ? 'cannot do this task' : 'exhausted'}`).join(', ');
       notes.push(
-        `DEGRADED REVIEW: ${required} is ${requiredState === 'missing' ? 'not installed' : 'exhausted'},`
-        + ` so this runs on ${normalized.independentOf} —`
+        `DEGRADED REVIEW: no other vendor can run (${why}),`
+        + ` so this runs on ${producer} —`
         + ' the same vendor that produced the artifact. Fresh context, shared blind spots.',
       );
     } else {
-      ranked = ranked.filter((c) => c.provider === required);
-      notes.push(`cross-model review: forced onto ${required} because the artifact came from ${normalized.independentOf}`);
+      ranked = others;
+      const usableOthers = others.filter(isUsable).map((c) => c.provider);
+      notes.push(`cross-model review: forced onto ${usableOthers.join(' or ') || others.map((c) => c.provider).join(' or ')}`
+        + ` because the artifact came from ${producer}`);
     }
   }
 
   if (normalized.pin) {
     ranked = ranked.filter((c) => c.provider === normalized.pin);
     notes.push(`provider pinned to ${normalized.pin} by the caller`);
+    // A review pinned onto the vendor that produced the artifact is not
+    // independent, whatever the caller wanted. Say so — or, strictly, refuse.
+    if (normalized.independentOf === normalized.pin) {
+      if (normalized.strictIndependence) ranked = [];
+      else {
+        independence = 'same-vendor';
+        degraded = true;
+        notes.push(`DEGRADED REVIEW: pinned to ${normalized.pin}, the vendor that produced the artifact`);
+      }
+    }
   }
 
   // A missing CLI is as unusable as a spent one — filtering only on
   // 'exhausted' let --strict-independence hand back a provider that cannot run.
-  const usable = ranked.filter((c) => c.state !== 'exhausted' && c.state !== 'missing');
+  // The same goes for an unverified grok and for codex on web work.
+  const usable = ranked.filter(isUsable);
 
   if (usable.length === 0) {
     const soonest = ranked
@@ -337,11 +418,16 @@ export function decide(task = {}, limits = {}, opts = {}) {
     return {
       ok: false,
       defer: true,
-      reason: normalized.independentOf
+      reason: normalized.pin
+        ? (normalized.independentOf === normalized.pin && normalized.strictIndependence
+          ? `the review is pinned to ${normalized.pin}, the producer, and --strict-independence forbids that`
+          : `the pinned provider ${normalized.pin} cannot run${normalized.needsWeb && normalized.pin === 'codex'
+            ? ' web work without --full-access' : ''}`)
+        : normalized.independentOf
         ? (normalized.strictIndependence
-          ? 'the only provider allowed for this cross-model review cannot run, and --strict-independence forbids degrading to the producer\'s vendor'
-          : 'both providers are out of headroom, so not even a degraded review can run')
-        : 'both providers are out of headroom',
+          ? 'no provider allowed for this cross-model review can run, and --strict-independence forbids degrading to the producer\'s vendor'
+          : 'no provider can run, so not even a degraded review can run')
+        : 'every provider is out of headroom or cannot run',
       ...(normalized.independentOf ? { independence: 'none' } : {}),
       resumeAfter: soonest,
       weight,
@@ -376,10 +462,11 @@ export function decide(task = {}, limits = {}, opts = {}) {
     notes.push(`model pinned to ${normalized.pinModel} by the caller`);
   }
 
-  // The failover target: same tier, other vendor. `run.mjs` uses this when the
-  // primary returns an explicit rate-limit error mid-run.
-  const fallbackCandidate = usable[1] ?? null;
-  const fallback = fallbackCandidate ? modelFor(fallbackCandidate.provider, tier) : null;
+  // The failover ladder: same tier, every other usable vendor in rank order.
+  // `run.mjs` walks it when the primary returns an explicit rate-limit error
+  // mid-run. `fallback` is its first rung, kept for callers that read one.
+  const fallbacks = usable.slice(1).map((c) => modelFor(c.provider, tier));
+  const fallback = fallbacks[0] ?? null;
 
   return {
     ok: true,
@@ -392,6 +479,7 @@ export function decide(task = {}, limits = {}, opts = {}) {
       chosen.why.join('; '),
     ].join(' | '),
     fallback,
+    fallbacks,
     factors: normalized,
     states,
     candidates: ranked,

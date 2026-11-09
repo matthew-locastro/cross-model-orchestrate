@@ -23,7 +23,7 @@ const FLAGS = new Set([
   'role', 'complexity', 'length', 'context-tokens', 'independent-of',
   'cwd', 'timeout', 'schema', 'pin', 'model', 'sandbox', 'attempts',
 ]);
-const BOOLEANS = new Set(['write', 'strict-independence', 'no-failover', 'full-access', 'refresh']);
+const BOOLEANS = new Set(['write', 'web', 'strict-independence', 'no-failover', 'full-access', 'refresh']);
 
 /**
  * Split a dispatch file into its parameters and its task text.

@@ -49,7 +49,14 @@
 //         local — `~/.claude/stats-cache.json` is historical counts only — so
 //         these are the only honest sources.
 //
-// Both are cached on disk with a TTL so hundreds of dispatch decisions share one
+// grok    One agent-protocol round trip to a short-lived `grok agent stdio`:
+//         `_x.ai/billing` (the account's weekly `creditUsagePercent` and when the
+//         period ends — the TUI's /usage "Usage limit" tab) and
+//         `_x.ai/auth/check_subscription` (is this a subscription sign-in at
+//         all). No session, no model call. See grok.mjs: the auth half is not a
+//         nicety, it is what keeps grok off pay-per-token API billing.
+//
+// All are cached on disk with a TTL so hundreds of dispatch decisions share one
 // probe.
 
 import { access, readFile, readdir, stat } from 'node:fs/promises';
@@ -57,6 +64,7 @@ import { constants } from 'node:fs';
 import { delimiter, join } from 'node:path';
 
 import { CACHE_DIR, loadConfig } from './config.mjs';
+import { GROK_METER_SOURCE, probeGrok } from './grok.mjs';
 import { applyCommitted, freshProbe, inFlight, mutate, snapshot } from './ledger.mjs';
 import { providerPressure } from './pace.mjs';
 
@@ -628,6 +636,65 @@ export async function readClaudeLimits({ credentialsPath, fetchImpl, refresh, cl
   return unavailable('claude', `${viaOAuth.error}; and through the CLI: ${viaCli?.error ?? 'no reading'}`);
 }
 
+// ── grok ──────────────────────────────────────────────────────────────────
+
+/**
+ * Grok's headroom and, with it, whether grok may be used at all.
+ *
+ * Every reading carries `auth` — the verdict of grok.mjs on whether the CLI is
+ * signed in to a subscription. Routing treats anything but `auth.ok` as a
+ * provider that cannot run, which is what keeps a lapsed sign-in from quietly
+ * falling through to API billing. The meter half fails soft like the others;
+ * the auth half fails closed.
+ */
+export async function readGrokLimits({ probe } = {}) {
+  const cfg = loadConfig();
+  if (!probe && cfg.grokProbe === false) {
+    return {
+      ...unavailable('grok', 'grok probe disabled (CMO_GROK_PROBE=0)'),
+      auth: { ok: false, method: 'unknown', reason: 'the grok probe is disabled, so its subscription sign-in is unverified' },
+    };
+  }
+  const ask = probe ?? (() => probeGrok(cfg.grokBinary));
+  try {
+    const { auth, billing, errors = [] } = await ask();
+    if (!billing) {
+      return {
+        ...unavailable('grok', errors.length ? `grok usage query failed: ${errors.join('; ')}` : 'grok reported no usage allowance'),
+        auth,
+        installed: true,
+      };
+    }
+    return {
+      ...summarize('grok', billing.windows, {
+        hardBlocked: billing.windows.some((w) => w.percentUsed >= 100),
+        plan: billing.plan,
+        source: GROK_METER_SOURCE,
+      }),
+      auth,
+      installed: true,
+      unifiedBilling: billing.unifiedBilling ?? null,
+      prepaidBalance: billing.prepaidBalance ?? null,
+    };
+  } catch (err) {
+    const missing = err?.code === 'ENOENT';
+    const message = missing ? 'grok is not on PATH' : (err instanceof Error ? err.message : String(err));
+    return {
+      ...unavailable('grok', message),
+      auth: { ok: false, method: 'unknown', reason: missing ? 'the grok CLI is not installed' : `could not ask the grok CLI: ${message}` },
+      ...(missing ? { installed: false } : {}),
+    };
+  }
+}
+
+/** Stand-in when a caller injected readers and did not mention grok: unverified, so unroutable. */
+async function grokNotProbed() {
+  return {
+    ...unavailable('grok', 'not probed'),
+    auth: { ok: false, method: 'unknown', reason: 'grok was not probed, so its subscription sign-in is unverified' },
+  };
+}
+
 // ── shared state ──────────────────────────────────────────────────────────
 //
 // The cache lives in ledger.mjs because it is not this process's cache — it is
@@ -650,8 +717,11 @@ export async function readLimits({ refresh = false, now = Date.now(), readers, i
   const nowFn = () => now;
   const readCodex = readers?.codex ?? readCodexLimits;
   const readClaude = readers?.claude ?? readClaudeLimits;
+  // Injected readers are a test deciding what the probes say; one that does not
+  // mention grok gets an unverified grok rather than a real CLI call.
+  const readGrok = readers?.grok ?? (readers ? grokNotProbed : readGrokLimits);
 
-  const [codexProbe, claudeProbe] = await Promise.all([
+  const [codexProbe, claudeProbe, grokProbe] = await Promise.all([
     freshProbe('codex', refresh ? -1 : cfg.freshness.codex, readCodex, { now: nowFn }),
     // A reading taken through the CLI cost a turn rather than a GET, so it is
     // reused for longer. Decided per entry: the same machine can hold either.
@@ -660,21 +730,35 @@ export async function readLimits({ refresh = false, now = Date.now(), readers, i
         ? Math.max(cfg.freshness.claude, cfg.freshness.claudeCli ?? 0)
         : cfg.freshness.claude
     ), readClaude, { now: nowFn }),
+    // A signed-out grok is re-asked sooner: `grok login` is the fix, and the
+    // first dispatch after it should not wait out a minute of stale "no".
+    freshProbe('grok', refresh ? -1 : (entry) => (
+      entry?.value?.auth?.ok ? cfg.freshness.grok : (cfg.freshness.grokSignedOut ?? cfg.freshness.grok)
+    ), readGrok, { now: nowFn }),
   ]);
 
   const state = await snapshot({ now: nowFn });
-  const codex = includeCommitted ? applyCommitted(codexProbe.value, state, 'codex') : codexProbe.value;
-  const claude = includeCommitted ? applyCommitted(claudeProbe.value, state, 'claude') : claudeProbe.value;
+  const committed = (probe, provider) => (
+    includeCommitted ? applyCommitted(probe.value, state, provider) : probe.value
+  );
+  const codex = committed(codexProbe, 'codex');
+  const claude = committed(claudeProbe, 'claude');
+  const grok = committed(grokProbe, 'grok');
 
   // Recorded on the reading itself so the routing decision can tell an absent
   // CLI from an unreadable meter. Injected readers (tests) are exempt: they are
   // deciding what the probe says, so PATH is not theirs to be judged by.
   if (!readers) {
-    const [codexInstalled, claudeInstalled] = await Promise.all([
+    const grokBinary = cfg.grokBinary ?? 'grok';
+    const [codexInstalled, claudeInstalled, grokInstalled] = await Promise.all([
       binaryOnPath('codex'), binaryOnPath('claude'),
+      grokBinary.includes('/')
+        ? access(grokBinary, constants.X_OK).then(() => true, () => false)
+        : binaryOnPath(grokBinary),
     ]);
     if (codex && typeof codex === 'object') codex.installed = codexInstalled;
     if (claude && typeof claude === 'object') claude.installed = claudeInstalled;
+    if (grok && typeof grok === 'object') grok.installed = grokInstalled;
   }
 
   // Pace-adjusted pressure, attached to the reading so a JSON consumer sees the
@@ -695,10 +779,12 @@ export async function readLimits({ refresh = false, now = Date.now(), readers, i
   return {
     codex: withPressure(codex),
     claude: withPressure(claude),
-    cached: { codex: codexProbe.cached, claude: claudeProbe.cached },
+    grok: withPressure(grok),
+    cached: { codex: codexProbe.cached, claude: claudeProbe.cached, grok: grokProbe.cached },
     inFlight: {
       codex: inFlight(state, 'codex'),
       claude: inFlight(state, 'claude'),
+      grok: inFlight(state, 'grok'),
     },
     // Whether these figures cover the whole fleet or only this machine, and
     // where the in-flight work actually is. The caller needs to know which,
@@ -757,6 +843,44 @@ export async function refreshClaudeLimits({ now = Date.now(), minAgeMs = 0 } = {
     st.probes.claude = { storedAt: now, value };
   }, { now: () => now });
   return value;
+}
+
+/**
+ * The grok twin of `refreshClaudeLimits`: re-ask the agent protocol after a
+ * dispatch, so grok can measure what one of its own agents costs. Throttled for
+ * the same reason, since it starts the CLI.
+ *
+ * Stores a reading that answered, and also one whose sign-in has stopped being
+ * a subscription — a lapse mid-run must stop the next grok dispatch, not the
+ * one after the cache expires.
+ */
+export async function refreshGrokLimits({ now = Date.now(), minAgeMs = 0, read = readGrokLimits } = {}) {
+  if (minAgeMs > 0) {
+    const state = await snapshot({ now: () => now });
+    const storedAt = state.probes?.grok?.storedAt;
+    if (typeof storedAt === 'number' && now - storedAt < minAgeMs) return null;
+  }
+  const value = await read();
+  if (value.available !== true && value.auth?.ok !== false) return null;
+  if (value.available !== true && /probe disabled|not probed/.test(value.auth?.reason ?? '')) return null;
+  await mutate((st) => {
+    st.probes.grok = { storedAt: now, value };
+  }, { now: () => now });
+  return value;
+}
+
+/**
+ * Record that grok must not be used: its session turned out not to be the
+ * subscription. Shared, so every orchestrator on the machine stops at once.
+ */
+export async function markGrokUnverified(reason, { now = Date.now() } = {}) {
+  await mutate((st) => {
+    const previous = st.probes.grok?.value ?? unavailable('grok', reason);
+    st.probes.grok = {
+      storedAt: now,
+      value: { ...previous, auth: { ok: false, method: 'api-key', reason } },
+    };
+  }, { now: () => now });
 }
 
 /**

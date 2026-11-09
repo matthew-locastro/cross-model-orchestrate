@@ -28,6 +28,12 @@ if (!process.env.CMO_CONFIG_DIR || process.env.CMO_CONFIG_DIR.includes('.config/
 // turn — slow, billed, and a different answer on every machine.
 process.env.CMO_CLAUDE_CLI_PROBE = '0';
 
+// And grok's. Its meter starts the real CLI, and its answer decides whether grok
+// is routable at all — a suite whose routing depends on whether this machine is
+// signed in to SuperGrok tests the machine, not the code. Disabled, grok reads
+// as unverified and unroutable unless a test injects a reading.
+process.env.CMO_GROK_PROBE = '0';
+
 // And any fleet settings inherited from the shell, for the same reason.
 delete process.env.CMO_FLEET_URL;
 delete process.env.CMO_FLEET_TOKEN;

@@ -49,8 +49,9 @@ via `--pin claude --model fable`, and only when you can say why.
 Strict precedence:
 
 1. **`--pin`** — you forced it.
-2. **`--independent-of <vendor>`** — cross-model review. The other vendor is
-   preferred. If it is out of headroom the call **degrades** to a fresh agent on
+2. **`--independent-of <vendor>`** — cross-model review. Only the other vendors
+   are candidates, ranked against each other as usual. If none of them can run
+   (spent, not installed, Grok not signed in) the call **degrades** to a fresh agent on
    the producer's vendor, marks the result `independence: same-vendor`, raises a
    tier, and warns the agent that it shares the producer's priors. That is
    strictly better than no review — a same-vendor independent grader rejected 38
@@ -58,10 +59,18 @@ Strict precedence:
    same-vendor verdict is weak; it is that an *unlabelled* one is
    indistinguishable from a real cross-vendor verdict. `--strict-independence`
    restores the refuse-instead behaviour.
-3. **Headroom** — a provider at ≥95% used, or flagged `rate_limit_reached`, is
-   not a candidate. Between usable providers, the one under less *pressure*
-   wins (see below): usage weighed against how long the remainder must last.
-4. **Preferred vendor first** — Codex by default. Deliberate load-balancing: the
+3. **Can it run** — a provider at ≥95% used, or flagged `rate_limit_reached`, is
+   not a candidate; nor is one whose CLI is missing; nor Grok unless its CLI
+   reports a subscription (OAuth) sign-in; nor Codex for `--web` work, because
+   its sandbox has no network. Between usable providers, the one under less
+   *pressure* wins (see below): usage weighed against how long the remainder
+   must last.
+4. **Affinity** — Grok gets 25 points for `research` and for `--web` work: it
+   searches and fetches live URLs. That beats the default Codex preference plus
+   a full headroom advantage, so a healthy Grok wins those roles, and a tight
+   one still loses them. Configurable as `affinity.grok` (`roles`, `web`,
+   `points`).
+5. **Preferred vendor first** — Codex by default. Deliberate load-balancing: the
    orchestrator is usually itself a Claude session, so Claude's window is already
    being consumed by the run doing the dispatching. The preference is worth
    `preference.weightPoints` (default 100) percentage points of headroom, so the
@@ -150,9 +159,16 @@ implement  · 3 · m  · --write                → codex gpt-5.6-terra
 judge      · 4 · s  · --independent-of codex → claude sonnet, medium
 architecture · 5 · l                         → codex gpt-5.6-sol
 judge      · 1 · xs                          → codex gpt-5.6-terra  (never fast)
-implement  · 3 · m  · codex at 99%           → claude sonnet, no fallback
-review     · 3 · s  · --independent-of codex, claude at 99% → DEFER
+implement  · 3 · m  · codex at 99%           → claude sonnet (grok fallback if signed in)
+research   · 2 · s  · grok signed in          → grok grok-4.7, low
+research   · 1 · xs · --web, grok signed out  → claude haiku   (never codex: no network)
+review     · 3 · s  · --independent-of codex  → grok or claude, whichever has more room
+review     · 3 · s  · --independent-of codex, claude at 99%, grok signed out → codex, DEGRADED
 ```
+
+Grok maps every tier to `grok-4.7` and varies only `--reasoning-effort`
+(low / medium / high). `grok-4.7-build-fast` is not a cheap tier — the CLI lists
+it as "2x the price" — so it is reachable only through `--model`.
 
 Print the whole table any time with `cmo selftest` — it uses your configured
 model IDs, so it doubles as a check that an override landed.
@@ -177,6 +193,25 @@ On macOS the credentials are in the Keychain and that file never exists, so the
 reader falls back to the CLI: one minimal `claude -p --output-format stream-json`
 turn, whose `rate_limit_event` carries the same two windows. About a thousand
 input tokens, reused for two minutes.
+
+**grok** — two JSON-RPC calls to a short-lived `grok agent --no-leader stdio`,
+the same account queries the TUI's `/usage` panel makes. No session, no model
+call:
+
+- `_x.ai/billing` → `creditUsagePercent` and `currentPeriod` (type
+  `USAGE_PERIOD_TYPE_WEEKLY`, start, end). One weekly window, resetting at the
+  period end. `isUnifiedBillingUser: true` means the allowance is shared with
+  the Grok apps.
+- `_x.ai/auth/check_subscription` → `authenticated`, `auth_mode` (`Oidc` for a
+  `grok login` session), `subscription_tier`. This is the billing gate: only an
+  OIDC/OAuth sign-in with a tier is routable. A signed-out reading is re-checked
+  every 15 seconds, a good one every 60.
+
+The probe and every grok dispatch run with `XAI_API_KEY` and
+`GROK_CODE_XAI_API_KEY` removed and `GROK_DISABLE_API_KEY_AUTH=1` set, so the
+CLI has no key to fall back to and would refuse one anyway. A dispatch's own
+stream then names its auth source (`apiKeySource`) on its first line; anything
+but `oauth` is killed there and marks Grok unroutable machine-wide.
 
 ### Contention
 

@@ -17,8 +17,12 @@
 //                A deterministic error is not retried; retrying it just burns
 //                quota N times before failing anyway.
 //   failover     An explicit rate-limit error switches vendor immediately
-//                rather than sleeping — that is the whole point of running two
-//                subscriptions.
+//                rather than sleeping — that is the whole point of running
+//                several subscriptions. The ladder walks every usable vendor.
+//   billing      Every child starts with the vendors' API keys removed, so a
+//                CLI that would fall back to pay-per-token billing has nothing
+//                to fall back to. Grok gets three more locks on top: see
+//                grok.mjs.
 //   harvest      Every `codex exec` writes a session rollout containing the
 //                current rate-limit snapshot, so limits.mjs reads fresh codex
 //                headroom off disk after every subagent — no extra probe, and
@@ -37,9 +41,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  markExhausted, recordCodexRateLimits, refreshClaudeLimits, refreshCodexLimits,
+  markExhausted, markGrokUnverified, readGrokLimits, recordCodexRateLimits, refreshClaudeLimits,
+  refreshCodexLimits, refreshGrokLimits,
 } from './limits.mjs';
-import { recordSample, releaseReservation, reserve, snapshot } from './ledger.mjs';
+import { loadConfig } from './config.mjs';
+import {
+  GROK_KEY_VARS, lockGrokEnv, offSubscriptionReason, parseGrokStream, startedOffSubscription,
+} from './grok.mjs';
+import { mutate, recordSample, releaseReservation, reserve, snapshot } from './ledger.mjs';
 import { newDispatchId, record } from './audit.mjs';
 import { identity } from './remote.mjs';
 
@@ -51,17 +60,21 @@ export const DEFAULT_TIMEOUT_MS = 20 * 60_000;
  * together would otherwise burst the usage endpoint into a 429.
  */
 const CLAUDE_SAMPLE_MIN_AGE_MS = 90_000;
+/** The same throttle for grok, whose meter starts the CLI. */
+const GROK_SAMPLE_MIN_AGE_MS = 90_000;
 const KILL_GRACE_MS = 5_000;
 const MAX_BACKOFF_MS = 60_000;
 
 // ── failure classification ────────────────────────────────────────────────
 
-const RATE_LIMIT_RE = /\b(rate[ _-]?limit|usage limit|quota exceeded|429|too many requests|out of (?:credits|usage)|limit reached)\b/i;
+// The grok CLI reports its limits as error codes: usage_limit_reached,
+// usage_pool_exhausted, rate_limited, global_rate_limit.
+const RATE_LIMIT_RE = /\b(rate[ _-]?limit(?:ed)?|usage[ _-]limit(?:[ _-]reached)?|usage[ _-]pool[ _-]exhausted|global[ _-]rate[ _-]limit|quota exceeded|429|too many requests|out of (?:credits|usage)|limit reached)\b/i;
 const STRUCTURED_SCHEMA_REJECTION_RE = /\b(?:invalid[ _-]?json[ _-]?schema|response_format|codex_output_schema)\b/i;
 // 5\d\d matched any number from 500 to 599 — line numbers, byte counts, pixel
 // values, durations. Name the statuses that actually mean "retry" instead.
 const TRANSIENT_RE = /\b(ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|network error|stream (?:closed|error)|5(?:00|02|03|04|29)\b|overloaded|temporarily unavailable|service unavailable)\b/i;
-const AUTH_RE = /\b(unauthori[sz]ed|401|403|invalid[ _-]?api[ _-]?key|not logged in|please (?:run )?(?:codex )?login|token (?:has )?expired|re-?authenticate)\b/i;
+const AUTH_RE = /\b(unauthori[sz]ed|401|403|invalid[ _-]?api[ _-]?key|not logged in|not signed in|please (?:run )?(?:codex )?login|token (?:has )?expired|re-?authenticate)\b/i;
 
 /**
  * Decide what a failed attempt was. The classification drives everything: a
@@ -153,10 +166,34 @@ export function buildCommand(decision, opts) {
     cwd,
     lastMessageFile,
     schemaFile = null,
+    promptFile = null,
     fullAccess = false,
     sandbox = 'workspace-write',
     allowedTools = null,
+    grokBinary = null,
   } = opts;
+
+  if (decision.provider === 'grok') {
+    // The prompt travels in a file: grok's headless mode takes it from
+    // --prompt-file or argv, never stdin, and argv has a length limit.
+    //
+    // streaming-messages-json, not json, because its first line names how the
+    // session authenticated (`apiKeySource`) — the dispatcher kills anything
+    // that is not the subscription on that line. It is also why a schema is a
+    // prompt contract here, as for claude: --json-schema forces plain json and
+    // would lose that line.
+    const args = [
+      '--prompt-file', promptFile,
+      '--output-format', 'streaming-messages-json',
+      '--model', decision.model,
+    ];
+    if (decision.effort) args.push('--reasoning-effort', decision.effort);
+    if (cwd) args.push('--cwd', cwd);
+    // Headless: nobody is there to approve a tool call. Same posture as claude.
+    args.push('--permission-mode', 'bypassPermissions');
+    args.push('--no-auto-update');
+    return { binary: grokBinary ?? loadConfig().grokBinary ?? 'grok', args };
+  }
 
   if (decision.provider === 'codex') {
     const args = [
@@ -198,13 +235,16 @@ export function buildCommand(decision, opts) {
 /**
  * Child env. Stripping the API keys is deliberate: with a key present the CLI
  * bills the API account instead of consuming the subscription this whole
- * dispatcher exists to balance.
+ * dispatcher exists to balance. Every child gets the grok lock too, so a grok
+ * started anywhere beneath a dispatch — by an agent's own shell — cannot fall
+ * back to a key either.
  */
 export function childEnv(base = process.env) {
-  const env = { ...base };
+  const env = lockGrokEnv(base);
   delete env.ANTHROPIC_API_KEY;
   delete env.CLAUDE_API_KEY;
   delete env.OPENAI_API_KEY;
+  for (const name of GROK_KEY_VARS) delete env[name];
   env.CI = env.CI ?? '1'; // suppress spinners/TTY affordances
   return env;
 }
@@ -254,7 +294,7 @@ async function shutdown(sig) {
 
 // ── process execution ─────────────────────────────────────────────────────
 
-function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env }) {
+function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env, abortIf = null }) {
   return new Promise((resolve) => {
     let child;
     try {
@@ -274,6 +314,7 @@ function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env }) {
     let stderr = '';
     let timedOut = false;
     let settled = false;
+    let aborted = null;
 
     const killTimer = setTimeout(() => {
       timedOut = true;
@@ -283,7 +324,19 @@ function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env }) {
       }, KILL_GRACE_MS).unref?.();
     }, timeoutMs);
 
-    child.stdout.on('data', (d) => { stdout += d; });
+    child.stdout.on('data', (d) => {
+      stdout += d;
+      // A caller-supplied tripwire on the live stream — grok's "this session
+      // is not the subscription" — stops the child on the line that shows it.
+      if (abortIf && !aborted) {
+        const reason = abortIf(stdout);
+        if (reason) {
+          aborted = reason;
+          child.kill('SIGTERM');
+          setTimeout(() => { if (!settled) child.kill('SIGKILL'); }, KILL_GRACE_MS).unref?.();
+        }
+      }
+    });
     child.stderr.on('data', (d) => { stderr += d; });
 
     child.on('error', (err) => {
@@ -291,7 +344,7 @@ function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env }) {
       settled = true;
       liveChildren.delete(child);
       clearTimeout(killTimer);
-      resolve({ code: null, signal: null, timedOut, stdout, stderr: `${stderr}\n${err.message}` });
+      resolve({ code: null, signal: null, timedOut, aborted, stdout, stderr: `${stderr}\n${err.message}` });
     });
 
     child.on('close', (code, signal) => {
@@ -299,7 +352,7 @@ function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env }) {
       settled = true;
       liveChildren.delete(child);
       clearTimeout(killTimer);
-      resolve({ code, signal, timedOut, stdout, stderr });
+      resolve({ code, signal, timedOut, aborted, stdout, stderr });
     });
 
     // Close stdin immediately after the prompt. An agent that then asks for
@@ -615,6 +668,40 @@ async function percentFor(provider) {
   }
 }
 
+// ── grok ──────────────────────────────────────────────────────────────────
+
+/**
+ * The grok auth verdict at spawn time: the shared reading if it is fresh, a new
+ * probe if not. Both come from the CLI's own subscription check (grok.mjs).
+ */
+async function currentGrokAuth({ maxAgeMs = 60_000 } = {}) {
+  // This machine's own verdict only — never a fleet reading, since the sign-in
+  // is a file on this disk — reused while under a minute old, else re-asked.
+  const local = await snapshot({ local: true }).catch(() => null);
+  const entry = local?.probes?.grok;
+  if (entry && Date.now() - entry.storedAt < maxAgeMs && entry.value?.auth?.ok === true) {
+    return entry.value.auth;
+  }
+  const value = await readGrokLimits();
+  if (value.available === true || value.auth?.ok === false) {
+    await mutate((st) => { st.probes.grok = { storedAt: Date.now(), value }; }).catch(() => {});
+  }
+  return value.auth ?? { ok: false, reason: 'no grok reading' };
+}
+
+/**
+ * Judge only the stream's first complete line — the init line — so a long run
+ * is not re-scanned on every chunk.
+ */
+function grokTripwire() {
+  let decided = false;
+  return (stdout) => {
+    if (decided || stdout.indexOf('\n') === -1) return null;
+    decided = true;
+    return offSubscriptionReason(stdout);
+  };
+}
+
 // ── the runner ────────────────────────────────────────────────────────────
 
 /**
@@ -624,7 +711,8 @@ async function percentFor(provider) {
  * @param {string} prompt
  * @param {object} opts
  *   cwd, timeoutMs, maxAttempts, schema, failover, fullAccess, sandbox,
- *   allowedTools, sleep (injectable for tests), spawnImpl (injectable)
+ *   allowedTools, sleep (injectable for tests), spawnImpl (injectable),
+ *   grokGate (injectable: resolves the current grok auth verdict)
  * @returns {Promise<object>} the result envelope
  */
 export async function runAgent(decision, prompt, opts = {}) {
@@ -640,6 +728,7 @@ export async function runAgent(decision, prompt, opts = {}) {
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
     spawnImpl = spawnWithTimeout,
     now = () => Date.now(),
+    grokGate = currentGrokAuth,
   } = opts;
 
   wireSignals();
@@ -683,23 +772,48 @@ export async function runAgent(decision, prompt, opts = {}) {
   ].join('\n') : '';
 
   const fullPrompt = `${prompt}${handicap}${schema ? `\n${schemaContract(schema)}` : ''}`;
+  // Grok reads its prompt from a file, never stdin.
+  const promptFile = join(workdir, 'prompt.md');
+  await writeFile(promptFile, fullPrompt, 'utf8');
 
-  // The dispatch ladder: primary first, then the other vendor if the policy
-  // gave us one. This is "codex first, claude when codex is unavailable".
-  const ladder = [decision, ...(failover && decision.fallback ? [decision.fallback] : [])];
+  // The dispatch ladder: primary first, then every other usable vendor the
+  // policy ranked, in order. `fallback` alone is the shape older callers built.
+  const rungs = Array.isArray(decision.fallbacks)
+    ? decision.fallbacks
+    : (decision.fallback ? [decision.fallback] : []);
+  const ladder = [decision, ...(failover ? rungs : [])];
 
   let lastError = null;
 
   try {
     for (let rung = 0; rung < ladder.length; rung += 1) {
       const target = ladder[rung];
+
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        // Grok is dispatched only on a session verified as the subscription,
+        // verified HERE, on this machine, before every attempt — not when the
+        // plan was made. A decision can be minutes old, built from a cached or
+        // fleet reading, or handed in by a caller; none of those proves THIS
+        // machine's sign-in now.
+        if (target.provider === 'grok') {
+          const grokAuth = await grokGate().catch((err) => ({ ok: false, reason: err?.message ?? String(err) }));
+          if (!grokAuth?.ok) {
+            lastError = `grok refused: ${grokAuth?.reason ?? 'subscription sign-in not verified'}`;
+            attempts.push({
+              provider: 'grok', model: target.model, attempt: attempt + 1, exitCode: null, timedOut: false,
+              failure: 'not-subscription', stderr: lastError,
+            });
+            break; // next vendor; nothing was spawned, nothing was billed
+          }
+        }
+
         // Never let a previous attempt's final message be read as this one's.
         await rm(lastMessageFile, { force: true }).catch(() => {});
 
         const { binary, args } = buildCommand(target, {
           cwd,
           lastMessageFile,
+          promptFile,
           schemaFile: target.provider === 'codex' ? codexSchemaFile : null,
           fullAccess,
           sandbox,
@@ -724,9 +838,11 @@ export async function runAgent(decision, prompt, opts = {}) {
             binary,
             args,
             cwd,
-            prompt: fullPrompt,
+            // Grok has its prompt in a file; its stdin gets EOF at once.
+            prompt: target.provider === 'grok' ? '' : fullPrompt,
             timeoutMs,
             env: childEnv(),
+            ...(target.provider === 'grok' ? { abortIf: grokTripwire() } : {}),
           });
         } finally {
           if (ticket) {
@@ -738,6 +854,8 @@ export async function runAgent(decision, prompt, opts = {}) {
         let text = '';
         let usage = null;
         let schemaRejected = false;
+        let offSubscription = null;
+        let authSource = null;
         // The endpoint's own error message, kept apart from the transport's.
         // classifyFailure subtracts it before pattern-matching, because it
         // quotes the caller's schema back and that is user input, not a signal.
@@ -771,6 +889,39 @@ export async function runAgent(decision, prompt, opts = {}) {
           } catch {
             text = '';
           }
+        } else if (target.provider === 'grok') {
+          const stream = parseGrokStream(result.stdout);
+          authSource = stream.apiKeySource;
+          usage = stream.usage;
+          // Success needs positive evidence: an answer from a stream that did
+          // not say "oauth" — a key, or no auth line at all because the format
+          // changed — is not returned. Fail closed.
+          const unconfirmed = Boolean(stream.text) && stream.apiKeySource !== 'oauth';
+          if (result.aborted || startedOffSubscription(stream) || unconfirmed) {
+            // The session ran on something other than the subscription. Its
+            // output is discarded — returning it would hide the breach — and
+            // grok is marked unusable for every orchestrator on the machine.
+            offSubscription = result.aborted
+              ?? (stream.apiKeySource
+                ? `grok session authenticated with "${stream.apiKeySource}", not the subscription`
+                : 'grok stream did not confirm subscription (oauth) auth');
+            await markGrokUnverified(offSubscription).catch(() => {});
+          } else {
+            text = stream.text;
+          }
+          // Unlike codex's error event, grok's `errors` are the CLI's own words
+          // (usage_limit_reached, "Not signed in") rather than quoted user
+          // input, so they are scanned, not subtracted: they are the signal.
+          if (stream.error) {
+            result = {
+              ...result,
+              stderr: [result.stderr?.trim(), stream.error].filter(Boolean).join('\n'),
+            };
+          }
+          const after = await refreshGrokLimits({ minAgeMs: GROK_SAMPLE_MIN_AGE_MS }).catch(() => null);
+          if (after?.available && typeof before === 'number' && typeof after.worstPercent === 'number') {
+            await recordSample('grok', after.worstPercent - before).catch(() => {});
+          }
         } else {
           const parsed = parseClaudeStdout(result.stdout);
           text = parsed.text;
@@ -788,12 +939,14 @@ export async function runAgent(decision, prompt, opts = {}) {
           }
         }
 
-        const failure = classifyFailure({
-          ...result,
-          hasOutput: text.length > 0,
-          schemaRejected,
-          structuredError,
-        });
+        const failure = offSubscription
+          ? 'not-subscription'
+          : classifyFailure({
+            ...result,
+            hasOutput: text.length > 0,
+            schemaRejected,
+            structuredError,
+          });
         const succeeded = failure === 'none' && text.length > 0;
 
         attempts.push({
@@ -840,6 +993,9 @@ export async function runAgent(decision, prompt, opts = {}) {
               in: totalInputTokens(usage),
               out: usage.output_tokens ?? usage.outputTokens ?? null,
             } : null,
+            // How the session authenticated, as the vendor's own stream said.
+            // For grok this is the per-dispatch proof of subscription billing.
+            ...(target.provider === 'grok' ? { auth: authSource ?? 'unknown' } : {}),
             node: who.node, project: who.project,
           }).catch(() => {});
 
@@ -870,13 +1026,17 @@ export async function runAgent(decision, prompt, opts = {}) {
         const providerError = result.stderr.slice(-2_000) || `exit ${result.code}`;
         lastError = failure === 'schema-rejection'
           ? `schema rejected: ${providerError}`
-          : providerError;
+          : failure === 'not-subscription'
+            ? `grok refused: ${offSubscription}`
+            : providerError;
 
         if (failure === 'rate-limit') {
           // Do not sleep out a rate limit when the other vendor is idle.
           await markExhausted(target.provider).catch(() => {});
           break;
         }
+        // Never retried, never repeated: the next vendor, or a loud failure.
+        if (failure === 'not-subscription') break;
         // Codex alone enforces the on-disk schema dialect. A rejection is
         // deterministic for this rung, but Claude can still honor the caller's
         // original prompt contract, so advance to the next provider.

@@ -1,6 +1,6 @@
 # cross-model-orchestrate
 
-**Run agent fan-outs across two AI subscriptions at once.**
+**Run agent fan-outs across two AI subscriptions at once — three, with Grok.**
 
 If you pay for both Claude and ChatGPT/Codex, you have two rate-limit windows and
 one agent using one of them. `cmo` spends both: it picks each subagent's model
@@ -70,6 +70,45 @@ claude --model opus --effort high
 
 Zero dependencies. Plain Node ESM, no build step, no API keys — it drives the
 `codex` and `claude` CLIs you logged into above.
+
+## Optional: Grok as a third vendor
+
+If you also pay for **SuperGrok**, `cmo` can dispatch to xAI's Grok Build CLI.
+It earns its place with one thing the other two don't do well from a fan-out:
+it runs on your machine with **live web search and fetch**, so it can open a URL
+and look. Codex's sandbox has no network (no DNS), and a Codex agent asked to
+check links guesses them in prose that reads exactly like having checked.
+
+```bash
+curl -fsSL https://x.ai/cli/install.sh | bash   # xAI's installer
+grok login                                       # browser OAuth to your SuperGrok account
+cmo doctor                                       # "grok sign-in  ok  Oidc (OAuth) on SuperGrok …"
+```
+
+**Subscription only, never API spend.** The grok CLI falls back to pay-per-token
+billing through `XAI_API_KEY` whenever it isn't signed in. `cmo` closes that
+path four ways:
+
+1. every child process starts with `XAI_API_KEY` and `GROK_CODE_XAI_API_KEY`
+   removed and `GROK_DISABLE_API_KEY_AUTH=1` set, so the CLI has no key to fall
+   back to and refuses one anyway (checked: with a key present and the lock set,
+   a headless run fails "Not signed in" rather than using it);
+2. before routing, `cmo` asks the CLI's own agent protocol whether the session
+   is an OAuth sign-in on a subscription tier — no sign-in, no grok;
+3. every dispatch's stream names its auth source on its first line, and a
+   session that isn't `oauth` is killed on that line and grok is marked
+   unroutable for every orchestrator on the machine;
+4. every grok receipt records that source, and `cmo audit` / `cmo report`
+   flag any grok dispatch not proven to be subscription-billed.
+
+`cmo` never reads, stores or sets a key, and never reads `~/.grok/auth.json`.
+
+What goes to Grok: `research`-role work and anything dispatched with `--web`
+(`web: true` in a dispatch file) lean to it while its window is healthy, and it
+joins the pool of cross-vendor reviewers. Everything else still follows the
+headroom rules, so Grok also takes ordinary work once Codex is spent. Its
+weekly allowance is shared with the Grok apps, so `cmo limits` shows the same
+number the app does.
 
 ---
 
@@ -144,8 +183,8 @@ weight < 0.30 → fast       weight < 0.62 → balanced       else → frontier
 Vendor, in strict precedence:
 
 1. `--pin` — you forced it.
-2. `--independent-of <vendor>` — cross-model review. The *other* vendor is
-   preferred; if it's out of headroom the call **degrades** to a fresh agent on
+2. `--independent-of <vendor>` — cross-model review. Only the *other* vendors are
+   candidates; if none of them can run the call **degrades** to a fresh agent on
    the producer's vendor, labels the verdict `same-vendor`, raises a tier, and
    tells the agent it shares the producer's blind spots. A same-vendor
    independent grader is still worth having — one rejected 38 of 57 candidates
@@ -204,27 +243,42 @@ model ID your account doesn't actually have.
 {
   "models": {
     "codex":  { "frontier": "gpt-5.6-sol", "balanced": "gpt-5.6-terra", "fast": "gpt-5.6-luna" },
-    "claude": { "frontier": "opus", "balanced": "sonnet", "fast": "haiku" }
+    "claude": { "frontier": "opus", "balanced": "sonnet", "fast": "haiku" },
+    "grok":   { "frontier": { "model": "grok-4.7", "effort": "high" },
+                "balanced": { "model": "grok-4.7", "effort": "medium" },
+                "fast":     { "model": "grok-4.7", "effort": "low" } }
   },
   "preference": { "first": "codex", "weightPoints": 100 },
+  "affinity": { "grok": { "roles": ["research"], "web": true, "points": 25 } },
   "pressure": { "tight": 65, "critical": 85, "exhausted": 95 }
 }
 ```
 
-Or per-tier via the environment: `CMO_CODEX_FRONTIER`, `CMO_CLAUDE_BALANCED`, …,
+Or per-tier via the environment: `CMO_CODEX_FRONTIER`, `CMO_CLAUDE_BALANCED`,
+`CMO_GROK_FAST`, …; `CMO_GROK_BIN` names the grok binary if it is neither on
+`PATH` nor in `~/.grok/bin`; `CMO_GROK_PROBE=0` stops the grok meter (and with it,
+grok routing);
 and `CMO_PREFER=claude` to flip the tie-break. Flip it if you drive this from a
 shell script or cron rather than from a Claude session — the Codex-first default
 exists because the orchestrator is usually itself burning Claude quota.
 
 Claude Fable is deliberately outside the tier map (Anthropic documents it as
 substantially more consumption-intensive than Sonnet); reach it with
-`--pin claude --model fable`.
+`--pin claude --model fable`. Likewise `grok-4.7-build-fast`, which the grok CLI
+lists as "2x the price": `--pin grok --model grok-4.7-build-fast`.
 
 ---
 
 ## Where the numbers come from
 
-Neither probe costs a token.
+None of the probes costs a model turn, except Claude's on macOS (below).
+
+**Grok** — two JSON-RPC calls to a short-lived `grok agent --no-leader stdio`,
+the account queries behind the TUI's `/usage` panel: `_x.ai/billing` returns the
+weekly `creditUsagePercent` and the period's end, and
+`_x.ai/auth/check_subscription` says whether the session is an OAuth sign-in on
+a subscription tier. About three seconds, reused for a minute (fifteen seconds
+while signed out, so `grok login` takes effect quickly).
 
 **Codex** — local only. Every `codex exec` writes a session rollout under
 `~/.codex/sessions/YYYY/MM/DD/` recording the current rolling-window snapshot, so
