@@ -4,9 +4,10 @@ description: >
   Run a request as a dynamic workflow: a deterministic script that fans out to
   disposable subagents, dispatching each one to Codex, Claude or Grok by a
   multi-factor analysis of complexity, task length and token efficiency against
-  live subscription headroom. Preferred vendor first, the others on failover,
-  web research and link checks on Grok, and adversarial review always on a
-  vendor that did not produce the work.
+  live subscription headroom. Power-uses whichever subscription is least used,
+  keeps Claude's window in reserve for the orchestrator, leans research and
+  web checks toward Grok, fails over to the next usable vendor, and always
+  reviews on a vendor that did not produce the work.
 when_to_use: >
   Invoke when the user says orchestrate this, run a dynamic workflow, spin up
   subagents, fan this out, or use all my subscriptions. This skill plans and
@@ -37,7 +38,8 @@ Every invocation runs the same four steps in order. Do not skip step 0.
 
 The **dispatcher** is provider-agnostic: `cmo` is a plain CLI, so any agent with
 a shell gets the full cross-provider behaviour — headroom check, model
-selection, preferred-vendor-first with failover, cross-model review.
+selection, least-used power-use with the orchestrator held in reserve,
+failover, cross-model review.
 
 The **orchestration** is Claude Code-native, deliberately. `pipeline()`,
 `parallel()`, the `(prompt, options)` resume cache and the `agentType` registry
@@ -175,11 +177,16 @@ The four factors you are analysing, and what each one means:
   sandbox has no network at all, so web work is never routed there.
 
 The tool combines them into a tier (fast / balanced / frontier), maps that to a
-model and an effort level per vendor, and picks the vendor from live headroom:
-preferred vendor first, every other usable vendor on failover in rank order, the
-emptier subscription when they are uneven, and a **defer** with a reset time
-when none can finish the job. Its reasoning is in `notes` — put the ones that changed the outcome in your
-plan.
+model and an effort level per vendor, and picks the vendor from live headroom.
+Least-used wins: headroom is the dominant score, and a subscription whose
+pressure sits 20 points or more below every other competing subscription gets
+a power-use bonus. Claude, the vendor driving the run, loses 30 points on
+every dispatch and, at 60% pressure or above, is a candidate only when nothing
+else can run. Research and web work still lean to a healthy Grok. A near-tie
+breaks to Codex. Every other usable vendor is the failover ladder, in that
+rank order, and a **defer** with a reset time comes back when none can finish
+the job. The power-use and reserve reasons are in `notes` — put the ones that
+changed the outcome in your plan.
 
 Full rubric, bands and the reason behind each correction:
 `references/dispatch-policy.md`.
@@ -193,7 +200,9 @@ a Codex agent asked to verify links guesses them, in prose indistinguishable
 from having checked.
 
 Send these to Grok — the dispatcher already leans them there when Grok is
-signed in and not tight, so describe the task honestly rather than pinning:
+signed in and healthy, so describe the task honestly rather than pinning.
+Ordinary implementation follows least-used instead: if Codex or Claude is the
+differentially idle subscription, it takes that work even when Grok is fine.
 
 - **research** that reads the web: vendor docs, release notes, prices, "what
   does the current API look like";
@@ -300,15 +309,17 @@ task cannot answer it. Give it the path.
 
 **Dispatch through the shim by default. A plain `agent()` needs a reason.**
 
-Claude's window is the scarce one: the orchestrator is a Claude session spending
-it continuously for the whole run, and it is the only thing that cannot be
-moved. Every subagent left on Claude competes with the thing driving the run. On
-one measured fan-out, 9.6k tokens went through the shim and 557k to plain
-`agent()` calls; Codex ended at 10% consumed and Claude at 96%.
+Claude's window is reserved for the orchestrator. The dispatcher already
+enforces that: Claude loses score on every dispatch, and once its pressure
+reaches 60% it is used only when Codex and Grok cannot run. A plain `agent()`
+bypasses the dispatcher and spends that window anyway. On one measured
+fan-out, 9.6k tokens went through the shim and 557k to plain `agent()` calls;
+Codex ended at 10% consumed and Claude at 96%.
 
 So generation, research, implementation, mechanical passes, grading and
-synthesis all go through the shim unless they *cannot*. Keep a plain `agent()`
-only for work neither Codex nor Grok can do:
+synthesis all go through the shim unless they *cannot*. The shim runs `cmo`,
+which power-uses whichever of Codex, Claude and Grok is least used. Keep a
+plain `agent()` only for work none of those CLIs can do:
 
 - MCP servers wired into this Claude session;
 - the harness's own browser, for looking at a rendered page;

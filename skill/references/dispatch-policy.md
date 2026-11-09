@@ -62,21 +62,38 @@ Strict precedence:
 3. **Can it run** — a provider at ≥95% used, or flagged `rate_limit_reached`, is
    not a candidate; nor is one whose CLI is missing; nor Grok unless its CLI
    reports a subscription (OAuth) sign-in; nor Codex for `--web` work, because
-   its sandbox has no network. Between usable providers, the one under less
-   *pressure* wins (see below): usage weighed against how long the remainder
-   must last.
-4. **Affinity** — Grok gets 25 points for `research` and for `--web` work: it
-   searches and fetches live URLs. That beats the default Codex preference plus
-   a full headroom advantage, so a healthy Grok wins those roles, and a tight
-   one still loses them. Configurable as `affinity.grok` (`roles`, `web`,
-   `points`).
-5. **Preferred vendor first** — Codex by default. Deliberate load-balancing: the
-   orchestrator is usually itself a Claude session, so Claude's window is already
-   being consumed by the run doing the dispatching. The preference is worth
-   `preference.weightPoints` (default 100) percentage points of headroom, so the
-   other side only wins when it is meaningfully emptier. Flip it with
-   `CMO_PREFER=claude` or `preference.first` in the config file — worth doing if
-   you drive this from a shell script or cron rather than from a Claude session.
+   its sandbox has no network.
+4. **Least-used wins.** Among providers that can run, pressure (below) is the
+   dominant score:
+
+   ```text
+   headroom = headroomWeight × (100 − pressure) / 100     default weight 40
+   ```
+
+   A provider whose pressure is at least `powerGap` points (default 20) below
+   every other provider that is actually competing gets `powerBonus` (default
+   25). The reason names the gap, for example
+   `power-use: grok is 61 points less used than codex`. State penalties still
+   apply on top: tight −15, critical −40.
+5. **Orchestrator reserve.** `orchestrator.vendor` (default `claude`) is the
+   vendor driving the run, so every dispatch costs it `penalty` points
+   (default 30). At or above `reserveAt` pressure (default 60) it is placed
+   below every usable alternative — still above anyone who cannot run — and
+   the reason says
+   `claude reserved for the orchestrator (pressure 62% ≥ 60%)`. It is not a
+   power-use competitor in that state. It is still chosen when nothing else
+   can run, including a cross-vendor review only it can serve. Set `vendor`
+   to `null` when a cron job or a shell script is the driver and no Claude
+   session needs the window kept.
+6. **Affinity** — Grok gets 25 points for `research` and for `--web` work: it
+   searches and fetches live URLs. That wins those roles while Grok is healthy
+   and no other subscription is differentially idle (a power-use gap, or a
+   tight window of Grok's own, still takes the work away). Configurable as
+   `affinity.grok` (`roles`, `web`, `points`).
+7. **Tie-break** — `preference.first`, Codex by default, worth
+   `preference.weightPoints / 10` score points (default 2.5). It decides a
+   near-tie and nothing wider. `CMO_PREFER=claude` flips which side of the tie
+   wins. It does not protect Claude's window; the reserve does.
 
 ### Pressure: usage weighed against time to reset
 
@@ -109,14 +126,16 @@ knowing:
 
 - **A weekly squeeze outranks a 5-hour blip.** Raw percentages called "codex 80%
   weekly, five days left" and "claude 70% of five hours, twenty minutes left"
-  the same thing — tight — and kept the default vendor. Pressure sends the work
-  to Claude and stretches Codex's week.
+  the same thing. Pressure sends the work to Claude and stretches Codex's week.
 - **Pace alone never exhausts a provider.** The cap at 94 keeps a rationed
   window in the candidate list on a cheaper tier, because budget that exists
   can still be spent on what only that vendor can do — a cross-vendor review.
   Only a raw reading ≥95%, or an explicit rate-limit error, removes it.
 - **Budget about to expire is room.** Unused weekly budget hours before its
-  reset is the cheapest quota there is; pressure falls so it gets spent.
+  reset is the cheapest quota there is; pressure falls, so the least-used
+  score treats it as room. A subscription that is still differentially idle
+  keeps the work — power-use is computed on this pressure, not on the raw
+  percentage.
 
 Pace is computed at decision time from the window's reset time, never cached. A
 window whose reset time is missing, already in the past (a stale reading), or
@@ -133,7 +152,7 @@ Bands of pressure, as defined above.
 | band | pressure | effect |
 | --- | --- | --- |
 | ok | <65% | normal |
-| tight | ≥65% | deprioritised; the other provider wins ties |
+| tight | ≥65% | deprioritised by 15 points, on top of the headroom term |
 | critical | ≥85% | model downgraded one tier to stretch the window |
 | exhausted | ≥95% or hard-blocked | not a candidate at all |
 | unknown | probe failed | treated as usable — a broken meter never stops a run |
@@ -153,16 +172,22 @@ Applied after the weighted tier. Each one appears in the decision's `notes`.
 ## Worked examples
 
 ```
-mechanical · 1 · xs                          → codex gpt-5.6-luna
-research   · 2 · l  · 180k context           → codex gpt-5.6-terra
-implement  · 3 · m  · --write                → codex gpt-5.6-terra
-judge      · 4 · s  · --independent-of codex → claude sonnet, medium
+mechanical · 1 · xs                          → codex gpt-5.6-luna     (even headroom: tie-break)
+research   · 2 · l  · 180k context           → codex gpt-5.6-terra    (grok not signed in)
+implement  · 3 · m  · --write                → codex gpt-5.6-terra    (even headroom: tie-break)
+implement  · grok 6% · codex 67% · claude 60% → grok, power-use; claude reserved
+implement  · codex 10% · grok 50% · claude 30% → codex, power-use
+implement  · codex 40% · grok 45% · claude 5%  → claude (the gap beats the penalty)
+implement  · codex 40% · grok 45% · claude 70% → codex, never claude
+implement  · codex and grok exhausted, claude 72% → claude, last resort
+judge      · 4 · s  · --independent-of codex → claude sonnet, medium  (grok not signed in)
 architecture · 5 · l                         → codex gpt-5.6-sol
 judge      · 1 · xs                          → codex gpt-5.6-terra  (never fast)
 implement  · 3 · m  · codex at 99%           → claude sonnet (grok fallback if signed in)
-research   · 2 · s  · grok signed in          → grok grok-4.7, low
+research   · 2 · s  · grok signed in, windows level → grok grok-4.7, low
+research   · grok healthy, codex 15%, claude 20%, grok 25% → grok, on affinity
 research   · 1 · xs · --web, grok signed out  → claude haiku   (never codex: no network)
-review     · 3 · s  · --independent-of codex  → grok or claude, whichever has more room
+review     · 3 · s  · --independent-of codex, grok healthy, claude ≥60% → grok, never claude
 review     · 3 · s  · --independent-of codex, claude at 99%, grok signed out → codex, DEGRADED
 ```
 

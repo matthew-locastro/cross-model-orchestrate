@@ -56,8 +56,9 @@ const results = await pipeline(
 
 Note that **every** stage here goes through the shim, including the generators.
 That is the default, not a flourish: a workflow that reaches for a plain
-`agent()` out of habit spends Claude on work Codex could have done, and the
-orchestrator needs that window for itself. Slot A can be in the
+`agent()` out of habit spends Claude on work the dispatcher would have
+power-used onto whichever subscription is least used, and the orchestrator
+needs that window for itself. Slot A can be in the
 judge stage while slot B is still generating; a stall costs one slot, not the
 run.
 

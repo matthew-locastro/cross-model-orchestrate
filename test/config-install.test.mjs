@@ -44,6 +44,11 @@ test('a missing config file is not an error — the defaults are usable', () => 
     assert.deepEqual(config.models, DEFAULT_MODELS);
     assert.equal(config.configFileFound, false);
     assert.equal(config.preference.first, 'codex');
+    assert.equal(config.preference.weightPoints, 25);
+    assert.equal(config.routing.headroomWeight, 40);
+    assert.equal(config.routing.powerGap, 20);
+    assert.equal(config.routing.powerBonus, 25);
+    assert.deepEqual(config.orchestrator, { vendor: 'claude', penalty: 30, reserveAt: 60 });
   });
 });
 
@@ -70,6 +75,22 @@ test('a malformed config file is loud, not silently ignored', () => {
     resetConfigCache();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('routing and orchestrator settings merge over the defaults', () => {
+  withConfig((config) => {
+    assert.equal(config.orchestrator.vendor, null);
+    assert.equal(config.orchestrator.penalty, 10);
+    assert.equal(config.orchestrator.reserveAt, 60);
+    assert.equal(config.routing.powerGap, 15);
+    assert.equal(config.routing.headroomWeight, 40);
+    assert.equal(config.routing.powerBonus, 25);
+    assert.equal(config.preference.first, 'codex');
+    assert.equal(config.preference.weightPoints, 25);
+  }, {
+    orchestrator: { vendor: null, penalty: 10 },
+    routing: { powerGap: 15 },
+  });
 });
 
 test('custom bands and a flipped vendor preference actually change dispatch', () => {

@@ -280,7 +280,8 @@ test('research and web work lean to a signed-in grok', () => {
   const limits = { codex: healthy(0), claude: healthy(0), grok: grokReading() };
   assert.equal(decide({ role: 'research', complexity: 2, length: 's' }, limits).provider, 'grok');
   assert.equal(decide({ role: 'implement', complexity: 3, length: 'm', needsWeb: true }, limits).provider, 'grok');
-  // Not for ordinary implementation: codex's window resets soonest and is preferred.
+  // Not for ordinary implementation when the windows are level: the tie breaks
+  // to codex, and claude is held back for the orchestrator.
   assert.equal(decide({ role: 'implement', complexity: 3, length: 'm' }, limits).provider, 'codex');
 });
 

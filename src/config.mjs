@@ -97,15 +97,42 @@ export const DEFAULT_PRESSURE = {
 };
 
 export const DEFAULT_PREFERENCE = {
-  // Which vendor wins a tie. The default is codex because the orchestrator is
-  // itself usually a Claude session, so Claude's window is already being spent
-  // by the run doing the dispatching. Set to "claude" if that is not true for
-  // you — for example if you drive this from a shell script or cron.
+  // Tie-break only. Least-used headroom decides a dispatch; this picks a
+  // winner when two usable providers are within a few points of each other.
+  // Worth `weightPoints / 10` score points (default 2.5) — enough to settle a
+  // near-tie, not enough to outweigh a real difference in pressure. The
+  // default vendor is codex. Set `first`, or `CMO_PREFER`, to take the other
+  // side of a tie. Claude's window is protected by `orchestrator`, not by this.
   first: 'codex',
-  // How much the preference is worth, in percentage points of headroom. At 100
-  // the preferred vendor only loses once it is fully consumed relative to the
-  // other; at 0 the emptier subscription always wins.
-  weightPoints: 100,
+  weightPoints: 25,
+};
+
+/**
+ * How subscription pressure turns into score.
+ *
+ * Headroom is the dominant term: `headroomWeight` points at 0% pressure,
+ * scaled linearly down to 0 at 100%. A power-use bonus lands on the one
+ * usable provider whose pressure sits at least `powerGap` points below every
+ * other provider that is actually competing for the dispatch.
+ */
+export const DEFAULT_ROUTING = {
+  headroomWeight: 40,
+  powerGap: 20,
+  powerBonus: 25,
+};
+
+/**
+ * The vendor driving the run. Spare it: every dispatch costs it `penalty`
+ * points, and once its pressure reaches `reserveAt` it is a candidate only
+ * when nothing else can run.
+ *
+ * `vendor: null` turns the reserve off — the right setting when a shell
+ * script or cron drives cmo and no Claude session is spending the window.
+ */
+export const DEFAULT_ORCHESTRATOR = {
+  vendor: 'claude',
+  penalty: 30,
+  reserveAt: 60,
 };
 
 /**
@@ -115,9 +142,9 @@ export const DEFAULT_PREFERENCE = {
  * can open a URL and see what is there. Codex's sandbox has no network at all
  * (no DNS), so a Codex agent asked to verify links guesses them instead — which
  * reads exactly like having checked. Research and link verification therefore
- * lean to Grok. 25 points outweighs the default codex preference (10) plus a
- * full headroom advantage (10), so a healthy Grok wins those roles outright, and
- * still loses them once its own window is tight.
+ * lean to Grok. 25 points wins those roles while Grok is healthy and no other
+ * subscription is differentially idle; a tight window, or a power-use gap on
+ * someone else, still takes the work away.
  */
 export const DEFAULT_AFFINITY = {
   grok: { roles: ['research'], web: true, points: 25 },
@@ -203,6 +230,11 @@ export function loadConfig({ file = CONFIG_FILE, reload = false } = {}) {
       ...DEFAULT_PREFERENCE,
       ...(fromFile.preference ?? {}),
       ...(process.env.CMO_PREFER ? { first: process.env.CMO_PREFER } : {}),
+    },
+    routing: { ...DEFAULT_ROUTING, ...(fromFile.routing ?? {}) },
+    orchestrator: {
+      ...DEFAULT_ORCHESTRATOR,
+      ...(fromFile.orchestrator ?? {}),
     },
     /**
      * Fleet coordination. Set `url` + `token` and every box points at one

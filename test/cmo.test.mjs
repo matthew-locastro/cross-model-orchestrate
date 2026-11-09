@@ -171,8 +171,8 @@ test('claude takes over once codex is exhausted', () => {
 });
 
 test('the emptier subscription wins when both are usable but uneven', () => {
-  // codex's +10 default preference is worth 100 percentage points of headroom,
-  // so it only loses once it is meaningfully more consumed than claude.
+  // Headroom dominates. A critical codex loses to a nearly empty claude even
+  // after claude pays the orchestrator penalty.
   const d = decide({ role: 'implement', complexity: 3, length: 'm' }, { codex: healthy(90), claude: healthy(5) });
   assert.equal(d.provider, 'claude');
 });

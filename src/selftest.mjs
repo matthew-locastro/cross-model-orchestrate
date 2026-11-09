@@ -12,6 +12,10 @@ import { parseClaudeAuthFailure } from './limits.mjs';
 import { grokAuthFrom, offSubscriptionReason, parseGrokModels } from './grok.mjs';
 
 const HEALTHY = { available: true, worstPercent: 5, nextResetAt: null, hardBlocked: false, windows: [{ key: '5h', percentUsed: 5 }] };
+const atPercent = (percent) => ({
+  available: true, worstPercent: percent, nextResetAt: null, hardBlocked: false,
+  windows: [{ key: '5h', percentUsed: percent }],
+});
 const TIGHT = { available: true, worstPercent: 72, nextResetAt: null, hardBlocked: false, windows: [{ key: '5h', percentUsed: 72 }] };
 const SPENT = { available: true, worstPercent: 99, nextResetAt: '2026-08-22T00:00:00.000Z', hardBlocked: true, windows: [{ key: '5h', percentUsed: 99 }] };
 
@@ -26,6 +30,7 @@ const paced = (windows) => {
 };
 // Grok is routable only with a verified subscription sign-in on the reading.
 const SUBSCRIBED = { ok: true, method: 'oauth', authMode: 'Oidc', tier: 'SuperGrok Plus' };
+const grokAt = (percent) => ({ ...atPercent(percent), provider: 'grok', auth: SUBSCRIBED });
 const GROK_OK = { ...paced([weekly(9, 108 * HOUR)]), provider: 'grok', auth: SUBSCRIBED };
 const GROK_SIGNED_OUT = { available: false, provider: 'grok', windows: [], auth: { ok: false, method: 'none', reason: 'not signed in' } };
 const GROK_ON_KEY = { ...GROK_OK, auth: { ok: false, method: 'api-key', reason: 'XAI_API_KEY' } };
@@ -64,10 +69,10 @@ const CASES = [
     expect: (d) => d.provider === 'claude' && d.states.codex.state === 'critical' && d.states.claude.state === 'ok',
   },
   {
-    name: 'weekly budget about to expire is spent, not hoarded',
+    name: 'expiring weekly budget stays usable, and a far emptier side is power-used',
     task: { role: 'implement', complexity: 3, length: 'm' },
     limits: { codex: WEEK_EXPIRING, claude: HEALTHY },
-    expect: (d) => d.provider === 'codex' && d.states.codex.state === 'ok',
+    expect: (d) => d.states.codex.state === 'ok' && d.provider === 'claude' && /power-use:/.test(d.reason),
   },
   {
     name: 'a pace-critical provider still serves the cross-vendor review only it can do',
@@ -124,7 +129,7 @@ const CASES = [
     expect: (d) => d.provider === 'claude' && !d.fallbacks.some((f) => f.provider === 'codex'),
   },
   {
-    name: 'implementation still spends codex first',
+    name: 'even headroom tie-breaks to codex and keeps claude in reserve',
     task: { role: 'implement', complexity: 3, length: 'm' },
     limits: { codex: HEALTHY, claude: HEALTHY, grok: GROK_OK },
     expect: (d) => d.provider === 'codex' && d.fallbacks.length === 2,
@@ -153,6 +158,56 @@ const CASES = [
     task: { role: 'synthesis', complexity: 3, length: 'xl', contextTokens: 250_000 },
     limits: { codex: HEALTHY, claude: HEALTHY },
     expect: (d) => d.tier === 'balanced',
+  },
+  {
+    name: 'power-use: grok at 6% beats codex at 67%, claude at 60% stays reserved',
+    task: { role: 'implement', complexity: 4, length: 'l' },
+    limits: { codex: atPercent(67), claude: atPercent(60), grok: grokAt(6) },
+    expect: (d) => d.provider === 'grok'
+      && /power-use: grok is 61 points less used than codex/.test(d.reason)
+      && d.notes.some((n) => n === 'claude reserved for the orchestrator (pressure 60% ≥ 60%)'),
+  },
+  {
+    name: 'power-use: codex at 10% beats grok at 50% and claude at 30%',
+    task: { role: 'implement', complexity: 3, length: 'm' },
+    limits: { codex: atPercent(10), claude: atPercent(30), grok: grokAt(50) },
+    expect: (d) => d.provider === 'codex'
+      && /power-use: codex is 20 points less used than claude/.test(d.reason),
+  },
+  {
+    name: 'claude wins when its differential beats the orchestrator penalty',
+    task: { role: 'implement', complexity: 3, length: 'm' },
+    limits: { codex: atPercent(40), claude: atPercent(5), grok: grokAt(45) },
+    expect: (d) => d.provider === 'claude'
+      && /power-use: claude is 35 points less used than codex/.test(d.reason)
+      && /claude loses 30 to keep orchestrator headroom/.test(d.reason),
+  },
+  {
+    name: 'claude above reserveAt is never chosen while anyone else can run',
+    task: { role: 'implement', complexity: 3, length: 'm' },
+    limits: { codex: atPercent(40), claude: atPercent(70), grok: grokAt(45) },
+    expect: (d) => d.provider === 'codex'
+      && d.notes.some((n) => /claude reserved for the orchestrator \(pressure 70% ≥ 60%\)/.test(n)),
+  },
+  {
+    name: 'claude above reserveAt still runs when every other vendor is exhausted',
+    task: { role: 'implement', complexity: 3, length: 'm' },
+    limits: { codex: SPENT, claude: atPercent(72), grok: { ...grokAt(99), hardBlocked: true } },
+    expect: (d) => d.provider === 'claude'
+      && /used because nothing else can run/.test(d.reason),
+  },
+  {
+    name: 'a review independent of codex goes to grok, not a reserved claude',
+    task: { role: 'review', complexity: 3, length: 's', independentOf: 'codex' },
+    limits: { codex: atPercent(20), claude: atPercent(75), grok: grokAt(12) },
+    expect: (d) => d.provider === 'grok' && d.independence === 'cross-vendor'
+      && !d.fallbacks.some((f) => f.provider === 'codex'),
+  },
+  {
+    name: 'research still goes to a healthy grok on affinity',
+    task: { role: 'research', complexity: 2, length: 's' },
+    limits: { codex: atPercent(15), claude: atPercent(20), grok: grokAt(25) },
+    expect: (d) => d.provider === 'grok' && /preferred for research/.test(d.reason),
   },
 ];
 

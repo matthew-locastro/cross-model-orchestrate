@@ -19,7 +19,7 @@
 // plan or Claude account exposes a different model list, so anything hardcoded
 // here would be wrong on somebody else's machine.
 //
-// Provider selection, in strict precedence:
+// Provider selection:
 //
 //   1. pin              — caller forced it
 //   2. independentOf    — adversarial review MUST run on a vendor other than the
@@ -27,11 +27,16 @@
 //   3. can it run       — not installed, not signed in to a subscription (grok),
 //                         exhausted, or unable to do the task (codex has no
 //                         network, so it cannot do web work): not a candidate
-//   4. affinity         — grok is preferred for research and web work, because
+//   4. least-used       — headroom is the dominant score. A provider whose
+//                         pressure sits `powerGap` points below every other
+//                         provider that is actually competing gets a power-use
+//                         bonus, so a differentially idle subscription is spent
+//   5. orchestrator     — the vendor driving the run loses `penalty` points on
+//                         every dispatch, and at or above `reserveAt` pressure
+//                         it ranks below every usable alternative
+//   6. affinity         — grok is preferred for research and web work, because
 //                         it can open and check URLs live
-//   5. preferred vendor — default codex, because the orchestrator is usually
-//                         itself a Claude session, so Claude's window is already
-//                         being spent by the run doing the dispatching
+//   7. tie-break        — `preference` settles a near-tie and nothing wider
 //
 // "Headroom" is pace-aware. A provider is judged on the PRESSURE of its most
 // binding window — the raw percentage adjusted for how long the remainder has
@@ -221,11 +226,47 @@ function modelFor(providerId, tier, models = loadConfig().models) {
   };
 }
 
+/** "61" or "42.8" — integer gaps stay integers. */
+function formatPoints(n) {
+  const rounded = Math.round(n * 10) / 10;
+  return String(rounded);
+}
+
 /**
  * Rank every provider for this task. Returns candidates best-first, each with
  * the reason it landed where it did.
+ *
+ * Score, for a provider that can run:
+ *
+ *   headroomWeight × (100 − pressure) / 100     default weight 40
+ *   − state penalty                             tight 15, critical 40
+ *   − orchestrator penalty                      default 30, on that vendor only
+ *   + powerBonus                                default 25, when its pressure is
+ *                                               ≥ powerGap (default 20) below
+ *                                               every other competing provider
+ *   + affinity                                  research and web, on grok
+ *   + preference.weightPoints / 10              tie-break, default 2.5
+ *
+ * `pressure` is the pace-adjusted percent already on the state. A provider
+ * that cannot run sits at −1000, under everyone.
+ *
+ * The orchestrator's vendor, once its pressure reaches `reserveAt`, is placed
+ * one point below the lowest usable alternative — still above anyone who
+ * cannot run — so it is chosen only when nothing else can take the dispatch.
+ * It is not a power-use peer in that state: it is not competing, and the
+ * bonus is about the gap to the subscriptions that are.
  */
 export function rankProviders(task, states, preference = loadConfig().preference, affinity = loadConfig().affinity) {
+  const routing = loadConfig().routing;
+  const orchestrator = loadConfig().orchestrator;
+  const headroomWeight = Number(routing.headroomWeight) || 0;
+  const powerGap = Number(routing.powerGap);
+  const powerBonus = Number(routing.powerBonus) || 0;
+  const reserveVendor = orchestrator?.vendor || null;
+  const reservePenalty = Number(orchestrator?.penalty) || 0;
+  const reserveAt = Number(orchestrator?.reserveAt);
+  const tieBreak = Number(preference?.weightPoints) > 0 ? Number(preference.weightPoints) / 10 : 0;
+
   const scored = PROVIDERS.map((id) => {
     const s = states[id] ?? { state: 'unknown', percent: null, resetsAt: null };
     let score = 0;
@@ -274,18 +315,23 @@ export function rankProviders(task, states, preference = loadConfig().preference
       }
     }
 
-    // The configured tie-break vendor. Worth `weightPoints` percentage points
-    // of headroom, so the preferred side only loses once it is meaningfully
-    // more consumed than the other.
-    if (id === preference.first) {
-      score += preference.weightPoints / 10;
-      why.push(`${id} preferred by default so the fan-out does not compete with the orchestrator`);
+    // Near-ties only. A couple of points, not a reason to drain the fuller window.
+    if (id === preference.first && tieBreak) {
+      score += tieBreak;
+      why.push(`${id} tie-break preference (+${tieBreak})`);
     }
 
-    // Prefer whichever provider genuinely has more room when both are usable.
-    // `percent` is pace-adjusted, so budget that expires soon counts as room
-    // and budget that must last days does not.
-    if (typeof s.percent === 'number') score += (100 - s.percent) / 10;
+    // Dominant term. `percent` is pace-adjusted, so budget that expires soon
+    // counts as room and budget that must last days does not.
+    if (typeof s.percent === 'number' && headroomWeight) {
+      score += headroomWeight * (100 - s.percent) / 100;
+    }
+
+    // Spare the vendor that is already spending its window on the run itself.
+    if (reserveVendor && id === reserveVendor && reservePenalty && !incapable && !UNUSABLE.has(s.state)) {
+      score -= reservePenalty;
+      why.push(`${id} loses ${reservePenalty} to keep orchestrator headroom`);
+    }
 
     return {
       provider: id,
@@ -300,8 +346,102 @@ export function rankProviders(task, states, preference = loadConfig().preference
     };
   });
 
-  scored.sort((a, b) => b.score - a.score);
+  const reserved = (c) => reserveVendor
+    && c.provider === reserveVendor
+    && isUsable(c)
+    && typeof c.percent === 'number'
+    && Number.isFinite(reserveAt)
+    && c.percent >= reserveAt;
+
+  // Power-use peers are the providers that can actually take the work. The
+  // orchestrator's vendor, once it has crossed reserveAt, is held back, so it
+  // is not a competitor the gap has to clear.
+  const peers = scored.filter((c) => isUsable(c) && !reserved(c) && typeof c.percent === 'number');
+  if (peers.length >= 2 && Number.isFinite(powerGap) && powerBonus) {
+    let winner = null;
+    let nearest = null;
+    let nearestGap = Infinity;
+    for (const candidate of peers) {
+      let gap = Infinity;
+      let other = null;
+      let clears = true;
+      for (const peer of peers) {
+        if (peer === candidate) continue;
+        const g = peer.percent - candidate.percent;
+        if (g < powerGap) {
+          clears = false;
+          break;
+        }
+        if (g < gap) {
+          gap = g;
+          other = peer;
+        }
+      }
+      if (clears && other && gap < nearestGap) {
+        winner = candidate;
+        nearest = other;
+        nearestGap = gap;
+      }
+    }
+    if (winner) {
+      winner.score += powerBonus;
+      winner.why.push(
+        `power-use: ${winner.provider} is ${formatPoints(nearestGap)} points less used than ${nearest.provider}`,
+      );
+    }
+  }
+
+  for (const candidate of scored) {
+    if (!reserved(candidate)) continue;
+    const heldBack = `${candidate.provider} reserved for the orchestrator (pressure ${candidate.percent}% ≥ ${reserveAt}%)`;
+    const others = scored.filter((o) => isUsable(o) && o.provider !== candidate.provider);
+    if (others.length === 0) {
+      candidate.why.push(`${heldBack}, used because nothing else can run`);
+      continue;
+    }
+    candidate.why.push(heldBack);
+    const floor = Math.min(...others.map((o) => o.score));
+    candidate.score = Math.min(candidate.score, floor - 1);
+  }
+
+  scored.sort((a, b) => b.score - a.score || PROVIDERS.indexOf(a.provider) - PROVIDERS.indexOf(b.provider));
   return scored;
+}
+
+/**
+ * One line for `cmo limits --human`: who the router would power-use, and
+ * whether the orchestrator's vendor is being held back.
+ */
+export function formatRoutingLine(ranked) {
+  const power = ranked.find((c) => c.why.some((w) => w.startsWith('power-use:')));
+  const lead = power ?? ranked.find((c) => isUsable(c)) ?? null;
+  const piece = (c, asLead) => {
+    const held = c.why.some((w) => w.includes('reserved for the orchestrator'));
+    // A reserved vendor that is also the only usable one is who would run, so
+    // name it as least-used. Otherwise the reserve is the whole status line.
+    if (held && !(asLead && !power)) return `${c.provider} reserved for orchestrator`;
+    if (!isUsable(c)) return `${c.provider} ${c.state}`;
+    const pct = typeof c.percent === 'number' ? `${c.percent}%` : 'unknown';
+    if (asLead && power) return `power-use ${c.provider} (${pct})`;
+    if (asLead) return `least-used ${c.provider} (${pct})`;
+    return `${c.provider} ${pct}`;
+  };
+  const parts = [];
+  if (lead) parts.push(piece(lead, true));
+  for (const candidate of ranked) {
+    if (lead && candidate.provider === lead.provider) continue;
+    parts.push(piece(candidate, false));
+  }
+  return `routing: ${parts.join(' · ')}`;
+}
+
+/** Routing line for a limits reading, using the same ranker `decide()` uses. */
+export function routingLine(limits, now = Date.now()) {
+  const bands = pressure();
+  const states = Object.fromEntries(
+    PROVIDERS.map((id) => [id, providerState(limits?.[id], bands, now, id)]),
+  );
+  return formatRoutingLine(rankProviders({ role: 'implement' }, states));
 }
 
 /**
@@ -356,6 +496,11 @@ export function decide(task = {}, limits = {}, opts = {}) {
   const states = Object.fromEntries(PROVIDERS.map((id) => [id, providerState(limits[id], bands, now, id)]));
 
   let ranked = rankProviders(normalized, states);
+  for (const candidate of ranked) {
+    for (const line of candidate.why) {
+      if (line.startsWith('power-use:') || line.includes('reserved for the orchestrator')) notes.push(line);
+    }
+  }
 
   // Adversarial independence outranks everything except an explicit pin: a
   // review of codex's work should be judged by claude and vice versa, so the

@@ -5,8 +5,8 @@
 If you pay for both Claude and ChatGPT/Codex, you have two rate-limit windows and
 one agent using one of them. `cmo` spends both: it picks each subagent's model
 from the task's complexity, length and token cost, checks what's actually left on
-each subscription before dispatching, sends work to Codex first so your Claude
-session keeps its own headroom, and — the part that changes output quality —
+each subscription before dispatching, power-uses whichever subscription is least
+used, keeps Claude's window in reserve for the orchestrator, and — the part that changes output quality —
 **always grades work on the vendor that didn't produce it.**
 
 ## First, the two CLIs this drives
@@ -105,10 +105,11 @@ path four ways:
 
 What goes to Grok: `research`-role work and anything dispatched with `--web`
 (`web: true` in a dispatch file) lean to it while its window is healthy, and it
-joins the pool of cross-vendor reviewers. Everything else still follows the
-headroom rules, so Grok also takes ordinary work once Codex is spent. Its
-weekly allowance is shared with the Grok apps, so `cmo limits` shows the same
-number the app does.
+joins the pool of cross-vendor reviewers. Ordinary work follows the same
+least-used rule as everything else, so Grok takes it whenever its subscription
+is the differentially idle one, not only after Codex is spent. Its weekly
+allowance is shared with the Grok apps, so `cmo limits` shows the same number
+the app does.
 
 ---
 
@@ -180,7 +181,7 @@ Three factors set the **tier**. Live subscription headroom picks the **vendor**.
 weight < 0.30 → fast       weight < 0.62 → balanced       else → frontier
 ```
 
-Vendor, in strict precedence:
+Vendor selection filters first, then scores whoever can run:
 
 1. `--pin` — you forced it.
 2. `--independent-of <vendor>` — cross-model review. Only the *other* vendors are
@@ -190,21 +191,45 @@ Vendor, in strict precedence:
    independent grader is still worth having — one rejected 38 of 57 candidates
    on the run this came from. What's dangerous is an *unlabelled* fallback, so
    it's always labelled. `--strict-independence` refuses instead.
-3. Headroom — a provider ≥95% used, or flagged `rate_limit_reached`, isn't a
-   candidate.
-4. Preferred vendor (Codex by default), then whichever is under less
-   *pressure*.
+3. Can it run — a provider ≥95% used, or flagged `rate_limit_reached`, isn't a
+   candidate. Nor is a missing CLI, an unverified Grok, or Codex on `--web` work.
+4. **Least-used wins.** The dominant term is headroom:
+   `headroomWeight` (default 40) × (100 − pressure) / 100. When one competing
+   provider's pressure is at least `powerGap` points (default 20) below every
+   other provider that is actually competing, it also gets `powerBonus`
+   (default 25). The reason reads, for example,
+   `power-use: grok is 61 points less used than codex`.
+5. **Orchestrator reserve.** The vendor driving the run (`orchestrator.vendor`,
+   default `claude`) loses `penalty` points (default 30) on every dispatch. At
+   or above `reserveAt` pressure (default 60) it ranks below every usable
+   alternative and is chosen only when nothing else can run:
+   `claude reserved for the orchestrator (pressure 62% ≥ 60%)`.
+   `vendor: null` turns the reserve off.
+6. **Affinity** — Grok gets 25 points for `research` and for `--web`, so a
+   healthy Grok still takes that work when no other subscription is
+   differentially idle.
+7. **Tie-break** — `preference.first` (default `codex`), worth
+   `weightPoints / 10` score points (default 2.5). It settles a near-tie and
+   nothing wider.
+
+`cmo limits --human` ends with that call:
+
+```text
+routing: power-use grok (6%) · codex 67% · claude reserved for orchestrator
+```
+
+`cmo plan --human` repeats the power-use and reserve reasons under `notes`.
 
 Headroom is **pace-aware**. Both vendors have a 5-hour and a weekly window, and
 a raw percentage can't tell 80% of a week with five days to go (20% must last
 five days: 4%/day against an even pace of 14.3%/day) from 80% with twelve hours
 to go (plenty, and whatever is left at the reset is lost). So each window gets a
 *pressure* — usage weighed against time to reset, on the same 0–100 scale — and
-the bands, the tie-break and the model downgrade all act on the most-pressured
-window. A weekly squeeze outranks a 5-hour blip that is about to clear; budget
-about to expire gets spent; and pace alone never takes a provider out of the
-running, so it can still serve the cross-vendor reviews only it can do.
-`cmo limits --human` prints the pace line for every window:
+the headroom term, the bands and the model downgrade all act on the
+most-pressured window. A weekly squeeze outranks a 5-hour blip that is about to
+clear; budget about to expire counts as room; and pace alone never takes a
+provider out of the running, so it can still serve the cross-vendor reviews
+only it can do. `cmo limits --human` prints the pace line for every window:
 
 ```text
 codex   critical  pressure 94% (weekly) plan=pro
@@ -248,19 +273,25 @@ model ID your account doesn't actually have.
                 "balanced": { "model": "grok-4.7", "effort": "medium" },
                 "fast":     { "model": "grok-4.7", "effort": "low" } }
   },
-  "preference": { "first": "codex", "weightPoints": 100 },
+  "preference": { "first": "codex", "weightPoints": 25 },
+  "routing": { "headroomWeight": 40, "powerGap": 20, "powerBonus": 25 },
+  "orchestrator": { "vendor": "claude", "penalty": 30, "reserveAt": 60 },
   "affinity": { "grok": { "roles": ["research"], "web": true, "points": 25 } },
   "pressure": { "tight": 65, "critical": 85, "exhausted": 95 }
 }
 ```
 
+`routing` and `orchestrator` merge the same way `preference` and `affinity` do:
+a key you set replaces that key, and the rest stay at the defaults.
+`orchestrator.vendor` set to `null` turns the reserve off.
+
 Or per-tier via the environment: `CMO_CODEX_FRONTIER`, `CMO_CLAUDE_BALANCED`,
 `CMO_GROK_FAST`, …; `CMO_GROK_BIN` names the grok binary if it is neither on
 `PATH` nor in `~/.grok/bin`; `CMO_GROK_PROBE=0` stops the grok meter (and with it,
 grok routing);
-and `CMO_PREFER=claude` to flip the tie-break. Flip it if you drive this from a
-shell script or cron rather than from a Claude session — the Codex-first default
-exists because the orchestrator is usually itself burning Claude quota.
+and `CMO_PREFER=claude` flips the near-tie only. If you drive this from a shell
+script or cron, set `"orchestrator": { "vendor": null }` — the default assumes
+the process doing the dispatching is itself a Claude session.
 
 Claude Fable is deliberately outside the tier map (Anthropic documents it as
 substantially more consumption-intensive than Sonnet); reach it with
@@ -463,15 +494,17 @@ grader whose verdict then carried no rubric discipline and no independence.
 Telling a capable model not to use its capability does not work. A model that
 never sees the task cannot answer it.
 
-**Dispatch through the shim by default.** Claude's window is the scarce one —
-the orchestrator is a Claude session spending it continuously, and it's the only
-agent that can't be moved. On one measured fan-out, 9.6k tokens went through the
-shim against 557k on plain `agent()` calls; Codex ended at 10% consumed, Claude
-at 96%.
+**Dispatch through the shim by default.** Claude's window is reserved for the
+orchestrator: the dispatcher docks it 30 points and, at 60% pressure or above,
+uses it only when nothing else can run. A plain `agent()` bypasses that and
+spends the window directly. On one measured fan-out, 9.6k tokens went through
+the shim against 557k on plain `agent()` calls; Codex ended at 10% consumed,
+Claude at 96%.
 
-Keep a plain `agent()` only when the task needs something Codex has no access
-to: an MCP server wired into the Claude session, the harness's browser, or an
-agent you plan to resume. Ordinary file work is not on that list.
+Keep a plain `agent()` only when the task needs something none of the CLIs can
+reach: an MCP server wired into the Claude session, the harness's browser, or
+an agent you plan to resume. Ordinary file work is not on that list. Web
+research goes in the dispatch file as `web: true` and lands on a healthy Grok.
 
 The shim costs ~10–15k Haiku tokens per dispatch, mostly its own prompt —
 trivial against a real agent, absurd against a five-second one.
@@ -522,7 +555,7 @@ provider had the headroom.
 ## Tests
 
 ```bash
-npm test        # 49 offline tests: no network, no spawn, nothing spent
+npm test        # 237 offline tests: no network, no spawn, nothing spent
 cmo selftest    # the decision table, printed
 cmo doctor      # the live half: CLIs, auth, model IDs, headroom
 ```

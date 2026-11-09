@@ -15,7 +15,7 @@
 import { readFile } from 'node:fs/promises';
 
 import { readLimits } from '../src/limits.mjs';
-import { decide, isUsable, providerState, pressure, PROVIDERS } from '../src/policy.mjs';
+import { decide, isUsable, providerState, pressure, PROVIDERS, routingLine } from '../src/policy.mjs';
 import { formatDuration, providerPressure } from '../src/pace.mjs';
 import { runAgent, DEFAULT_TIMEOUT_MS } from '../src/run.mjs';
 import { doctor } from '../src/doctor.mjs';
@@ -137,6 +137,7 @@ function renderLimits(limits, now = Date.now()) {
     lines.push('WARNING: a fleet coordinator is configured but unreachable — '
       + 'this decision sees only the local machine.');
   }
+  lines.push(routingLine(limits, now));
   return lines.join('\n');
 }
 
