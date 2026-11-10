@@ -39,6 +39,10 @@
 //   6. affinity         — grok is preferred for research and web work, because
 //                         it can open and check URLs live
 //   7. tie-break        — `preference` settles a near-tie and nothing wider
+//   8. time fit         — a vendor whose own receipts say it will not finish
+//                         inside the dispatch's timeout goes behind one that
+//                         will (durations.mjs). Never ahead of a reserved
+//                         orchestrator, never off the failover ladder
 //
 // "Headroom" is pace-aware. A provider is judged on the PRESSURE of its most
 // binding window — the raw percentage adjusted for how long the remainder has
@@ -53,6 +57,7 @@
 // an expensive model, and that is the most common way a fan-out wastes quota.
 
 import { loadConfig, PROVIDERS, TIERS } from './config.mjs';
+import { expectedDuration, formatElapsed } from './durations.mjs';
 import { providerPressure } from './pace.mjs';
 
 export { PROVIDERS, TIERS };
@@ -412,6 +417,7 @@ export function rankProviders(task, states, preference = loadConfig().preference
       continue;
     }
     candidate.why.push(heldBack);
+    candidate.reserved = true;
     const floor = Math.min(...others.map((o) => o.score));
     candidate.score = Math.min(candidate.score, floor - 1);
   }
@@ -460,6 +466,60 @@ export function routingLine(limits, now = Date.now()) {
 }
 
 /**
+ * Put the vendors that will finish inside the timeout ahead of those whose own
+ * receipts say they will not.
+ *
+ * Only a vendor with evidence is moved: fewer than `minSamples` receipts for
+ * this role, tier and effort is no evidence, and it keeps its place. The order
+ * within each group is the headroom order rankProviders gave. A vendor held in
+ * reserve for the orchestrator is not promoted past a slow one — the reserve
+ * says "only when nothing else can run", and the slow vendor can run. When no
+ * vendor fits, nothing moves and the note says to raise the timeout.
+ */
+export function fitToTimeout(usable, { role, tier, timeoutMs, durations, fit = loadConfig().durationFit, models = loadConfig().models } = {}) {
+  if (!fit?.enabled || !durations || !(timeoutMs > 0) || usable.length < 2) return { ordered: usable, notes: [] };
+  const limit = timeoutMs * (Number(fit.margin) > 0 ? Number(fit.margin) : 1);
+  const estimates = new Map(usable.map((c) => [c, expectedDuration(durations, {
+    provider: c.provider,
+    role,
+    tier,
+    effort: models?.[c.provider]?.[tier]?.effort ?? models?.[c.provider]?.[tier]?.reasoning ?? null,
+  }, { ...fit, judgeMs: limit })]));
+  const slow = (c) => estimates.get(c) != null && estimates.get(c).ms > limit;
+  const describe = (c) => {
+    const e = estimates.get(c);
+    return `${c.provider} ${Number.isFinite(e.ms) ? formatElapsed(e.ms) : 'past the timeout'} at p${Math.round((fit.quantile ?? 0.75) * 100)} over ${e.n}`
+      + (e.floorFrom ? ` on ${e.floorFrom}, as a floor` : '')
+      + (e.timeouts ? `, ${e.timeouts} timed out` : '');
+  };
+  const overrun = usable.filter(slow);
+  if (overrun.length === 0) return { ordered: usable, notes: [] };
+
+  const ahead = usable.filter((c) => !slow(c) && !c.reserved);
+  if (ahead.length === 0) {
+    const reservedFit = usable.filter((c) => !slow(c) && c.reserved).map((c) => c.provider);
+    return {
+      ordered: usable,
+      notes: [`time fit: ${overrun.map(describe).join('; ')} — usually over the ${formatElapsed(timeoutMs)} timeout`
+        + ` for ${role}·${tier}`
+        + (reservedFit.length ? `; ${reservedFit.join(' or ')} would fit but is reserved for the orchestrator` : '')
+        + ' — raise --timeout'],
+    };
+  }
+  const behind = usable.filter((c) => !ahead.includes(c));
+  const lastAhead = Math.max(...ahead.map((c) => usable.indexOf(c)));
+  const notes = [];
+  for (const c of overrun) {
+    const line = `${c.provider} usually overruns a ${formatElapsed(timeoutMs)} timeout on ${role}·${tier} (${describe(c)})`
+      + `, so it runs only if ${ahead.map((a) => a.provider).join(' or ')} cannot`;
+    c.why.push(line);
+    // A decision note only where the order actually changed.
+    if (usable.indexOf(c) < lastAhead) notes.push(`time fit: ${line}`);
+  }
+  return { ordered: [...ahead, ...behind], notes };
+}
+
+/**
  * @param {object} task
  *   role            one of ROLES (default 'implement')
  *   complexity      1..5 (default 3)
@@ -472,7 +532,10 @@ export function routingLine(limits, now = Date.now()) {
  *   pin             'codex'|'claude'|'grok' — caller overrides provider selection
  *   pinModel        exact model id, bypassing the tier map
  * @param {object} limits  { codex, claude, grok } from limits.mjs
- * @param {object} opts    { now } — epoch ms, so pace is testable; defaults to the clock
+ * @param {object} opts    { now, timeoutMs, durations }
+ *   now         epoch ms, so pace is testable; defaults to the clock
+ *   timeoutMs   the dispatch's timeout; with `durations`, enables the time fit
+ *   durations   durationProfile() of recent receipts (durations.mjs)
  */
 export function decide(task = {}, limits = {}, opts = {}) {
   const now = Number.isFinite(opts.now) ? opts.now : Date.now();
@@ -610,7 +673,14 @@ export function decide(task = {}, limits = {}, opts = {}) {
     };
   }
 
-  const chosen = usable[0];
+  const timed = normalized.pin ? { ordered: usable, notes: [] } : fitToTimeout(usable, {
+    role: normalized.role,
+    tier,
+    timeoutMs: opts.timeoutMs,
+    durations: opts.durations,
+  });
+  notes.push(...timed.notes);
+  const chosen = timed.ordered[0];
 
   // A same-vendor grader is handicapped by construction, so give it more
   // capability rather than less — it has to catch what it is predisposed to
@@ -636,7 +706,7 @@ export function decide(task = {}, limits = {}, opts = {}) {
   // The failover ladder: same tier, every other usable vendor in rank order.
   // `run.mjs` walks it when the primary returns an explicit rate-limit error
   // mid-run. `fallback` is its first rung, kept for callers that read one.
-  const fallbacks = usable.slice(1).map((c) => modelFor(c.provider, tier));
+  const fallbacks = timed.ordered.slice(1).map((c) => modelFor(c.provider, tier));
   const fallback = fallbacks[0] ?? null;
 
   return {

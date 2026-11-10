@@ -94,6 +94,23 @@ Strict precedence:
    `preference.weightPoints / 10` score points (default 2.5). It decides a
    near-tie and nothing wider. `CMO_PREFER=claude` flips which side of the tie
    wins. It does not protect Claude's window; the reserve does.
+8. **Time fit** — with the dispatch's `timeout` known, a vendor whose recent
+   receipts say it usually overruns it goes behind the vendors that fit:
+
+   ```text
+   expected = p75 of that vendor's last 14 days on this role · tier · effort
+              (≥3 samples; with too few, the nearest cheaper tier's
+               estimate is a floor; a timed-out attempt counts as at
+               least its timeout)
+   overruns = expected > 0.9 × timeout
+   ```
+
+   It stays on the failover ladder; a pin wins; the reserved orchestrator is
+   never promoted past it (the note then says to raise the timeout). Grok is
+   three to four times slower than Codex at the same tier, so this is what
+   keeps a Codex-sized timeout from being spent on a Grok run that cannot
+   finish. Configurable as `durationFit` (`enabled`, `quantile`, `margin`,
+   `minSamples`, `windowDays`).
 
 ### Pressure: usage weighed against time to reset
 

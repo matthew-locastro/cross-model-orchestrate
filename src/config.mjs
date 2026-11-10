@@ -16,6 +16,8 @@ import { accessSync, constants, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
 
+import { DEFAULT_DURATION_FIT } from './durations.mjs';
+
 export const CONFIG_DIR = process.env.CMO_CONFIG_DIR
   ?? join(homedir(), '.config', 'cross-model-orchestrate');
 export const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
@@ -70,6 +72,18 @@ export const DEFAULT_MODELS = {
  * shared and single-flighted (see ledger.mjs), so a short TTL costs one probe
  * for the whole box, not one per dispatch.
  */
+/**
+ * When a running agent is stopped. Past its time budget (`--timeout`) an agent
+ * that is still producing output keeps going: a long run that is making
+ * progress is worth more than the clock. It is stopped only once it has been
+ * silent for `idleMinutes` (never longer than the budget itself), or at the
+ * `maxMinutes` ceiling. Within the budget nothing is stopped for silence.
+ */
+export const DEFAULT_WATCHDOG = {
+  idleMinutes: 15,
+  maxMinutes: 240,
+};
+
 export const DEFAULT_FRESHNESS = {
   codex: 10_000, // a local file read — effectively free, so keep it tight
   claude: 45_000, // a network call, shared across every process on this machine
@@ -238,6 +252,10 @@ export function loadConfig({ file = CONFIG_FILE, reload = false } = {}) {
       ...(process.env.CMO_PREFER ? { first: process.env.CMO_PREFER } : {}),
     },
     routing: { ...DEFAULT_ROUTING, ...(fromFile.routing ?? {}) },
+    // Move a vendor whose own receipts say it will not finish inside the
+    // dispatch's timeout behind one that will (durations.mjs).
+    durationFit: { ...DEFAULT_DURATION_FIT, ...(fromFile.durationFit ?? {}) },
+    watchdog: { ...DEFAULT_WATCHDOG, ...(fromFile.watchdog ?? {}) },
     orchestrator: {
       ...DEFAULT_ORCHESTRATOR,
       ...(fromFile.orchestrator ?? {}),

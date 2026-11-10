@@ -30,6 +30,7 @@ import { timingSafeEqual } from 'node:crypto';
 
 import { CACHE_DIR } from './config.mjs';
 import { identity } from './remote.mjs';
+import { MAX_LEASE_MS } from './ledger.mjs';
 
 export const DEFAULT_PORT = 7867;
 const MAX_BODY_BYTES = 256 * 1024;
@@ -207,7 +208,7 @@ export function createCoordinator({ token, statePath, now = Date.now } = {}) {
           // Only ever consulted for entries from this coordinator's own node.
           pid: Number.isInteger(b.pid) ? b.pid : null,
           startedAt,
-          expiresAt: startedAt + Math.min(Number(b.leaseMs) || DEFAULT_LEASE_MS, 6 * 60 * 60_000),
+          expiresAt: startedAt + Math.min(Number(b.leaseMs) || DEFAULT_LEASE_MS, MAX_LEASE_MS),
         };
         state.reservations = state.reservations.filter((r) => r.id !== entry.id).concat(entry);
         await persist();

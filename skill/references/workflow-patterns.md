@@ -143,7 +143,8 @@ while (dry < 2) {
 confirmation held a `parallel()` barrier for 91 minutes while two hundred
 finished agents idled behind it. Same stall in a `pipeline()` costs one item.
 Pass the non-interactive flag, pre-answer the prompt, or do not give it the
-tool — `cmo run` does all three and kills on a wall clock.
+tool — `cmo run` does all three, and stops an agent that falls silent past its
+budget without cutting off one that is still working.
 
 **Prose where the script expected a verdict.** Anything the script branches on
 gets a schema. Without one, a differently-phrased refusal reads as approval.

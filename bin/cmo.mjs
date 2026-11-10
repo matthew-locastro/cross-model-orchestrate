@@ -24,7 +24,9 @@ import { createCoordinator, DEFAULT_PORT } from '../src/server.mjs';
 import { fleetConfig, health } from '../src/remote.mjs';
 import { mergeDispatch, parseDispatchFile } from '../src/dispatch-file.mjs';
 import { readAudit, summarise, findings, tierStats, failureTaxonomy } from '../src/audit.mjs';
-import { perAgentCost } from '../src/ledger.mjs';
+import { durationProfile } from '../src/durations.mjs';
+import { loadConfig } from '../src/config.mjs';
+import { MAX_LEASE_MS, perAgentCost } from '../src/ledger.mjs';
 import { update } from '../src/update.mjs';
 
 function parseArgs(argv) {
@@ -62,6 +64,38 @@ function taskFromArgs(args) {
     pin: args.pin || null,
     pinModel: args.model || null,
   };
+}
+
+/**
+ * A duration flag in seconds, as ms: null when absent, and a refusal when it is
+ * not a positive number. `--timeout nope` once meant a NaN clock that never
+ * fired, so a silent agent ran forever.
+ */
+function secondsFlag(args, key) {
+  if (args[key] === undefined) return null;
+  const n = Number(args[key]);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new UsageError(`--${key} must be a positive number of seconds, got "${args[key]}"`);
+  }
+  // Six hours: the longest a reservation can hold headroom, here and on a
+  // fleet coordinator, so the longest any run can be allowed to last.
+  if (n * 1000 > MAX_LEASE_MS) {
+    throw new UsageError(`--${key} must be at most ${MAX_LEASE_MS / 1000} seconds (6 hours), got "${args[key]}"`);
+  }
+  return n * 1000;
+}
+
+class UsageError extends Error {}
+
+/** The timeout a run will use, and the receipts that say who fits inside it. */
+async function timing(args) {
+  const timeoutMs = secondsFlag(args, 'timeout') ?? DEFAULT_TIMEOUT_MS;
+  const fit = loadConfig().durationFit;
+  if (!fit?.enabled) return { timeoutMs };
+  const windowDays = Number(fit.windowDays) > 0 ? Number(fit.windowDays) : 14;
+  // 4 MB is ~10,000 receipts — more than readAudit keeps — read from the end.
+  const rows = await readAudit({ sinceMs: Date.now() - windowDays * 86_400_000, tailBytes: 4 << 20 }).catch(() => []);
+  return { timeoutMs, durations: durationProfile(rows, { windowDays }) };
 }
 
 function bar(percent) {
@@ -212,6 +246,14 @@ task options (plan, run)
   --pin             codex|claude|grok — override provider selection. Grok is
                     still refused unless signed in to a subscription.
   --model           exact model id, bypassing the tier map
+  --timeout         the time budget in seconds  (default: ${DEFAULT_TIMEOUT_MS / 1000}). Within it
+                    nothing is stopped. Past it, an agent still producing
+                    output keeps going; one silent for --idle-timeout stops.
+                    A vendor whose recent receipts for this role and tier
+                    usually overrun it is tried after one that fits.
+  --idle-timeout    seconds of silence, past the budget, before an agent is
+                    stopped  (default: 900, never more than --timeout)
+  --max-runtime     the absolute ceiling in seconds  (default: 14400, at most 21600)
 
 run options
   --dispatch        a file holding a DISPATCH header and a TASK body. Preferred:
@@ -220,7 +262,6 @@ run options
   --prompt-file     read the prompt from a file (else stdin, else --prompt)
   --schema          JSON Schema file; the result is validated and returned parsed
   --cwd             working directory for the subagent  (default: cwd)
-  --timeout         seconds before the agent is killed  (default: ${DEFAULT_TIMEOUT_MS / 1000})
   --attempts        max attempts per provider           (default: 3)
   --no-failover     do not try the other vendor
   --full-access     codex only: bypass the sandbox (use inside an isolated box)
@@ -420,8 +461,15 @@ async function main() {
     if (typeof args.dispatch === 'string') {
       planArgs = mergeDispatch(args, parseDispatchFile(await readFile(args.dispatch, 'utf8')).meta);
     }
+    try {
+      secondsFlag(planArgs, 'timeout');
+    } catch (err) {
+      if (!(err instanceof UsageError)) throw err;
+      process.stderr.write(`cmo plan: ${err.message}\n`);
+      return 2;
+    }
     const limits = await readLimits({ refresh: Boolean(planArgs.refresh) });
-    const decision = decide(taskFromArgs(planArgs), limits);
+    const decision = decide(taskFromArgs(planArgs), limits, await timing(planArgs));
     if (args.human) {
       if (!decision.ok) {
         process.stdout.write(`DEFER — ${decision.reason}\nresume after ${decision.resumeAfter ?? 'unknown'}\n`);
@@ -471,8 +519,23 @@ async function main() {
       process.stderr.write('cmo run: no prompt (use --prompt-file, --prompt, or stdin)\n');
       return 2;
     }
+    // Bad durations are refused before anything is read or spent.
+    let watchdogArgs;
+    try {
+      const watchdog = loadConfig().watchdog ?? {};
+      secondsFlag(runArgs, 'timeout');
+      watchdogArgs = {
+        idleMs: secondsFlag(runArgs, 'idle-timeout') ?? (Number(watchdog.idleMinutes) || 15) * 60_000,
+        maxMs: secondsFlag(runArgs, 'max-runtime') ?? (Number(watchdog.maxMinutes) || 240) * 60_000,
+      };
+    } catch (err) {
+      if (!(err instanceof UsageError)) throw err;
+      process.stderr.write(`cmo run: ${err.message}\n`);
+      return 2;
+    }
     const limits = await readLimits({ refresh: Boolean(runArgs.refresh) });
-    const decision = decide(taskFromArgs(runArgs), limits);
+    const { timeoutMs, durations } = await timing(runArgs);
+    const decision = decide(taskFromArgs(runArgs), limits, { timeoutMs, durations });
     if (!decision.ok) {
       process.stdout.write(`${JSON.stringify({ ok: false, deferred: true, ...decision }, null, 2)}\n`);
       return 3;
@@ -485,7 +548,8 @@ async function main() {
 
     const envelope = await runAgent(decision, prompt, {
       cwd: runArgs.cwd ? String(runArgs.cwd) : process.cwd(),
-      timeoutMs: runArgs.timeout ? Number(runArgs.timeout) * 1000 : DEFAULT_TIMEOUT_MS,
+      timeoutMs,
+      ...watchdogArgs,
       maxAttempts: runArgs.attempts ? Number(runArgs.attempts) : 3,
       schema,
       failover: !runArgs['no-failover'],

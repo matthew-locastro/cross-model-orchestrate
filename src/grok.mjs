@@ -42,7 +42,9 @@
 // shared with the Grok apps — the CLI and the app draw on one weekly pool.
 
 import { spawn } from 'node:child_process';
-import { tmpdir } from 'node:os';
+import { lstatSync, readdirSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 /** Environment variables the grok CLI will bill an API key from. Never passed on. */
 export const GROK_KEY_VARS = ['XAI_API_KEY', 'GROK_CODE_XAI_API_KEY'];
@@ -367,4 +369,63 @@ export function offSubscriptionReason(partialStdout) {
     } catch { /* torn line: wait for more */ }
   }
   return null;
+}
+
+// ── progress the stream does not show ─────────────────────────────────────
+
+const SESSION_ID_RE = /^[A-Za-z0-9-]{1,80}$/;
+
+/**
+ * When this grok run last showed signs of life, in epoch ms, or null.
+ *
+ * Grok's stream prints whole messages only, so while it reasons it can be
+ * silent on stdout for minutes (measured: over two) — which looks exactly like
+ * a stall. Its own session log does not go quiet: `events.jsonl` in the
+ * session's folder gets a line every few seconds while it works (longest gap
+ * measured: under ten seconds). The init line names the session; this finds
+ * that folder under `~/.grok/sessions/<cwd>/` and reads when it last changed.
+ * Read only; never opens a file's content.
+ */
+const sessionDirs = new Map(); // session id → its folder, or the time a search found none
+
+export function grokSessionActivity(stdout, { grokHome = process.env.GROK_HOME ?? join(homedir(), '.grok') } = {}) {
+  let id = null;
+  for (const line of String(stdout ?? '').split('\n', 8)) {
+    try {
+      const event = JSON.parse(line);
+      if (typeof event?.session_id === 'string') { id = event.session_id; break; }
+    } catch { /* not a JSON line */ }
+  }
+  if (!id || !SESSION_ID_RE.test(id)) return null;
+  const sessions = join(grokHome, 'sessions');
+  const key = `${sessions}\0${id}`;
+
+  // Found once, then two stats per check. A search that found nothing is not
+  // repeated for a minute: the folder may not exist yet, and the history under
+  // ~/.grok/sessions grows with every project grok has run in.
+  let dir = sessionDirs.get(key);
+  if (typeof dir !== 'string') {
+    if (typeof dir === 'number' && Date.now() - dir < 60_000) return null;
+    dir = null;
+    let roots = [];
+    try { roots = readdirSync(sessions, { withFileTypes: true }); } catch { return null; }
+    for (const root of roots) {
+      if (!root.isDirectory()) continue; // a symlink is not followed out of the tree
+      const candidate = join(sessions, root.name, id);
+      try {
+        if (lstatSync(candidate).isDirectory()) { dir = candidate; break; }
+      } catch { /* not this project */ }
+    }
+    sessionDirs.set(key, dir ?? Date.now());
+    if (!dir) return null;
+  }
+
+  let latest = null;
+  for (const file of ['events.jsonl', 'updates.jsonl']) {
+    try {
+      const st = lstatSync(join(dir, file));
+      if (st.isFile() && (latest == null || st.mtimeMs > latest)) latest = st.mtimeMs;
+    } catch { /* not written yet */ }
+  }
+  return latest;
 }

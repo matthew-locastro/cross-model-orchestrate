@@ -211,6 +211,20 @@ Vendor selection filters first, then scores whoever can run:
 7. **Tie-break** — `preference.first` (default `codex`), worth
    `weightPoints / 10` score points (default 2.5). It settles a near-tie and
    nothing wider.
+8. **Time fit** — a vendor whose own recent receipts say it will not finish
+   inside the dispatch's `--timeout` is tried after one that will. The
+   estimate is the p75 of that vendor's last 14 days on the same role, tier and
+   effort (3 samples minimum; a tier with fewer takes the nearest cheaper
+   tier's estimate as a floor), and "will not finish" means over 90% of the
+   timeout. The slow vendor stays on the failover ladder, a pin still wins,
+   and the orchestrator's reserved vendor is never promoted past it. The reason reads, for example,
+   `grok usually overruns a 10.0 min timeout on review·balanced (grok 18.5 min
+   at p75 over 4), so it runs only if codex cannot`. It exists because Grok
+   takes three to four times as long as Codex at the same tier (review p50
+   876s against 202s): power-use sent it reviews with Codex-sized 600s and
+   900s timeouts, it was killed with nothing to show, and Codex did the work
+   anyway. (Since 0.1.30 a run still producing output is not killed at its
+   timeout at all: see the watchdog under Hardening.)
 
 `cmo limits --human` ends with that call:
 
@@ -277,11 +291,12 @@ model ID your account doesn't actually have.
   "routing": { "headroomWeight": 40, "powerGap": 20, "powerBonus": 25 },
   "orchestrator": { "vendor": "claude", "penalty": 30, "reserveAt": 60 },
   "affinity": { "grok": { "roles": ["research"], "web": true, "points": 25 } },
+  "durationFit": { "enabled": true, "quantile": 0.75, "margin": 0.9, "minSamples": 3, "windowDays": 14 },
   "pressure": { "tight": 65, "critical": 85, "exhausted": 95 }
 }
 ```
 
-`routing` and `orchestrator` merge the same way `preference` and `affinity` do:
+`routing`, `orchestrator` and `durationFit` merge the same way `preference` and `affinity` do:
 a key you set replaces that key, and the rest stay at the defaults.
 `orchestrator.vendor` set to `null` turns the reserve off.
 
@@ -555,7 +570,7 @@ Everything in `cmo run` is there because of something that actually went wrong:
 
 | | |
 | --- | --- |
-| **watchdog** | Hard wall-clock timeout, `SIGTERM` then `SIGKILL`. One agent waiting on an interactive confirmation once held a `parallel()` barrier for 91 minutes while two hundred finished agents idled behind it. |
+| **watchdog** | Progress-aware, `SIGTERM` then `SIGKILL`. Within its `--timeout` budget (default 30 min) nothing is stopped; past it, an agent still producing output keeps going, and only `--idle-timeout` of silence (default 15 min, never more than the budget) or the `--max-runtime` ceiling (default 4 h) stops it. Claude runs with `stream-json` so its progress shows. One agent waiting on an interactive confirmation once held a `parallel()` barrier for 91 minutes while two hundred finished agents idled behind it; a slow agent that is working is not that, and cutting it off wastes the whole run. Configurable as `watchdog: { idleMinutes, maxMinutes }`. |
 | **stdin prompts** | Prompts go down stdin, never argv. Long prompts blow argv limits and shell quoting corrupts them silently. |
 | **no interactive path** | Codex gets `--sandbox` + `--skip-git-repo-check`; Claude gets `--dangerously-skip-permissions`. There's nobody there to press `y`. |
 | **classified retries** | A rate limit switches vendor instead of sleeping. A deterministic error (bad flag, malformed prompt) isn't retried — that just burns quota three times and fails anyway. |

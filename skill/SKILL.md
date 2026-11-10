@@ -329,8 +329,10 @@ every dispatch and, at 60% pressure or above, is a candidate only when nothing
 else can run. Research and web work still lean to a healthy Grok. A near-tie
 breaks to Codex. Every other usable vendor is the failover ladder, in that
 rank order, and a **defer** with a reset time comes back when none can finish
-the job. The power-use and reserve reasons are in `notes` — put the ones that
-changed the outcome in your plan.
+the job. A vendor whose own receipts say it will not finish inside the
+dispatch's `timeout` is tried after one that will. The power-use, reserve and
+time-fit reasons are in `notes` — put the ones that changed the outcome in your
+plan.
 
 Full rubric, bands and the reason behind each correction:
 `references/dispatch-policy.md`.
@@ -354,6 +356,16 @@ differentially idle subscription, it takes that work even when Grok is fine.
   citation says what it is cited for (`role: research`, `web: true`);
 - **cross-vendor review** of Codex or Claude work, as a third grader — it
   spreads review load off the two windows the build itself is draining.
+
+Grok is slow: three to four times Codex's wall time at the same tier (a
+review takes 12–19 minutes, an implementation 15 minutes to an hour). Set
+`timeout` to the time you can actually wait, not to what Codex would need;
+routing moves Grok behind a faster vendor when the timeout is too short for
+it, and a timeout that leaves room is how Grok's idle subscription gets used.
+The timeout is a budget, not a guillotine: past it, an agent that is still
+producing output keeps going, and only 15 minutes of silence or the 4-hour
+ceiling stops it (`idle-timeout`, `max-runtime`). A slow run that is working is
+never cut off.
 
 Keep these off it: anything that must not touch the network or the wider
 filesystem (Grok, like Claude, is not sandboxed), and work whose output must be
@@ -402,8 +414,9 @@ autonomous runs die: one stalled agent holds every finished branch behind it.
 
 **Nothing interactive, ever.** Every subagent command passes its non-interactive
 flag or does not get the tool. There is nobody there to press `y`. `cmo run`
-enforces this and kills on a wall clock; hand-rolled `Bash` inside a subagent
-does not.
+enforces this and stops an agent that falls silent past its budget, while
+letting one that is still working finish; hand-rolled `Bash` inside a subagent
+does neither.
 
 **Schemas on anything the script branches on.** A verdict is a typed object with
 a score and an enum, never prose parsed with a regex at three in the morning.

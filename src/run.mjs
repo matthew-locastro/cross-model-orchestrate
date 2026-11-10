@@ -6,11 +6,14 @@
 //
 // Hardening, in order of how much each one has cost us:
 //
-//   watchdog     Hard wall-clock timeout, SIGTERM then SIGKILL. The 91-minute
-//                stall in the image run was one agent holding a parallel()
-//                barrier while it waited for a confirmation prompt nobody was
-//                awake to answer. Every invocation here is non-interactive and
-//                every invocation dies on the clock.
+//   watchdog     Progress-aware, SIGTERM then SIGKILL. The 91-minute stall in
+//                the image run was one agent holding a parallel() barrier while
+//                it waited for a confirmation prompt nobody was awake to
+//                answer, so every invocation is non-interactive and a silent
+//                one dies. But a slow agent that is still working is not a
+//                stall: past its time budget an agent that keeps producing
+//                output keeps going, and only silence or the hard ceiling
+//                stops it. Cutting off good progress wastes the whole run.
 //   stdin prompt Prompts go down stdin, never argv. Long prompts blow argv
 //                limits and shell-quoting bugs corrupt them silently.
 //   retries      Bounded, classified, with exponential backoff and jitter.
@@ -45,14 +48,19 @@ import {
   refreshClaudeLimits, refreshCodexLimits, refreshGrokLimits,
 } from './limits.mjs';
 import { loadConfig } from './config.mjs';
+import { formatElapsed } from './durations.mjs';
 import {
-  GROK_KEY_VARS, lockGrokEnv, offSubscriptionReason, parseGrokStream, startedOffSubscription,
+  GROK_KEY_VARS, grokSessionActivity, lockGrokEnv, offSubscriptionReason, parseGrokStream, startedOffSubscription,
 } from './grok.mjs';
-import { mutate, recordSample, releaseReservation, reserve, snapshot } from './ledger.mjs';
+import { MAX_LEASE_MS, mutate, recordSample, releaseReservation, reserve, snapshot } from './ledger.mjs';
 import { newDispatchId, record } from './audit.mjs';
 import { identity } from './remote.mjs';
 
-export const DEFAULT_TIMEOUT_MS = 20 * 60_000;
+// The time budget. Thirty minutes, not twenty: Grok's reviews and balanced
+// implementations run 15–18 minutes at p50, and a budget they fit inside is
+// what lets its idle subscription take them. Past it nothing is cut off while
+// it still works (see watchdogVerdict).
+export const DEFAULT_TIMEOUT_MS = 30 * 60_000;
 /**
  * How stale claude's reading must be before a finished dispatch will spend a
  * network call refreshing it to measure its own cost. Codex pays nothing for
@@ -220,9 +228,13 @@ export function buildCommand(decision, opts) {
     return { binary: 'codex', args };
   }
 
+  // stream-json, not json: json prints nothing until the end, so a long claude
+  // run looks exactly like a stalled one to the watchdog. The stream shows it
+  // working, and its last line is the same result envelope json would print.
   const args = [
     '-p',
-    '--output-format', 'json',
+    '--output-format', 'stream-json',
+    '--verbose',
     '--model', decision.model,
   ];
   if (decision.effort) args.push('--effort', decision.effort);
@@ -296,7 +308,35 @@ async function shutdown(sig) {
 
 // ── process execution ─────────────────────────────────────────────────────
 
-function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env, abortIf = null }) {
+/**
+ * When to stop a child, given how long it has run and how long it has been
+ * silent. Within the budget, never for silence. Past it, only after `idleMs` of
+ * silence (capped at the budget, so a child that is silent from the start stops
+ * at the budget exactly as a wall clock would), or at the `maxMs` ceiling.
+ * Returns the reason to stop, or the ms until it is worth asking again.
+ */
+export function watchdogVerdict({ elapsed, quiet, everSpoke, timeoutMs: budget, idleMs = budget, maxMs = budget }) {
+  // A clock that is not a positive number never fires: fall back, never hang.
+  const timeoutMs = Number.isFinite(budget) && budget > 0 ? budget : DEFAULT_TIMEOUT_MS;
+  const quietLimit = Math.max(1, Math.min(Number(idleMs) || timeoutMs, timeoutMs));
+  const ceiling = Math.max(timeoutMs, Number(maxMs) || timeoutMs);
+  if (elapsed >= ceiling) return { stop: `still running at the ${formatElapsed(ceiling)} ceiling` };
+  if (elapsed >= timeoutMs && quiet >= quietLimit) {
+    return {
+      stop: everSpoke
+        ? `no output for ${formatElapsed(quiet)}, past its ${formatElapsed(timeoutMs)} budget (ran ${formatElapsed(elapsed)})`
+        : `no output at all in its ${formatElapsed(timeoutMs)} budget`,
+    };
+  }
+  return { wait: Math.max(25, Math.min(ceiling - elapsed, Math.max(timeoutMs - elapsed, quietLimit - quiet))) };
+}
+
+export function spawnWithTimeout({
+  binary, args, cwd, prompt, timeoutMs, idleMs = timeoutMs, maxMs = 240 * 60_000, env, abortIf = null,
+  // When the child last showed progress somewhere other than its own output
+  // (grok's session log), in epoch ms: a silent stdout is then not a stall.
+  activity = null,
+}) {
   return new Promise((resolve) => {
     let child;
     try {
@@ -317,17 +357,55 @@ function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env, abortIf =
     let timedOut = false;
     let settled = false;
     let aborted = null;
+    let stopReason = null;
+    let startedAt = Date.now();
+    let lastOutputAt = startedAt;
+    let expectedWake = null;
+    let everSpoke = false;
+    const heard = () => { lastOutputAt = Date.now(); everSpoke = true; };
 
-    const killTimer = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGTERM');
-      setTimeout(() => {
-        if (!settled) child.kill('SIGKILL');
-      }, KILL_GRACE_MS).unref?.();
-    }, timeoutMs);
+    let killTimer = null;
+    const watch = () => {
+      if (settled) return;
+      const at = Date.now();
+      // Woken far later than scheduled: the machine slept, or the event loop
+      // was blocked. The child was frozen too, so that gap is neither silence
+      // nor runtime; it never counts against a run that was mid-work.
+      if (expectedWake != null && at - expectedWake > 60_000) {
+        const asleep = at - expectedWake;
+        startedAt += asleep;
+        lastOutputAt = Math.min(at, lastOutputAt + asleep);
+      }
+      if (activity) {
+        let seen = null;
+        try { seen = activity(stdout); } catch { /* no evidence either way */ }
+        if (Number.isFinite(seen) && seen > lastOutputAt) {
+          lastOutputAt = Math.min(seen, at);
+          everSpoke = true;
+        }
+      }
+      const verdict = watchdogVerdict({
+        elapsed: at - startedAt, quiet: at - lastOutputAt, everSpoke, timeoutMs, idleMs, maxMs,
+      });
+      if (verdict.stop) {
+        timedOut = true;
+        stopReason = verdict.stop;
+        child.kill('SIGTERM');
+        setTimeout(() => {
+          if (!settled) child.kill('SIGKILL');
+        }, KILL_GRACE_MS).unref?.();
+        return;
+      }
+      expectedWake = Date.now() + verdict.wait;
+      killTimer = setTimeout(watch, verdict.wait);
+    };
+    const firstWait = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
+    expectedWake = Date.now() + firstWait;
+    killTimer = setTimeout(watch, firstWait);
 
     child.stdout.on('data', (d) => {
       stdout += d;
+      heard();
       // A caller-supplied tripwire on the live stream — grok's "this session
       // is not the subscription" — stops the child on the line that shows it.
       if (abortIf && !aborted) {
@@ -339,14 +417,14 @@ function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env, abortIf =
         }
       }
     });
-    child.stderr.on('data', (d) => { stderr += d; });
+    child.stderr.on('data', (d) => { stderr += d; heard(); });
 
     child.on('error', (err) => {
       if (settled) return;
       settled = true;
       liveChildren.delete(child);
       clearTimeout(killTimer);
-      resolve({ code: null, signal: null, timedOut, aborted, stdout, stderr: `${stderr}\n${err.message}` });
+      resolve({ code: null, signal: null, timedOut, stopReason, aborted, stdout, stderr: `${stderr}\n${err.message}` });
     });
 
     child.on('close', (code, signal) => {
@@ -354,7 +432,7 @@ function spawnWithTimeout({ binary, args, cwd, prompt, timeoutMs, env, abortIf =
       settled = true;
       liveChildren.delete(child);
       clearTimeout(killTimer);
-      resolve({ code, signal, timedOut, aborted, stdout, stderr });
+      resolve({ code, signal, timedOut, stopReason, aborted, stdout, stderr });
     });
 
     // Close stdin immediately after the prompt. An agent that then asks for
@@ -411,12 +489,45 @@ export function parseCodexStream(stdout) {
   return { rateLimits, usage, error, schemaRejected };
 }
 
-/** `claude -p --output-format json` returns one envelope; be liberal about it. */
+/**
+ * The result envelope: the whole of `--output-format json`, or the last
+ * `type: result` line of `stream-json`. `stream` says the output was a stream,
+ * so a stream cut off before its result line is not mistaken for plain text.
+ */
+function claudeEnvelope(trimmed) {
+  try {
+    const whole = JSON.parse(trimmed);
+    // One stream event that is not the result: a stream cut off early.
+    if (whole && typeof whole === 'object' && typeof whole.type === 'string' && whole.type !== 'result') {
+      return { value: null, line: '', stream: true };
+    }
+    return { value: whole, line: trimmed, stream: false };
+  } catch { /* more than one line, or not JSON */ }
+  const lines = trimmed.split('\n').map((l) => l.trim()).filter(Boolean);
+  let stream = lines.length > 0;
+  let found = null;
+  for (const line of lines) {
+    let event;
+    try { event = JSON.parse(line); } catch { stream = false; break; }
+    if (!event || typeof event !== 'object' || typeof event.type !== 'string') { stream = false; break; }
+    if (event.type === 'result') found = { value: event, line, stream: true };
+  }
+  if (found) return found;
+  return stream ? { value: null, line: '', stream: true } : null;
+}
+
+/**
+ * Claude's answer from `claude -p` output, json or stream-json; be liberal.
+ * `raw` is what a failure classifier may read: the envelope alone, never the
+ * stream's tool output, whose file contents could mention a 429 or a 401.
+ */
 export function parseClaudeStdout(stdout) {
   const trimmed = stdout.trim();
-  if (!trimmed) return { text: '', usage: null };
-  try {
-    const parsed = JSON.parse(trimmed);
+  if (!trimmed) return { text: '', usage: null, raw: '' };
+  const envelope = claudeEnvelope(trimmed);
+  if (envelope?.stream && !envelope.value) return { text: '', usage: null, raw: '' };
+  if (envelope) {
+    const parsed = envelope.value;
     // A run that failed still prints a result, its text the error ("Failed to
     // authenticate: …"). That is a diagnosis, never an answer: it goes to the
     // caller as `error` so the failure is classified by what it says.
@@ -424,16 +535,16 @@ export function parseClaudeStdout(stdout) {
       const said = typeof parsed.result === 'string' && parsed.result.trim()
         ? parsed.result.trim()
         : `claude reported an error (${parsed.subtype ?? 'no detail'})`;
-      return { text: '', usage: parsed.usage ?? null, error: said };
+      return { text: '', usage: parsed.usage ?? null, error: said, raw: envelope.line };
     }
     if (typeof parsed?.result === 'string') {
-      return { text: parsed.result, usage: parsed.usage ?? null, cost: parsed.total_cost_usd ?? null };
+      return { text: parsed.result, usage: parsed.usage ?? null, cost: parsed.total_cost_usd ?? null, raw: envelope.line };
     }
-    if (typeof parsed === 'string') return { text: parsed, usage: null };
-  } catch {
-    // Not JSON — some versions/flags stream plain text. Use it as-is.
+    if (typeof parsed === 'string') return { text: parsed, usage: null, raw: trimmed };
+    if (envelope.stream) return { text: '', usage: null, raw: envelope.line };
   }
-  return { text: trimmed, usage: null };
+  // Not JSON — some versions/flags print plain text. Use it as-is.
+  return { text: trimmed, usage: null, raw: trimmed };
 }
 
 /**
@@ -713,6 +824,16 @@ function grokTripwire() {
   };
 }
 
+/**
+ * What each attempt cost in time, for the receipt. Attempts that never spawned
+ * (grok refused before start) have no wall time and are left out.
+ */
+function attemptLog(attempts) {
+  return attempts
+    .filter((a) => Number.isFinite(a.ms))
+    .map((a) => ({ provider: a.provider, tier: a.tier, effort: a.effort, ms: a.ms, failure: a.failure ?? null }));
+}
+
 // ── the runner ────────────────────────────────────────────────────────────
 
 /**
@@ -721,7 +842,8 @@ function grokTripwire() {
  * @param {object} decision  from policy.decide()
  * @param {string} prompt
  * @param {object} opts
- *   cwd, timeoutMs, maxAttempts, schema, failover, fullAccess, sandbox,
+ *   cwd, timeoutMs (the budget), idleMs and maxMs (the watchdog: see
+ *   watchdogVerdict), maxAttempts, schema, failover, fullAccess, sandbox,
  *   allowedTools, sleep (injectable for tests), spawnImpl (injectable),
  *   grokGate (injectable: resolves the current grok auth verdict)
  * @returns {Promise<object>} the result envelope
@@ -730,6 +852,8 @@ export async function runAgent(decision, prompt, opts = {}) {
   const {
     cwd = process.cwd(),
     timeoutMs = DEFAULT_TIMEOUT_MS,
+    idleMs: idleOpt = (Number(loadConfig().watchdog?.idleMinutes) || 15) * 60_000,
+    maxMs: maxOpt = (Number(loadConfig().watchdog?.maxMinutes) || 240) * 60_000,
     maxAttempts = 3,
     schema = null,
     failover = true,
@@ -742,6 +866,11 @@ export async function runAgent(decision, prompt, opts = {}) {
     grokGate = currentGrokAuth,
   } = opts;
 
+  // Every clock finite, positive and inside the longest lease a reservation
+  // can hold: an infinite ceiling would never stop a run that keeps talking.
+  const clamp = (ms, fallback) => (Number.isFinite(ms) && ms > 0 ? Math.min(ms, MAX_LEASE_MS) : fallback);
+  const idleMs = clamp(idleOpt, 15 * 60_000);
+  const maxMs = clamp(maxOpt, 240 * 60_000);
   wireSignals();
   const who = identity(cwd);
   const startedAt = now();
@@ -838,12 +967,14 @@ export async function runAgent(decision, prompt, opts = {}) {
           label: target.model,
           cwd,
           // The coordinator cannot test a pid on another machine, so the entry
-          // expires on its own. One timeout of slack covers a retry.
-          leaseMs: timeoutMs * 2 + 60_000,
+          // expires on its own. A run still working past its budget can last
+          // to the watchdog's ceiling, and must hold its headroom that long.
+          leaseMs: Math.min(Math.max(timeoutMs, maxMs) + 60_000, MAX_LEASE_MS),
         }).catch(() => null);
         if (ticket) liveTickets.add(ticket);
 
         let result;
+        const attemptStarted = now();
         try {
           result = await spawnImpl({
             binary,
@@ -852,8 +983,10 @@ export async function runAgent(decision, prompt, opts = {}) {
             // Grok has its prompt in a file; its stdin gets EOF at once.
             prompt: target.provider === 'grok' ? '' : fullPrompt,
             timeoutMs,
+            idleMs,
+            maxMs,
             env: childEnv(),
-            ...(target.provider === 'grok' ? { abortIf: grokTripwire() } : {}),
+            ...(target.provider === 'grok' ? { abortIf: grokTripwire(), activity: (out) => grokSessionActivity(out) } : {}),
           });
         } finally {
           if (ticket) {
@@ -937,6 +1070,8 @@ export async function runAgent(decision, prompt, opts = {}) {
           const parsed = parseClaudeStdout(result.stdout);
           text = parsed.text;
           usage = parsed.usage;
+          // Classify on the envelope alone (see parseClaudeStdout).
+          result = { ...result, stdout: parsed.raw ?? '' };
           if (parsed.error) {
             result = {
               ...result,
@@ -969,9 +1104,15 @@ export async function runAgent(decision, prompt, opts = {}) {
         attempts.push({
           provider: target.provider,
           model: target.model,
+          tier: target.tier ?? null,
+          effort: target.effort ?? target.reasoning ?? null,
           attempt: attempt + 1,
+          // Wall time of this attempt alone. A timed-out one is evidence too:
+          // durations.mjs reads it as "at least this long" for that vendor.
+          ms: now() - attemptStarted,
           exitCode: result.code,
           timedOut: result.timedOut,
+          ...(result.stopReason ? { stopReason: result.stopReason } : {}),
           failure: succeeded ? null : failure === 'none' ? 'empty-output' : failure,
           stderr: succeeded ? undefined : result.stderr.slice(-2_000),
         });
@@ -1005,6 +1146,7 @@ export async function runAgent(decision, prompt, opts = {}) {
             attempts: attempts.length,
             retried: attempts.length > 1,
             failures: attempts.map((a) => a.failure).filter(Boolean),
+            attemptLog: attemptLog(attempts),
             durationMs: now() - startedAt,
             tokens: usage ? {
               in: totalInputTokens(usage),
@@ -1041,7 +1183,9 @@ export async function runAgent(decision, prompt, opts = {}) {
         }
 
         const providerError = result.stderr.slice(-2_000) || `exit ${result.code}`;
-        lastError = failure === 'schema-rejection'
+        lastError = failure === 'timeout' && result.stopReason
+          ? `${target.provider} stopped: ${result.stopReason}`
+          : failure === 'schema-rejection'
           ? `schema rejected: ${providerError}`
           : failure === 'not-subscription'
             ? `grok refused: ${offSubscription}`
@@ -1067,7 +1211,7 @@ export async function runAgent(decision, prompt, opts = {}) {
         // A timeout is the most expensive failure to repeat and the least
         // likely to come out differently: the same prompt on the same model
         // with the same clock will run out of clock again. Three attempts at
-        // the 20-minute default is an hour spent to learn nothing. Move to the
+        // the 30-minute default is ninety minutes spent to learn nothing. Move to the
         // other vendor, which is a genuinely different attempt, or give up.
         if (failure === 'timeout') break;
         if (attempt + 1 < maxAttempts) await sleep(backoffMs(attempt));
@@ -1086,6 +1230,7 @@ export async function runAgent(decision, prompt, opts = {}) {
       attempts: attempts.length,
       failedOver,
       failures: attempts.map((a) => a.failure).filter(Boolean),
+      attemptLog: attemptLog(attempts),
       durationMs: now() - startedAt,
       error: (lastError ?? 'all providers failed').slice(0, 200),
       node: who.node, project: who.project,

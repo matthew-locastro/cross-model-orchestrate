@@ -15,7 +15,7 @@
 // Before this, answering "did the fan-out balance?" meant grepping session
 // rollout files on both vendors and guessing.
 
-import { appendFile, mkdir, readFile } from 'node:fs/promises';
+import { appendFile, mkdir, open, readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
@@ -43,10 +43,29 @@ export async function record(entry) {
   }
 }
 
-export async function readAudit({ sinceMs = null } = {}) {
+/**
+ * The last `bytes` of a file, starting at a line boundary. Routing reads the
+ * log on every dispatch, and the file is append-only, so it must not cost more
+ * as the months go by.
+ */
+async function readTail(path, bytes) {
+  const handle = await open(path, 'r');
+  try {
+    const { size } = await handle.stat();
+    const start = Math.max(0, size - bytes);
+    const buffer = Buffer.alloc(size - start);
+    await handle.read(buffer, 0, buffer.length, start);
+    const text = buffer.toString('utf8');
+    return start === 0 ? text : text.slice(text.indexOf('\n') + 1);
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function readAudit({ sinceMs = null, tailBytes = null } = {}) {
   let text = '';
   try {
-    text = await readFile(AUDIT_FILE, 'utf8');
+    text = tailBytes > 0 ? await readTail(AUDIT_FILE, tailBytes) : await readFile(AUDIT_FILE, 'utf8');
   } catch {
     return [];
   }

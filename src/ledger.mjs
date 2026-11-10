@@ -48,6 +48,12 @@ const LOCK_WAIT_MS = 3_000;
 /** A reservation older than this is assumed abandoned, even if the pid lives. */
 export const RESERVATION_LEASE_MS = 30 * 60_000;
 
+/**
+ * The longest any reservation may hold headroom, and so the longest any run may
+ * last: the fleet coordinator caps leases here too (server.mjs).
+ */
+export const MAX_LEASE_MS = 6 * 60 * 60_000;
+
 const EMPTY = { probes: {}, reservations: [], samples: {}, lastGood: {} };
 
 function sleep(ms) {
@@ -131,9 +137,16 @@ function processAlive(pid) {
 }
 
 /** Drop reservations whose process is gone or whose lease expired. */
+function leaseOf(r) {
+  const lease = Number(r.leaseMs);
+  return Number.isFinite(lease) && lease > 0 ? Math.min(lease, MAX_LEASE_MS) : RESERVATION_LEASE_MS;
+}
+
 export function gcReservations(reservations, now) {
+  // Each entry's own lease when it has one: a run that may work past its
+  // budget to the watchdog's ceiling holds its headroom that long.
   return reservations.filter(
-    (r) => r && now - r.startedAt < RESERVATION_LEASE_MS && processAlive(r.pid),
+    (r) => r && now - r.startedAt < leaseOf(r) && processAlive(r.pid),
   );
 }
 
@@ -318,7 +331,7 @@ export async function reserve(provider, { label = null, cost = null, leaseMs = n
   await mutate((s) => {
     s.reservations.push({
       id, provider, pid: process.pid, startedAt: now(), cost: points, label,
-      node: who.node, project: who.project,
+      node: who.node, project: who.project, leaseMs: leaseMs ?? RESERVATION_LEASE_MS,
     });
   }, { now });
   // The coordinator cannot test a pid on another box, so the entry carries its
