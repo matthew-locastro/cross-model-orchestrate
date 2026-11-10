@@ -65,7 +65,9 @@ import { delimiter, join } from 'node:path';
 
 import { CACHE_DIR, loadConfig } from './config.mjs';
 import { GROK_METER_SOURCE, probeGrok } from './grok.mjs';
-import { applyCommitted, freshProbe, inFlight, mutate, snapshot } from './ledger.mjs';
+import {
+  applyCommitted, freshProbe, inFlight, lastGoodReading, mutate, rememberGoodReading, snapshot,
+} from './ledger.mjs';
 import { providerPressure } from './pace.mjs';
 
 export { CACHE_DIR };
@@ -771,6 +773,50 @@ async function grokNotProbed() {
 // written atomically, and single-flighted: a hundred concurrent dispatches
 // produce one probe, not a hundred.
 
+function epochMs(t) {
+  if (t == null || t === '') return null;
+  if (typeof t === 'number') return t < 1e12 ? t * 1000 : t;
+  const n = Date.parse(t);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * A meter that failed, without saying the vendor is signed out or missing,
+ * stands on its last good reading for a while, marked `stale`. Otherwise one
+ * flaky account query reads as "headroom unknown" and sends a vendor with most
+ * of its week left to the back of the queue.
+ *
+ * Never across a reset (the old figure would then be wrong in the other
+ * direction), never past `maxAgeMs`, and never over a sign-out or a missing
+ * CLI: those are facts, not gaps. The fresh reading's `auth` always wins, so
+ * grok's subscription check is never answered from the past.
+ */
+export async function holdLastGood(provider, value, { now = Date.now(), maxAgeMs = 30 * 60_000 } = {}) {
+  if (value?.available === true) {
+    if (!value.stale) await rememberGoodReading(provider, value, { now: () => now }).catch(() => {});
+    return value;
+  }
+  if (!maxAgeMs || !value || value.auth?.ok === false || value.installed === false) return value;
+  const last = await lastGoodReading(provider).catch(() => null);
+  if (!last?.value || now - last.storedAt >= maxAgeMs || now < last.storedAt) return value;
+  // A reading that carried a sign-in verdict (grok) stands in only on a fresh
+  // verdict that affirms it: the past never vouches for today's sign-in.
+  if (last.value.auth && value.auth?.ok !== true) return value;
+  const resets = [last.value.nextResetAt, ...(last.value.windows ?? []).map((w) => w.resetsAt)]
+    .map(epochMs).filter((t) => t != null);
+  if (resets.some((t) => t <= now)) return value;
+  return {
+    ...last.value,
+    ...(value.auth ? { auth: value.auth } : {}),
+    stale: {
+      since: new Date(last.storedAt).toISOString(),
+      ageMs: now - last.storedAt,
+      expiresAt: new Date(last.storedAt + maxAgeMs).toISOString(),
+      error: value.error ?? null,
+    },
+  };
+}
+
 /**
  * Read both providers, honouring a SHORT shared freshness window, and fold in
  * headroom this machine has already committed but not yet been billed for.
@@ -789,21 +835,24 @@ export async function readLimits({ refresh = false, now = Date.now(), readers, i
   // Injected readers are a test deciding what the probes say; one that does not
   // mention grok gets an unverified grok rather than a real CLI call.
   const readGrok = readers?.grok ?? (readers ? grokNotProbed : readGrokLimits);
+  const holding = (provider, read) => async () => holdLastGood(provider, await read(), {
+    now, maxAgeMs: cfg.freshness.lastGood ?? 0,
+  });
 
   const [codexProbe, claudeProbe, grokProbe] = await Promise.all([
-    freshProbe('codex', refresh ? -1 : cfg.freshness.codex, readCodex, { now: nowFn }),
+    freshProbe('codex', refresh ? -1 : cfg.freshness.codex, holding('codex', readCodex), { now: nowFn }),
     // A reading taken through the CLI cost a turn rather than a GET, so it is
     // reused for longer. Decided per entry: the same machine can hold either.
     freshProbe('claude', refresh ? -1 : (entry) => (
       entry?.value?.source === CLAUDE_CLI_SOURCE
         ? Math.max(cfg.freshness.claude, cfg.freshness.claudeCli ?? 0)
         : cfg.freshness.claude
-    ), readClaude, { now: nowFn }),
+    ), holding('claude', readClaude), { now: nowFn }),
     // A signed-out grok is re-asked sooner: `grok login` is the fix, and the
     // first dispatch after it should not wait out a minute of stale "no".
     freshProbe('grok', refresh ? -1 : (entry) => (
       entry?.value?.auth?.ok ? cfg.freshness.grok : (cfg.freshness.grokSignedOut ?? cfg.freshness.grok)
-    ), readGrok, { now: nowFn }),
+    ), holding('grok', readGrok), { now: nowFn }),
   ]);
 
   const state = await snapshot({ now: nowFn });
@@ -988,7 +1037,8 @@ export async function recordCodexRateLimits(rl, { now = Date.now() } = {}) {
 export async function markExhausted(provider, { now = Date.now(), resetsAt = null } = {}) {
   let value = null;
   await mutate((st) => {
-    const previous = st.probes[provider]?.value ?? unavailable(provider, 'exhausted');
+    // A stand-in's `stale` mark must not ride along: this is a fresh fact.
+    const { stale: _stale, ...previous } = st.probes[provider]?.value ?? unavailable(provider, 'exhausted');
     value = {
       ...previous,
       available: true,

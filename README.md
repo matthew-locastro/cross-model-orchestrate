@@ -509,6 +509,26 @@ research goes in the dispatch file as `web: true` and lands on a healthy Grok.
 The shim costs ~10–15k Haiku tokens per dispatch, mostly its own prompt —
 trivial against a real agent, absurd against a five-second one.
 
+## Talking to it while it works
+
+Once `/cross-model-orchestrate` is invoked, the chat stays the orchestrator for
+the rest of the session: it plans, dispatches, watches and reports, and every
+piece of real work runs in a background subagent or `cmo run`. The point is that
+you can keep talking — send a correction, a new task or a question at any time —
+without stopping the work. Corrections reach a running agent if it can take
+messages, and otherwise queue for that unit's next stage; a new task that would
+touch files a running agent owns waits behind it.
+
+For a run of notes, say **Start Feedback Batch**, send screenshots and notes one
+at a time (each gets a one-line receipt and nothing else), then **End Feedback
+Batch**. The orchestrator reads the whole batch back, groups the items by the
+files they touch, asks once about anything that blocks, and sends one work
+package per group to subagents in parallel, each item with a check that proves
+it done. As packages land, a reviewer on another vendor checks every item and
+you get a per-item report. Batches are kept on disk under
+`~/.cache/cross-model-orchestrate/feedback/`, so a long one survives a context
+reset.
+
 ## What's portable and what isn't
 
 | | Claude Code | Codex / Kilo / OpenCode |

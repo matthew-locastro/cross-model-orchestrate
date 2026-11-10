@@ -186,6 +186,50 @@ test('a sign-out is one machine\'s: it outranks the fleet there and is never pub
   });
 });
 
+test('a stand-in reading stays on its box: never published over the fleet', async () => {
+  await withCoordinator(async (url) => {
+    const auth = `{ ok: true, method: 'oauth', authMode: 'Oidc' }`;
+    // Box A knew grok at 6%, then its meter errored: it stands on the 6%.
+    const a = JSON.parse(await box(url, 'mac-a', `
+      import { freshProbe } from '${SRC}ledger.mjs';
+      import { holdLastGood } from '${SRC}limits.mjs';
+      const now = Date.now();
+      await holdLastGood('grok', { available: true, worstPercent: 6, windows: [], auth: ${auth} }, { now: now - 60000 });
+      const r = await freshProbe('grok', 60000, async () => holdLastGood('grok',
+        { available: false, windows: [], error: 'Internal error', auth: ${auth} }, { now }));
+      console.log(JSON.stringify({ stale: Boolean(r.value.stale), pct: r.value.worstPercent }));
+    `));
+    assert.deepEqual(a, { stale: true, pct: 6 });
+    // Box B must take its own reading, not inherit A's guess as a fresh one.
+    const b = JSON.parse(await box(url, 'mac-b', `
+      import { freshProbe } from '${SRC}ledger.mjs';
+      let probed = 0;
+      const r = await freshProbe('grok', 60000, async () => { probed++; return { available: true, worstPercent: 80, windows: [] }; });
+      console.log(JSON.stringify({ probed, pct: r.value.worstPercent }));
+    `));
+    assert.deepEqual(b, { probed: 1, pct: 80 });
+  });
+});
+
+test('a genuine fleet reading also becomes this box\'s last good one', async () => {
+  await withCoordinator(async (url) => {
+    await box(url, 'mac-a', `
+      import { freshProbe } from '${SRC}ledger.mjs';
+      await freshProbe('grok', 60000, async () => ({ available: true, worstPercent: 80, windows: [] }));
+      console.log('ok');
+    `);
+    const b = JSON.parse(await box(url, 'mac-b', `
+      import { freshProbe, lastGoodReading } from '${SRC}ledger.mjs';
+      import { holdLastGood } from '${SRC}limits.mjs';
+      await holdLastGood('grok', { available: true, worstPercent: 6, windows: [] }, { now: Date.now() - 120000 });
+      const r = await freshProbe('grok', 60000, async () => { throw new Error('should use the fleet'); });
+      const last = await lastGoodReading('grok');
+      console.log(JSON.stringify({ from: r.from ?? null, last: last.value.worstPercent }));
+    `));
+    assert.deepEqual(b, { from: 'mac-a', last: 80 });
+  });
+});
+
 test('cost samples are pooled — the fleet learns from every box', async () => {
   await withCoordinator(async (url) => {
     await box(url, 'vps-a', `

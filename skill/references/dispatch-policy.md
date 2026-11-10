@@ -157,6 +157,12 @@ Bands of pressure, as defined above.
 | exhausted | ≥95% or hard-blocked | not a candidate at all |
 | unknown | probe failed | treated as usable — a broken meter never stops a run |
 
+A meter that errors without saying the vendor is signed out (xAI's usage query
+answers "Internal error" now and then) stands on its last good reading, marked
+`stale`, for up to `freshness.lastGood` (30 minutes), never across a window
+reset and never published to a fleet coordinator. The fresh reading's sign-in
+verdict always wins, so an old reading never vouches for Grok's subscription.
+
 ## Token-efficiency corrections
 
 Applied after the weighted tier. Each one appears in the decision's `notes`.

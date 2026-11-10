@@ -76,6 +76,11 @@ export const DEFAULT_FRESHNESS = {
   claudeCli: 120_000, // read through the CLI instead (macOS): a small turn, not a GET
   grok: 60_000, // two RPCs to a short-lived `grok agent stdio` — no inference, ~3s
   grokSignedOut: 15_000, // a signed-out reading is re-checked soon: logging in fixes it
+  // A meter that errors (xAI's usage query answers "Internal error" now and
+  // then) falls back to the last good reading for this long, as long as no
+  // window has reset since. Usage only grows within a window, so the stand-in
+  // can only understate it, by what was spent in that time. 0 turns it off.
+  lastGood: 30 * 60_000,
 };
 
 /**

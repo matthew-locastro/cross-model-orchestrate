@@ -89,7 +89,10 @@ function renderLimits(limits, now = Date.now()) {
       ? (p.auth.ok ? `auth=${p.auth.authMode ?? p.auth.method} ` : `NOT ROUTABLE: ${p.auth.reason} `)
       : '';
     const why = p.available || (provider === 'grok' && p.auth && !p.auth.ok) ? '' : `unavailable: ${p.error}`;
-    lines.push(`${provider.padEnd(7)} ${s.state.padEnd(9)} ${headline}${p.plan ? `plan=${p.plan} ` : ''}${auth}${via}${why}`);
+    const stale = p.stale
+      ? `last good reading ${Math.max(1, Math.round((now - (Date.parse(p.stale.since) || now)) / 60_000))}m ago${p.stale.error ? ` (meter: ${p.stale.error})` : ''} `
+      : '';
+    lines.push(`${provider.padEnd(7)} ${s.state.padEnd(9)} ${headline}${p.plan ? `plan=${p.plan} ` : ''}${auth}${via}${stale}${why}`);
     for (const w of p.windows ?? []) {
       const reset = w.resetsAt ? ` resets ${w.resetsAt.replace('T', ' ').slice(0, 16)}Z` : '';
       lines.push(`        ${w.label.padEnd(6)} ${bar(w.percentUsed)}${reset}`);

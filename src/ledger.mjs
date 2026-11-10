@@ -48,7 +48,7 @@ const LOCK_WAIT_MS = 3_000;
 /** A reservation older than this is assumed abandoned, even if the pid lives. */
 export const RESERVATION_LEASE_MS = 30 * 60_000;
 
-const EMPTY = { probes: {}, reservations: [], samples: {} };
+const EMPTY = { probes: {}, reservations: [], samples: {}, lastGood: {} };
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -101,6 +101,7 @@ async function readState() {
       probes: parsed.probes ?? {},
       reservations: Array.isArray(parsed.reservations) ? parsed.reservations : [],
       samples: parsed.samples ?? {},
+      lastGood: parsed.lastGood ?? {},
     };
   } catch {
     return structuredClone(EMPTY);
@@ -137,6 +138,31 @@ export function gcReservations(reservations, now) {
 }
 
 /**
+ * Every write to `probes` (a meter read, a post-dispatch refresh, a rate-limit
+ * error marking a vendor spent) also moves `lastGood` to it, so a meter that
+ * fails later can never stand on anything older than the newest thing this
+ * machine knew — an exhaustion included. Tied to the write itself, not to
+ * timestamps: the write is the newest fact, even on an equal clock.
+ */
+function syncLastGood(state, before) {
+  for (const [provider, entry] of Object.entries(state.probes ?? {})) {
+    if (entry === before[provider]) continue;
+    if (entry?.value?.available !== true || entry.value.stale) continue;
+    state.lastGood[provider] = { storedAt: entry.storedAt, value: entry.value };
+  }
+}
+
+/**
+ * A stand-in reading (see holdLastGood) is never served past its own expiry,
+ * and one without a readable expiry is treated as expired: fail closed.
+ */
+function staleExpired(entry, nowMs) {
+  if (!entry?.value?.stale) return false;
+  const t = Date.parse(entry.value.stale.expiresAt ?? '');
+  return !Number.isFinite(t) || nowMs >= t;
+}
+
+/**
  * Run `fn(state)` under the lock and persist whatever it returns.
  * If the lock cannot be taken we still proceed — a contended lock must degrade
  * to a possible lost update, never to a stalled dispatch.
@@ -146,7 +172,9 @@ export async function mutate(fn, { now = Date.now } = {}) {
   try {
     const state = await readState();
     state.reservations = gcReservations(state.reservations, now());
+    const before = { ...state.probes };
     const result = await fn(state);
+    syncLastGood(state, before);
     await writeState(state);
     return result;
   } finally {
@@ -209,7 +237,8 @@ export async function freshProbe(provider, maxAgeMs, read, { now = Date.now } = 
 
   const local = await readState();
   const localEntry = local.probes?.[provider];
-  const localFresh = Boolean(localEntry) && now() - localEntry.storedAt < maxAge(localEntry);
+  const localFresh = Boolean(localEntry) && now() - localEntry.storedAt < maxAge(localEntry)
+    && !staleExpired(localEntry, now());
   // The windows are per-subscription, but a sign-in is per machine. This box's
   // own word that its CLI is signed out outranks another box's healthy
   // reading — that box can run the vendor, this one cannot — and it is never
@@ -222,7 +251,13 @@ export async function freshProbe(provider, maxAgeMs, read, { now = Date.now } = 
   if (fleet && !signedOutHere) {
     const remote = await remoteState();
     const entry = remote?.probes?.[provider];
-    if (entry && now() - entry.storedAt < maxAge(entry)) {
+    if (entry && now() - entry.storedAt < maxAge(entry) && !staleExpired(entry, now())) {
+      // Keep the fleet's genuine reading here too, so a coordinator outage
+      // followed by a meter error stands on it, not on an older local one.
+      const known = local.lastGood?.[provider];
+      if (entry.value?.available === true && !entry.value.stale && (!known || known.storedAt < entry.storedAt)) {
+        await rememberGoodReading(provider, entry.value, { now, storedAt: entry.storedAt }).catch(() => {});
+      }
       return { value: entry.value, cached: true, from: entry.node ?? 'fleet' };
     }
   }
@@ -238,8 +273,28 @@ export async function freshProbe(provider, maxAgeMs, read, { now = Date.now } = 
     const current = s.probes[provider];
     if (!current || current.storedAt < storedAt) s.probes[provider] = { storedAt, value };
   }, { now });
-  if (fleet && !isMachineLocal(value)) await remoteProbe(provider, value, storedAt);
+  // A stand-in is this box's guess from an older reading: publishing it with
+  // today's timestamp would overwrite a genuine newer reading fleet-wide.
+  if (fleet && !isMachineLocal(value) && !value?.stale) await remoteProbe(provider, value, storedAt);
   return { value, cached: false };
+}
+
+// ── last good reading ─────────────────────────────────────────────────────
+
+/**
+ * The newest reading of `provider` that had numbers in it, kept on this
+ * machine so a meter that fails for a minute does not erase what was known.
+ * See `holdLastGood` in limits.mjs for when it is allowed to stand in.
+ */
+export async function rememberGoodReading(provider, value, { now = Date.now, storedAt = now() } = {}) {
+  await mutate((s) => {
+    const current = s.lastGood[provider];
+    if (!current || current.storedAt <= storedAt) s.lastGood[provider] = { storedAt, value };
+  }, { now });
+}
+
+export async function lastGoodReading(provider) {
+  return (await readState()).lastGood?.[provider] ?? null;
 }
 
 // ── reservations ──────────────────────────────────────────────────────────
