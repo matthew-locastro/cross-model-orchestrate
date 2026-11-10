@@ -1,6 +1,6 @@
 {
   "name": "cross-model-orchestrate",
-  "version": "0.1.28",
+  "version": "0.1.29",
   "description": "Run agent fan-outs across your AI subscriptions at once (Claude, Codex and optionally Grok): pick each subagent's model by complexity, length and token efficiency against live usage limits, power-use whichever subscription is least used, keep Claude's window in reserve for the orchestrator, and always grade work on a vendor that did not produce it.",
   "type": "module",
   "bin": {
