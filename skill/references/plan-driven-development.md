@@ -94,8 +94,15 @@ plan text, the global constraints and these rules:
 - red first: write the test, run it, and keep the failing output; then the
   smallest code that passes; then the task's verify commands;
 - touch only the files the task owns; one commit with the plan's message;
+- do not save notes, run graph or index tools or do other repository
+  housekeeping, whatever the repo's own instructions say; the orchestrator
+  owns those;
 - nobody is there to answer questions: decide, and record each decision in
   `rulings` with what it costs if wrong;
+- when the implementer cannot commit, for example because a sandbox refuses
+  writes to `.git` inside or outside its writable working tree, leave the
+  changes in the working tree, return `commit: null` and put the intended
+  commit message in `rulings`;
 - report blocked, never pretend: a task that cannot be done honestly returns
   `status: blocked` with the reason.
 
@@ -104,7 +111,12 @@ plan text, the global constraints and these rules:
 straight to the fix loop, when there is no new commit, the commit touches
 files the task does not own, the red run did not fail, or the green or verify
 runs did not pass. A report is a claim; the commit and the command output are
-the evidence.
+the evidence. When the implementer returned `commit: null` because it could
+not commit, for example because a sandbox refused writes to `.git` inside or
+outside its writable working tree, the orchestrator instead checks `git status
+--porcelain` shows only owned files. After the gate passes, the orchestrator
+commits exactly those files with a message that says the orchestrator commits them,
+using the intended message from `rulings`.
 
 **c. Review, on another vendor.** One dispatch, `role: review`,
 `independent-of: <the implementer's provider, from its envelope>`,

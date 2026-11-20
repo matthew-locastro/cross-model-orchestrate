@@ -49,6 +49,7 @@ test('plan-driven development is reachable from the skill and keeps every review
   assert.match(pattern, /each review file is written \*\*after\*\* its implement or fix dispatch returns/);
   assert.match(pattern, /After \*\*three\*\* rounds the task is parked/);
   assert.match(pattern, /A red baseline\s+stops the run/);
+  assert.match(pattern, /the orchestrator commits/);
   // Credit where the method came from.
   assert.match(pattern, /obra\/superpowers/);
   assert.match(pattern, /MIT, © 2025 Jesse\s+Vincent/);
@@ -63,6 +64,12 @@ test('every review template names the vendor to avoid and none spends a write ti
     assert.doesNotMatch(block, /write: true/);
     assert.match(block, /task-verdict\.json/);
   }
+});
+
+test('implement and review templates leave repository housekeeping to the orchestrator', () => {
+  const templates = REF('plan-driven-templates.md');
+  const dispatched = templates.split('```text').filter((block) => /role: implement|role: review/.test(block));
+  for (const block of dispatched) assert.match(block, /housekeeping/);
 });
 
 test('the report and verdict schemas are strict objects the script can branch on', () => {

@@ -60,10 +60,16 @@ Rules:
    It must fail for the reason the task names; if it passes, the test is wrong.
 2. Write the smallest code that makes it pass. Run `<test command>`.
 3. Run every verify command.
-4. Touch only: <owned files>. One commit: "<message>".
+4. Touch only: <owned files>. Commit "<message>" when you can. If the
+   implementer cannot commit, for example because a sandbox refuses writes to
+   `.git` inside or outside its writable working tree, leave the changes in the
+   working tree, return commit null and put the intended message in rulings; the
+   orchestrator commits the owned files after its gate.
 5. Decide anything the plan leaves open and record it in rulings with what it
    costs if wrong. If the task cannot be done honestly, return status "blocked"
    with the reason rather than a partial or faked result.
+6. Do not save notes, run graph or index tools or do other repository
+   housekeeping. The orchestrator owns it, whatever the repo instructions say.
 Return the report object. Paste command output verbatim; never summarise a
 failure as a pass.
 ```
@@ -94,6 +100,8 @@ Read, in this order:
 3. Evidence: confirm the commit exists and is the diff's head; list any file
    changed outside <owned files>; re-run `<verify commands>` and record each
    exit code.
+Do not save notes, run graph or index tools or do other repository
+housekeeping. The orchestrator owns it, whatever the repo instructions say.
 Do not edit, stage, commit or delete anything. Run `git status --porcelain`
 last and set tree_clean_after_review from it (build output the commands write
 to ignored paths is fine).
@@ -121,7 +129,8 @@ Findings:
 
 Same rules as the task: a failing test first where a finding is a behaviour
 bug, owned files only, one commit "fix(T<n>): round <n> review findings",
-verbatim command output in the report.
+verbatim command output in the report. Do not do repository housekeeping; the
+orchestrator owns it.
 ```
 
 ## Re-review
@@ -153,5 +162,7 @@ diff <base>..<head> at <path>.
    code, dead code, tests that only test mocks.
 3. Run the full suite: `<command>`. Record the exit code and the pass, fail
    and skip counts.
+Do not save notes, run graph or index tools or do other repository
+housekeeping. The orchestrator owns it, whatever the repo instructions say.
 Do not edit anything. Same approve rule as a task review.
 ```
