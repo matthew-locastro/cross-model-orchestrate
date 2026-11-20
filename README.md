@@ -544,6 +544,18 @@ you get a per-item report. Batches are kept on disk under
 `~/.cache/cross-model-orchestrate/feedback/`, so a long one survives a context
 reset.
 
+## Building a feature from a plan
+
+Ask for a feature or a fix against a spec and the orchestrator runs it as
+**plan-driven development**: a written plan of small tasks, each built
+test-first by one dispatch, gated on its commit and command output, reviewed
+by a dispatch on a vendor that did not write it, fixed in at most three
+rounds, then a whole-branch review against the spec. Implementers return a
+typed report and reviewers a typed verdict
+(`skill/references/schemas/`), so a run branches on fields, not prose. The
+pattern is in `skill/references/plan-driven-development.md`, with templates
+beside it.
+
 ## What's portable and what isn't
 
 | | Claude Code | Codex / Kilo / OpenCode |
@@ -733,3 +745,14 @@ the tag and `package.json` disagree.
 ## License
 
 MIT.
+
+## Acknowledgements
+
+The plan-driven pattern (the plan format, the per-task implement and review
+loop, red-green test evidence, "no evidence, no done" and how review findings
+are acted on) is adapted from the `subagent-driven-development`,
+`writing-plans`, `test-driven-development`, `verification-before-completion` and
+`receiving-code-review` skills in
+[obra/superpowers](https://github.com/obra/superpowers), MIT licensed,
+copyright (c) 2025 Jesse Vincent. The text here is rewritten for cross-vendor
+dispatch rather than copied.

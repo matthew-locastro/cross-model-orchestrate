@@ -36,3 +36,56 @@ test('a feedback batch collects until End, then packages by file and checks ever
 test('nothing from one user\'s projects leaks into the public skill', () => {
   assert.doesNotMatch(SKILL, /\b(SYH|syhclub|yacht|superyacht)\b/i);
 });
+
+const REF = (name) => readFileSync(new URL(`../skill/references/${name}`, import.meta.url), 'utf8');
+
+test('plan-driven development is reachable from the skill and keeps every review cross-vendor', () => {
+  assert.match(SKILL, /### Plan-driven development/);
+  assert.match(SKILL, /references\/plan-driven-development\.md/);
+  assert.match(SKILL, /a feature or fix against an agreed spec \| plan-driven development/);
+  assert.match(SKILL, /- No evidence, no "done"\./);
+  const pattern = REF('plan-driven-development.md');
+  assert.match(pattern, /independent-of: <the implementer's provider, from its envelope>/);
+  assert.match(pattern, /each review file is written \*\*after\*\* its implement or fix dispatch returns/);
+  assert.match(pattern, /After \*\*three\*\* rounds the task is parked/);
+  assert.match(pattern, /A red baseline\s+stops the run/);
+  // Credit where the method came from.
+  assert.match(pattern, /obra\/superpowers/);
+  assert.match(pattern, /MIT, © 2025 Jesse\s+Vincent/);
+});
+
+test('every review template names the vendor to avoid and none spends a write tier', () => {
+  const templates = REF('plan-driven-templates.md');
+  const reviews = templates.split('```text').filter((block) => /role: review/.test(block));
+  assert.equal(reviews.length, 2);
+  for (const block of reviews) {
+    assert.match(block, /independent-of: </);
+    assert.doesNotMatch(block, /write: true/);
+    assert.match(block, /task-verdict\.json/);
+  }
+});
+
+test('the report and verdict schemas are strict objects the script can branch on', () => {
+  const strict = (node, path) => {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'object' || (Array.isArray(node.type) && node.type.includes('object'))) {
+      assert.equal(node.additionalProperties, false, `${path} is closed`);
+      assert.deepEqual([...node.required].sort(), Object.keys(node.properties).sort(), `${path} requires every property`);
+    }
+    for (const [key, child] of Object.entries(node.properties ?? {})) strict(child, `${path}.${key}`);
+    if (node.items) strict(node.items, `${path}[]`);
+  };
+  for (const name of ['implementer-report.json', 'task-verdict.json']) {
+    const schema = JSON.parse(REF(`schemas/${name}`));
+    strict(schema, name);
+  }
+  const verdict = JSON.parse(REF('schemas/task-verdict.json'));
+  assert.deepEqual(verdict.properties.quality.properties.findings.items.properties.severity.enum, ['critical', 'important', 'minor']);
+  assert.ok(verdict.properties.evidence.properties.tree_clean_after_review);
+});
+
+test('nothing from one user\'s projects leaks into the public references', () => {
+  for (const name of ['plan-driven-development.md', 'plan-driven-templates.md', 'schemas/implementer-report.json', 'schemas/task-verdict.json']) {
+    assert.doesNotMatch(REF(name), /\b(SYH|syhclub|yacht|superyacht)\b/i, name);
+  }
+});

@@ -1,0 +1,66 @@
+{
+  "$comment": "What a task, re-review or final review dispatch returns in the plan-driven pattern (references/plan-driven-development.md). approve is true only when both verdicts pass and no critical or important finding is open.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task", "spec", "quality", "evidence", "approve"],
+  "properties": {
+    "task": { "type": "string", "description": "The task id, or \"final\" for the whole-branch review." },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "missing", "extra"],
+      "properties": {
+        "verdict": { "type": "string", "enum": ["pass", "fail"] },
+        "missing": { "type": "array", "items": { "type": "string" }, "description": "Required by the brief or spec, not done." },
+        "extra": { "type": "array", "items": { "type": "string" }, "description": "Done, but not asked for." }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "findings"],
+      "properties": {
+        "verdict": { "type": "string", "enum": ["pass", "fail"] },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["severity", "file", "line", "issue", "fix"],
+            "properties": {
+              "severity": { "type": "string", "enum": ["critical", "important", "minor"] },
+              "file": { "type": "string" },
+              "line": { "type": ["integer", "null"] },
+              "issue": { "type": "string" },
+              "fix": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit_present", "files_outside_scope", "commands", "tree_clean_after_review"],
+      "properties": {
+        "commit_present": { "type": "boolean", "description": "The commit the report names exists and is in the diff under review." },
+        "files_outside_scope": { "type": "array", "items": { "type": "string" } },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["command", "exit_code", "summary"],
+            "properties": {
+              "command": { "type": "string" },
+              "exit_code": { "type": "integer" },
+              "summary": { "type": "string" }
+            }
+          }
+        },
+        "tree_clean_after_review": { "type": "boolean" }
+      }
+    },
+    "approve": { "type": "boolean" }
+  }
+}

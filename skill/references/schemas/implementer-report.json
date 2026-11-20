@@ -1,0 +1,52 @@
+{
+  "$comment": "What an implement or fix dispatch returns in the plan-driven pattern (references/plan-driven-development.md). A report is a claim; the commit and the command output are the evidence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task", "status", "commit", "files_changed", "red", "green", "verify", "rulings", "concerns"],
+  "properties": {
+    "task": { "type": "string", "description": "The task id from the plan." },
+    "status": { "type": "string", "enum": ["done", "blocked"] },
+    "commit": { "type": ["string", "null"], "description": "The full SHA of the task's commit; null when blocked." },
+    "files_changed": { "type": "array", "items": { "type": "string" } },
+    "red": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "exit_code", "failed_as_expected", "excerpt"],
+      "properties": {
+        "command": { "type": "string" },
+        "exit_code": { "type": "integer" },
+        "failed_as_expected": { "type": "boolean", "description": "It failed, and for the reason the task names." },
+        "excerpt": { "type": "string", "description": "The failing assertion or error, verbatim, at most 40 lines." }
+      }
+    },
+    "green": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "exit_code", "excerpt"],
+      "properties": {
+        "command": { "type": "string" },
+        "exit_code": { "type": "integer" },
+        "excerpt": { "type": "string", "description": "The summary lines (pass and fail counts), verbatim." }
+      }
+    },
+    "verify": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "exit_code", "excerpt"],
+        "properties": {
+          "command": { "type": "string" },
+          "exit_code": { "type": "integer" },
+          "excerpt": { "type": "string" }
+        }
+      }
+    },
+    "rulings": {
+      "type": "array",
+      "description": "Each decision made without asking: what was decided, why, and what it costs if wrong.",
+      "items": { "type": "string" }
+    },
+    "concerns": { "type": "array", "items": { "type": "string" } }
+  }
+}

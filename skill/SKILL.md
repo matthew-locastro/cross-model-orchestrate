@@ -289,6 +289,7 @@ Do not fan out when:
 | one bounded change | one background `cmo run --dispatch`; no workflow script |
 | shape unknown — the task list has to be discovered | a background scout discovers and writes the list, then come back |
 | under about a dozen independent units | background dispatches, one per unit; a workflow script starts paying around a dozen |
+| a feature or fix against an agreed spec | plan-driven development: a queue with a cross-vendor judge per task (below) |
 
 Say which one and why. The shape decides the form of the delegation, never
 whether to delegate: this chat does not take the work on itself. The two
@@ -296,6 +297,18 @@ compose: scout with a loop, fan out with a script.
 
 Otherwise state the fan in one line — *N independent units × K attempts, judged
 by an independent grader* — and continue.
+
+### Plan-driven development
+
+Building a feature or fixing a bug is a queue with a judge per task: a written
+plan of small tasks, each built test-first by one dispatch, gated on its commit
+and command output, reviewed by a dispatch on another vendor, fixed in at most
+three rounds, then one whole-branch review against the spec. Read
+`references/plan-driven-development.md` before writing the plan, and use
+`references/plan-driven-templates.md` and `references/schemas/` for the plan,
+the dispatch files and the typed report and verdict. The pattern is adapted
+from obra/superpowers; what this skill adds is that every step routes through
+`cmo` and no task is judged by the vendor that wrote it.
 
 ## 2 — Dispatch: analyse every subagent before you spawn it
 
@@ -571,6 +584,9 @@ not.
 - This chat does no product work. Every change, research pass, build and review
   runs in a background subagent or dispatch, so the user can keep talking.
 - Never act on a feedback-batch item before End Feedback Batch.
+- No evidence, no "done". Nobody in the run claims tests pass, a build works,
+  a bug is fixed or an agent finished without the output that proves it,
+  produced after the last change: a commit and its diff, not an agent's report.
 
 ## Required output before you start work
 
