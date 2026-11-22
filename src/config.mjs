@@ -27,12 +27,15 @@ export const CACHE_DIR = process.env.CMO_CACHE_DIR
 export const TIERS = ['fast', 'balanced', 'frontier'];
 
 /**
- * Every vendor cmo can dispatch to, in tie-break order. Grok is last: it joined
- * after the other two, and its headroom comes from a CLI agent call rather than
- * a free local read, so it should win on merit (headroom, web access) rather
- * than on a coin toss.
+ * Every vendor cmo knows how to dispatch to, in tie-break order. This static
+ * list is also used for parsing and reports. Routing uses activeProviders(), so
+ * a known vendor can remain available without joining the default roster.
  */
-export const PROVIDERS = ['codex', 'claude', 'grok'];
+export const PROVIDERS = ['codex', 'claude', 'antigravity', 'grok'];
+const DEFAULT_ACTIVE_PROVIDERS = ['codex', 'claude', 'antigravity'];
+
+/** Antigravity is pinned to Gemini so it remains an independent vendor. */
+export const ANTIGRAVITY_MODEL_RE = /^gemini-[a-z0-9.-]+$/;
 
 /**
  * Defaults as of codex-cli 0.149, Claude Code 2.1 and Grok Build 1.0.50.
@@ -55,6 +58,12 @@ export const DEFAULT_MODELS = {
     frontier: { model: 'opus', effort: 'high' },
     balanced: { model: 'sonnet', effort: 'medium' },
     fast: { model: 'haiku', effort: 'low' },
+  },
+  // Provisional until outcome data confirms the tier ordering in practice.
+  antigravity: {
+    frontier: { model: 'gemini-4-neon', effort: 'xhigh' },
+    balanced: { model: 'gemini-4-carbon', effort: 'high' },
+    fast: { model: 'gemini-4-hydrogen', effort: 'low' },
   },
   grok: {
     frontier: { model: 'grok-4.7', effort: 'high' },
@@ -88,6 +97,7 @@ export const DEFAULT_FRESHNESS = {
   codex: 10_000, // a local file read — effectively free, so keep it tight
   claude: 45_000, // a network call, shared across every process on this machine
   claudeCli: 120_000, // read through the CLI instead (macOS): a small turn, not a GET
+  antigravity: 60_000, // a no-inference /usage request to the subscription backend
   grok: 60_000, // two RPCs to a short-lived `grok agent stdio` — no inference, ~3s
   grokSignedOut: 15_000, // a signed-out reading is re-checked soon: logging in fixes it
   // A meter that errors (xAI's usage query answers "Internal error" now and
@@ -106,7 +116,13 @@ export const DEFAULT_FRESHNESS = {
  * work cached, underestimating makes it discover the limit by being killed.
  * Replaced by a measured median once there is enough evidence.
  */
-export const DEFAULT_RESERVATION = { default: 1.0, codex: 1.0, claude: 1.0, grok: 1.0 };
+export const DEFAULT_RESERVATION = {
+  default: 1.0,
+  codex: 1.0,
+  claude: 1.0,
+  antigravity: 1.0,
+  grok: 1.0,
+};
 
 /** Headroom bands, in percent of a rolling window consumed. */
 export const DEFAULT_PRESSURE = {
@@ -158,15 +174,12 @@ export const DEFAULT_ORCHESTRATOR = {
 /**
  * What a vendor is better placed to do than the others, in points of score.
  *
- * Grok runs unsandboxed on this machine with live web search and fetch, so it
- * can open a URL and see what is there. Codex's sandbox has no network at all
- * (no DNS), so a Codex agent asked to verify links guesses them instead — which
- * reads exactly like having checked. Research and link verification therefore
- * lean to Grok. 25 points wins those roles while Grok is healthy and no other
- * subscription is differentially idle; a tight window, or a power-use gap on
- * someone else, still takes the work away.
+ * Web-capable vendors can open a URL and see what is there. Codex's sandbox has
+ * no network, so research and link verification lean to Antigravity or Grok.
+ * A tight window or a power-use gap on someone else still takes the work away.
  */
 export const DEFAULT_AFFINITY = {
+  antigravity: { roles: ['research'], web: true, points: 25 },
   grok: { roles: ['research'], web: true, points: 25 },
 };
 
@@ -234,6 +247,16 @@ export function resolveGrokBinary(env = process.env, home = homedir()) {
   return executable(installed) ? installed : 'grok';
 }
 
+/** Find Antigravity on PATH first, then in its user-local install location. */
+export function resolveAgyBinary(env = process.env, home = homedir()) {
+  if (env.CMO_AGY_BIN) return env.CMO_AGY_BIN;
+  for (const dir of (env.PATH ?? '').split(delimiter)) {
+    if (dir && executable(join(dir, 'agy'))) return 'agy';
+  }
+  const installed = join(home, '.local', 'bin', 'agy');
+  return executable(installed) ? installed : 'agy';
+}
+
 let cached = null;
 
 /** Resolved configuration: defaults, then the config file, then the env. */
@@ -241,6 +264,9 @@ export function loadConfig({ file = CONFIG_FILE, reload = false } = {}) {
   if (cached && !reload) return cached;
   const fromFile = readConfigFile(file);
   cached = {
+    providers: Array.isArray(fromFile.providers)
+      ? fromFile.providers
+      : [...DEFAULT_ACTIVE_PROVIDERS],
     models: mergeModels(DEFAULT_MODELS, fromFile.models, envModelOverrides()),
     pressure: { ...DEFAULT_PRESSURE, ...(fromFile.pressure ?? {}) },
     freshness: { ...DEFAULT_FRESHNESS, ...(fromFile.freshness ?? {}) },
@@ -292,10 +318,23 @@ export function loadConfig({ file = CONFIG_FILE, reload = false } = {}) {
     grokProbe: process.env.CMO_GROK_PROBE !== undefined
       ? !/^(0|false|no|off)$/i.test(process.env.CMO_GROK_PROBE)
       : fromFile.grokProbe !== false,
+    // Antigravity's meter is free of inference but still starts the real CLI.
+    agyBinary: process.env.CMO_AGY_BIN ?? fromFile.agyBinary ?? resolveAgyBinary(),
+    agyProbe: process.env.CMO_AGY_PROBE !== undefined
+      ? !/^(0|false|no|off)$/i.test(process.env.CMO_AGY_PROBE)
+      : fromFile.agyProbe !== false,
     configFile: file,
     configFileFound: Object.keys(fromFile).length > 0,
   };
   return cached;
+}
+
+/** The known providers configured to participate in routing, in config order. */
+export function activeProviders(config = loadConfig()) {
+  const configured = Array.isArray(config?.providers)
+    ? config.providers
+    : DEFAULT_ACTIVE_PROVIDERS;
+  return configured.filter((provider) => PROVIDERS.includes(provider));
 }
 
 export function resetConfigCache() {

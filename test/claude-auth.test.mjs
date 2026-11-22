@@ -3,6 +3,9 @@
 // with session ids and timestamps removed.
 
 import './isolate.mjs'; // MUST be first — see the file
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -13,6 +16,7 @@ import { decide, providerState } from '../src/policy.mjs';
 import { classifyFailure, parseClaudeStdout, runAgent } from '../src/run.mjs';
 import { snapshot } from '../src/ledger.mjs';
 import { grokAuthFrom } from '../src/grok.mjs';
+import { loadConfig, resetConfigCache } from '../src/config.mjs';
 
 const REASON = 'Failed to authenticate: OAuth session expired and could not be refreshed';
 
@@ -48,6 +52,20 @@ const SIGNED_OUT = {
   available: false, provider: 'claude', windows: [],
   auth: { ok: false, method: 'none', reason: 'the claude CLI is signed out' },
 };
+
+function withGrok(body) {
+  const dir = mkdtempSync(join(tmpdir(), 'cmo-claude-grok-'));
+  const file = join(dir, 'config.json');
+  writeFileSync(file, JSON.stringify({ providers: ['codex', 'claude', 'grok'] }), 'utf8');
+  try {
+    resetConfigCache();
+    loadConfig({ file, reload: true });
+    return body();
+  } finally {
+    resetConfigCache();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 test('the CLI\'s own words are read out of a signed-out turn', () => {
   assert.equal(parseClaudeAuthFailure(PROBE_SIGNED_OUT), REASON);
@@ -113,16 +131,18 @@ test('work pinned to a signed-out claude defers instead of failing on auth', () 
 });
 
 test('cross-vendor review of codex work skips a signed-out claude', () => {
-  const grok = {
-    ...HEALTHY, provider: 'grok',
-    auth: grokAuthFrom({ authenticated: true, meta: { auth_mode: 'Oidc', subscription_tier: 'SuperGrok Plus', backend_billed: false } }),
-  };
-  const d = decide(
-    { role: 'review', complexity: 3, length: 's', independentOf: 'codex' },
-    { codex: HEALTHY, claude: SIGNED_OUT, grok },
-  );
-  assert.equal(d.provider, 'grok');
-  assert.ok(!d.fallbacks.some((f) => f.provider === 'claude'));
+  withGrok(() => {
+    const grok = {
+      ...HEALTHY, provider: 'grok',
+      auth: grokAuthFrom({ authenticated: true, meta: { auth_mode: 'Oidc', subscription_tier: 'SuperGrok Plus', backend_billed: false } }),
+    };
+    const d = decide(
+      { role: 'review', complexity: 3, length: 's', independentOf: 'codex' },
+      { codex: HEALTHY, claude: SIGNED_OUT, grok },
+    );
+    assert.equal(d.provider, 'grok');
+    assert.ok(!d.fallbacks.some((f) => f.provider === 'claude'));
+  });
 });
 
 test('a failed claude run is a diagnosis, never an answer', () => {

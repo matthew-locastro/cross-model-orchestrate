@@ -43,7 +43,11 @@ function withConfig(contents, body) {
   }
 }
 
-test('grok 6, codex 67, claude 60: implement power-uses grok and reserves claude', () => {
+function testWithGrok(name, body) {
+  test(name, () => withConfig({ providers: ['codex', 'claude', 'grok'] }, body));
+}
+
+testWithGrok('grok 6, codex 67, claude 60: implement power-uses grok and reserves claude', () => {
   const d = decide({ role: 'implement', complexity: 4, length: 'l' }, limits(67, 60, 6));
   assert.equal(d.provider, 'grok');
   assert.match(d.reason, /power-use: grok is 61 points less used than codex/);
@@ -56,21 +60,21 @@ test('grok 6, codex 67, claude 60: implement power-uses grok and reserves claude
   );
 });
 
-test('codex 10, grok 50, claude 30: implement power-uses codex', () => {
+testWithGrok('codex 10, grok 50, claude 30: implement power-uses codex', () => {
   const d = decide({ role: 'implement', complexity: 3, length: 'm' }, limits(10, 30, 50));
   assert.equal(d.provider, 'codex');
   assert.match(d.reason, /power-use: codex is 20 points less used than claude/);
   assert.equal(d.notes.some((n) => /reserved for the orchestrator/.test(n)), false);
 });
 
-test('codex 40, grok 45, claude 5: claude wins and the why shows the bonus and the penalty', () => {
+testWithGrok('codex 40, grok 45, claude 5: claude wins and the why shows the bonus and the penalty', () => {
   const d = decide({ role: 'implement', complexity: 3, length: 'm' }, limits(40, 5, 45));
   assert.equal(d.provider, 'claude');
   assert.match(d.reason, /power-use: claude is 35 points less used than codex/);
   assert.match(d.reason, /claude loses 30 to keep orchestrator headroom/);
 });
 
-test('codex 40, grok 45, claude 70: claude is reserved and never chosen', () => {
+testWithGrok('codex 40, grok 45, claude 70: claude is reserved and never chosen', () => {
   const d = decide({ role: 'implement', complexity: 3, length: 'm' }, limits(40, 70, 45));
   assert.equal(d.provider, 'codex');
   assert.notEqual(d.provider, 'claude');
@@ -78,7 +82,7 @@ test('codex 40, grok 45, claude 70: claude is reserved and never chosen', () => 
   assert.ok(d.notes.some((n) => n === 'claude reserved for the orchestrator (pressure 70% ≥ 60%)'));
 });
 
-test('claude above reserveAt is still allowed when every other vendor is exhausted', () => {
+testWithGrok('claude above reserveAt is still allowed when every other vendor is exhausted', () => {
   const d = decide(
     { role: 'implement', complexity: 3, length: 'm' },
     { codex: spent(), claude: reading(72), grok: grok(99, { hardBlocked: true }) },
@@ -89,7 +93,7 @@ test('claude above reserveAt is still allowed when every other vendor is exhaust
   assert.equal(d.fallback, null);
 });
 
-test('a review independent of codex goes to a healthy grok, never a reserved claude', () => {
+testWithGrok('a review independent of codex goes to a healthy grok, never a reserved claude', () => {
   const d = decide(
     { role: 'review', complexity: 3, length: 's', independentOf: 'codex' },
     limits(20, 75, 12),
@@ -101,31 +105,31 @@ test('a review independent of codex goes to a healthy grok, never a reserved cla
   assert.ok(d.notes.some((n) => /claude reserved for the orchestrator \(pressure 75% ≥ 60%\)/.test(n)));
 });
 
-test('research still goes to grok when it is healthy', () => {
+testWithGrok('research still goes to grok when it is healthy', () => {
   const d = decide({ role: 'research', complexity: 2, length: 's' }, limits(15, 20, 25));
   assert.equal(d.provider, 'grok');
   assert.match(d.reason, /grok preferred for research/);
   assert.equal(/power-use:/.test(d.reason), false);
 });
 
-test('a pin still forces the orchestrator vendor while it is reserved', () => {
+testWithGrok('a pin still forces the orchestrator vendor while it is reserved', () => {
   const d = decide({ role: 'implement', pin: 'claude' }, limits(40, 70, 45));
   assert.equal(d.provider, 'claude');
   assert.ok(d.notes.some((n) => /provider pinned to claude/.test(n)));
 });
 
-test('orchestrator.vendor null turns the reserve off', () => {
+testWithGrok('orchestrator.vendor null turns the reserve off', () => {
   const readingSet = { codex: reading(90), claude: reading(70), grok: spent() };
   const held = decide({ role: 'implement' }, readingSet);
   assert.equal(held.provider, 'codex', 'a critical codex still outranks a reserved claude');
-  withConfig({ orchestrator: { vendor: null } }, () => {
+  withConfig({ providers: ['codex', 'claude', 'grok'], orchestrator: { vendor: null } }, () => {
     const open = decide({ role: 'implement' }, readingSet);
     assert.equal(open.provider, 'claude');
     assert.equal(open.notes.some((n) => /reserved for the orchestrator/.test(n)), false);
   });
 });
 
-test('a usable provider with unknown pressure blocks the power-use bonus', () => {
+testWithGrok('a usable provider with unknown pressure blocks the power-use bonus', () => {
   // Codex 50%, Claude 5%, Grok signed in but unreadable. Claude's 45-point gap
   // over Codex is not a comparison against every competitor: Grok can still run.
   const unread = { provider: 'grok', available: false, auth: SUB, error: 'meter unreadable' };
@@ -137,7 +141,7 @@ test('a usable provider with unknown pressure blocks the power-use bonus', () =>
   assert.notEqual(d.provider, 'claude');
 });
 
-test('an available reading with no pressure stays null and does not win as least-used', () => {
+testWithGrok('an available reading with no pressure stays null and does not win as least-used', () => {
   const blank = { available: true, worstPercent: null, windows: [], hardBlocked: false };
   assert.equal(providerPressure(blank).percent, null);
   const state = providerState(blank);
@@ -154,7 +158,7 @@ test('an available reading with no pressure stays null and does not win as least
   assert.equal(d.provider, 'claude');
 });
 
-test('limits --human says headroom unknown when the lead has no numeric pressure', () => {
+testWithGrok('limits --human says headroom unknown when the lead has no numeric pressure', () => {
   const dark = { available: false, error: 'no reading' };
   const line = routingLine({
     codex: dark,
@@ -168,8 +172,8 @@ test('limits --human says headroom unknown when the lead has no numeric pressure
   assert.equal(/least-used/.test(line), false);
 });
 
-test('a configured powerGap is what the bonus actually uses', () => {
-  withConfig({ routing: { powerGap: 100 } }, () => {
+testWithGrok('a configured powerGap is what the bonus actually uses', () => {
+  withConfig({ providers: ['codex', 'claude', 'grok'], routing: { powerGap: 100 } }, () => {
     const d = decide({ role: 'implement' }, limits(10, 30, 50));
     assert.equal(d.provider, 'codex');
     assert.equal(/power-use:/.test(d.reason), false);

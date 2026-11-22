@@ -34,6 +34,10 @@ process.env.CMO_CLAUDE_CLI_PROBE = '0';
 // as unverified and unroutable unless a test injects a reading.
 process.env.CMO_GROK_PROBE = '0';
 
+// Antigravity's meter also starts its CLI. Tests use only injected readings
+// and fake binaries, so no test may reach the real account.
+process.env.CMO_AGY_PROBE = '0';
+
 // And any fleet settings inherited from the shell, for the same reason.
 delete process.env.CMO_FLEET_URL;
 delete process.env.CMO_FLEET_TOKEN;

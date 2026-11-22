@@ -28,12 +28,20 @@ const paced = (windows) => {
   const worst = windows.reduce((a, w) => (w.percentUsed > a.percentUsed ? w : a));
   return { available: true, worstPercent: worst.percentUsed, worstWindow: worst.key, nextResetAt: worst.resetsAt, hardBlocked: false, windows };
 };
-// Grok is routable only with a verified subscription sign-in on the reading.
-const SUBSCRIBED = { ok: true, method: 'oauth', authMode: 'Oidc', tier: 'SuperGrok Plus' };
-const grokAt = (percent) => ({ ...atPercent(percent), provider: 'grok', auth: SUBSCRIBED });
-const GROK_OK = { ...paced([weekly(9, 108 * HOUR)]), provider: 'grok', auth: SUBSCRIBED };
-const GROK_SIGNED_OUT = { available: false, provider: 'grok', windows: [], auth: { ok: false, method: 'none', reason: 'not signed in' } };
-const GROK_ON_KEY = { ...GROK_OK, auth: { ok: false, method: 'api-key', reason: 'XAI_API_KEY' } };
+// Antigravity is routable only with a verified subscription meter reading.
+const VERIFIED_SUBSCRIPTION = { ok: true, method: 'subscription' };
+const antigravityAt = (percent) => ({
+  ...atPercent(percent), provider: 'antigravity', auth: VERIFIED_SUBSCRIPTION,
+});
+const ANTIGRAVITY_OK = {
+  ...paced([weekly(9, 108 * HOUR)]), provider: 'antigravity', auth: VERIFIED_SUBSCRIPTION,
+};
+const ANTIGRAVITY_SIGNED_OUT = {
+  available: false,
+  provider: 'antigravity',
+  windows: [],
+  auth: { ok: false, method: 'none', reason: 'not signed in with a subscription' },
+};
 const CLAUDE_SIGNED_OUT = { available: false, provider: 'claude', windows: [], auth: { ok: false, method: 'none', reason: 'the claude CLI is signed out' } };
 const CLAUDE_AUTH_RESULT = JSON.stringify({
   type: 'result', subtype: 'success', is_error: true, total_cost_usd: 0,
@@ -105,53 +113,48 @@ const CASES = [
     expect: (d) => d.tier !== 'fast',
   },
   {
-    name: 'grok never runs unless signed in to a subscription',
+    name: 'antigravity never runs without a verified subscription meter',
     task: { role: 'research', complexity: 2, length: 's', needsWeb: true },
-    limits: { codex: SPENT, claude: SPENT, grok: GROK_SIGNED_OUT },
+    limits: { codex: SPENT, claude: SPENT, antigravity: ANTIGRAVITY_SIGNED_OUT },
     expect: (d) => d.ok === false && d.defer === true,
   },
   {
-    name: 'grok on an API key is refused even when pinned',
-    task: { role: 'research', complexity: 2, length: 's', pin: 'grok' },
-    limits: { codex: HEALTHY, claude: HEALTHY, grok: GROK_ON_KEY },
-    expect: (d) => d.ok === false,
-  },
-  {
-    name: 'research goes to grok when it is signed in',
+    name: 'research goes to antigravity when its subscription meter is verified',
     task: { role: 'research', complexity: 2, length: 's' },
-    limits: { codex: HEALTHY, claude: HEALTHY, grok: GROK_OK },
-    expect: (d) => d.provider === 'grok',
+    limits: { codex: HEALTHY, claude: HEALTHY, antigravity: ANTIGRAVITY_OK },
+    expect: (d) => d.provider === 'antigravity'
+      && !d.fallbacks.some((f) => f.provider === 'codex'),
   },
   {
     name: 'web work never goes to codex',
     task: { role: 'implement', complexity: 3, length: 'm', needsWeb: true },
-    limits: { codex: HEALTHY, claude: HEALTHY, grok: GROK_SIGNED_OUT },
+    limits: { codex: HEALTHY, claude: HEALTHY, antigravity: ANTIGRAVITY_SIGNED_OUT },
     expect: (d) => d.provider === 'claude' && !d.fallbacks.some((f) => f.provider === 'codex'),
   },
   {
     name: 'even headroom tie-breaks to codex and keeps claude in reserve',
     task: { role: 'implement', complexity: 3, length: 'm' },
-    limits: { codex: HEALTHY, claude: HEALTHY, grok: GROK_OK },
+    limits: { codex: HEALTHY, claude: HEALTHY, antigravity: ANTIGRAVITY_OK },
     expect: (d) => d.provider === 'codex' && d.fallbacks.length === 2,
   },
   {
-    name: 'review of grok output never runs on grok',
-    task: { role: 'review', complexity: 3, length: 's', independentOf: 'grok' },
-    limits: { codex: SPENT, claude: HEALTHY, grok: GROK_OK },
+    name: 'review of antigravity output never runs on antigravity',
+    task: { role: 'review', complexity: 3, length: 's', independentOf: 'antigravity' },
+    limits: { codex: SPENT, claude: HEALTHY, antigravity: ANTIGRAVITY_OK },
     expect: (d) => d.provider === 'claude' && d.independence === 'cross-vendor'
-      && !d.fallbacks.some((f) => f.provider === 'grok'),
+      && !d.fallbacks.some((f) => f.provider === 'antigravity'),
   },
   {
-    name: 'grok is the cross-vendor reviewer when claude is spent',
+    name: 'antigravity is the cross-vendor reviewer when claude is spent',
     task: { role: 'review', complexity: 3, length: 's', independentOf: 'codex' },
-    limits: { codex: HEALTHY, claude: SPENT, grok: GROK_OK },
-    expect: (d) => d.provider === 'grok' && d.independence === 'cross-vendor',
+    limits: { codex: HEALTHY, claude: SPENT, antigravity: ANTIGRAVITY_OK },
+    expect: (d) => d.provider === 'antigravity' && d.independence === 'cross-vendor',
   },
   {
     name: 'a signed-out claude CLI is never routed to',
     task: { role: 'review', complexity: 3, length: 's', independentOf: 'codex' },
-    limits: { codex: HEALTHY, claude: CLAUDE_SIGNED_OUT, grok: GROK_OK },
-    expect: (d) => d.provider === 'grok' && !d.fallbacks.some((f) => f.provider === 'claude'),
+    limits: { codex: HEALTHY, claude: CLAUDE_SIGNED_OUT, antigravity: ANTIGRAVITY_OK },
+    expect: (d) => d.provider === 'antigravity' && !d.fallbacks.some((f) => f.provider === 'claude'),
   },
   {
     name: 'bulk reading does not get a frontier model',
@@ -160,24 +163,24 @@ const CASES = [
     expect: (d) => d.tier === 'balanced',
   },
   {
-    name: 'power-use: grok at 6% beats codex at 67%, claude at 60% stays reserved',
+    name: 'power-use: antigravity at 6% beats codex at 67%, claude stays reserved',
     task: { role: 'implement', complexity: 4, length: 'l' },
-    limits: { codex: atPercent(67), claude: atPercent(60), grok: grokAt(6) },
-    expect: (d) => d.provider === 'grok'
-      && /power-use: grok is 61 points less used than codex/.test(d.reason)
+    limits: { codex: atPercent(67), claude: atPercent(60), antigravity: antigravityAt(6) },
+    expect: (d) => d.provider === 'antigravity'
+      && /power-use: antigravity is 61 points less used than codex/.test(d.reason)
       && d.notes.some((n) => n === 'claude reserved for the orchestrator (pressure 60% ≥ 60%)'),
   },
   {
-    name: 'power-use: codex at 10% beats grok at 50% and claude at 30%',
+    name: 'power-use: codex at 10% beats antigravity at 50% and claude at 30%',
     task: { role: 'implement', complexity: 3, length: 'm' },
-    limits: { codex: atPercent(10), claude: atPercent(30), grok: grokAt(50) },
+    limits: { codex: atPercent(10), claude: atPercent(30), antigravity: antigravityAt(50) },
     expect: (d) => d.provider === 'codex'
       && /power-use: codex is 20 points less used than claude/.test(d.reason),
   },
   {
     name: 'claude wins when its differential beats the orchestrator penalty',
     task: { role: 'implement', complexity: 3, length: 'm' },
-    limits: { codex: atPercent(40), claude: atPercent(5), grok: grokAt(45) },
+    limits: { codex: atPercent(40), claude: atPercent(5), antigravity: antigravityAt(45) },
     expect: (d) => d.provider === 'claude'
       && /power-use: claude is 35 points less used than codex/.test(d.reason)
       && /claude loses 30 to keep orchestrator headroom/.test(d.reason),
@@ -185,29 +188,34 @@ const CASES = [
   {
     name: 'claude above reserveAt is never chosen while anyone else can run',
     task: { role: 'implement', complexity: 3, length: 'm' },
-    limits: { codex: atPercent(40), claude: atPercent(70), grok: grokAt(45) },
+    limits: { codex: atPercent(40), claude: atPercent(70), antigravity: antigravityAt(45) },
     expect: (d) => d.provider === 'codex'
       && d.notes.some((n) => /claude reserved for the orchestrator \(pressure 70% ≥ 60%\)/.test(n)),
   },
   {
     name: 'claude above reserveAt still runs when every other vendor is exhausted',
     task: { role: 'implement', complexity: 3, length: 'm' },
-    limits: { codex: SPENT, claude: atPercent(72), grok: { ...grokAt(99), hardBlocked: true } },
+    limits: {
+      codex: SPENT,
+      claude: atPercent(72),
+      antigravity: { ...antigravityAt(99), hardBlocked: true },
+    },
     expect: (d) => d.provider === 'claude'
       && /used because nothing else can run/.test(d.reason),
   },
   {
-    name: 'a review independent of codex goes to grok, not a reserved claude',
+    name: 'a review independent of codex goes to antigravity, not reserved claude',
     task: { role: 'review', complexity: 3, length: 's', independentOf: 'codex' },
-    limits: { codex: atPercent(20), claude: atPercent(75), grok: grokAt(12) },
-    expect: (d) => d.provider === 'grok' && d.independence === 'cross-vendor'
+    limits: { codex: atPercent(20), claude: atPercent(75), antigravity: antigravityAt(12) },
+    expect: (d) => d.provider === 'antigravity' && d.independence === 'cross-vendor'
       && !d.fallbacks.some((f) => f.provider === 'codex'),
   },
   {
-    name: 'research still goes to a healthy grok on affinity',
+    name: 'research still goes to a healthy antigravity on affinity',
     task: { role: 'research', complexity: 2, length: 's' },
-    limits: { codex: atPercent(15), claude: atPercent(20), grok: grokAt(25) },
-    expect: (d) => d.provider === 'grok' && /preferred for research/.test(d.reason),
+    limits: { codex: atPercent(15), claude: atPercent(20), antigravity: antigravityAt(25) },
+    expect: (d) => d.provider === 'antigravity' && /preferred for research/.test(d.reason)
+      && !d.fallbacks.some((f) => f.provider === 'codex'),
   },
 ];
 

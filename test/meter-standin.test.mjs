@@ -5,7 +5,11 @@
 import './isolate.mjs'; // MUST be first — see the file
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
+import { loadConfig, resetConfigCache } from '../src/config.mjs';
 import { decide, providerState } from '../src/policy.mjs';
 import { grokAuthFrom } from '../src/grok.mjs';
 import { holdLastGood, markExhausted, readLimits } from '../src/limits.mjs';
@@ -40,6 +44,20 @@ const GROK_METER_FAILED = {
   error: 'grok usage query failed: Internal error',
   auth: GROK_AUTH,
 };
+
+async function withGrok(body) {
+  const dir = mkdtempSync(join(tmpdir(), 'cmo-meter-grok-'));
+  const file = join(dir, 'config.json');
+  writeFileSync(file, JSON.stringify({ providers: ['codex', 'claude', 'grok'] }), 'utf8');
+  try {
+    resetConfigCache();
+    loadConfig({ file, reload: true });
+    return await body();
+  } finally {
+    resetConfigCache();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 test('a meter that errors stands on its last good reading, marked stale, with the fresh auth', async () => {
   assert.equal(await holdLastGood('grok', GROK_GOOD, { now: NOW }), GROK_GOOD);
@@ -77,7 +95,7 @@ test('the last good reading never stands in past its age, across a reset, or ove
   assert.equal(after.available, false, 'the window reset since, so 70% is no longer true');
 });
 
-test('readLimits routes on the held reading while the meter is down', async () => {
+test('readLimits routes on the held reading while the meter is down', async () => withGrok(async () => {
   let calls = 0;
   const readers = {
     codex: async () => at(50),
@@ -90,7 +108,7 @@ test('readLimits routes on the held reading while the meter is down', async () =
   assert.equal(later.grok.available, true);
   assert.ok(later.grok.stale);
   assert.equal(decide(TASK, later, { now: NOW + 2 * MIN }).provider, 'grok');
-});
+}));
 
 
 test('a rate-limit error moves the last good reading forward: a later meter failure stays exhausted', async () => {

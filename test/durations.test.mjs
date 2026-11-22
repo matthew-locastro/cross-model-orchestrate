@@ -8,8 +8,12 @@
 import './isolate.mjs'; // MUST be first — see the file
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { DEFAULT_DURATION_FIT, durationProfile, expectedDuration, formatElapsed } from '../src/durations.mjs';
+import { loadConfig, resetConfigCache } from '../src/config.mjs';
 import { grokAuthFrom } from '../src/grok.mjs';
 import { decide, fitToTimeout } from '../src/policy.mjs';
 import { runAgent } from '../src/run.mjs';
@@ -36,6 +40,24 @@ const grokReading = (percent = 9) => ({
 // The evening of the incident: Grok far less used than Codex, Claude driving.
 const LIMITS = { codex: healthy(45), claude: healthy(20), grok: grokReading(9) };
 const REVIEW = { role: 'review', complexity: 3, length: 's', independentOf: 'claude' }; // → balanced
+
+async function withGrok(body) {
+  const dir = mkdtempSync(join(tmpdir(), 'cmo-duration-grok-'));
+  const file = join(dir, 'config.json');
+  writeFileSync(file, JSON.stringify({ providers: ['codex', 'claude', 'grok'] }), 'utf8');
+  try {
+    resetConfigCache();
+    loadConfig({ file, reload: true });
+    return await body();
+  } finally {
+    resetConfigCache();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function testWithGrok(name, body) {
+  test(name, async () => withGrok(body));
+}
 
 /** A legacy receipt: no attemptLog, as every receipt before this change. */
 const legacy = (provider, ms, extra = {}) => ({
@@ -128,7 +150,7 @@ test('elapsed times read as minutes once they are long', () => {
 
 // ── routing ─────────────────────────────────────────────────────────────
 
-test('the incident: a 600s review goes to codex first, with grok still on the ladder', () => {
+testWithGrok('the incident: a 600s review goes to codex first, with grok still on the ladder', () => {
   const durations = durationProfile(RECEIPTS, { now: NOW });
   const before = decide(REVIEW, LIMITS, { now: NOW });
   assert.equal(before.provider, 'grok', 'without timing, power-use sends the review to grok');
@@ -140,7 +162,7 @@ test('the incident: a 600s review goes to codex first, with grok still on the la
   assert.match(note, /grok usually overruns a 10\.0 min timeout on review·balanced \(grok 18\.5 min at p75 over 4\)/);
 });
 
-test('the 900s frontier review moves too, on the balanced floor', () => {
+testWithGrok('the 900s frontier review moves too, on the balanced floor', () => {
   const durations = durationProfile(RECEIPTS, { now: NOW });
   const d = decide({ ...REVIEW, complexity: 4, length: 'm' }, LIMITS, { now: NOW, timeoutMs: 900_000, durations });
   assert.equal(d.tier, 'frontier');
@@ -148,26 +170,26 @@ test('the 900s frontier review moves too, on the balanced floor', () => {
   assert.match(d.notes.join('\n'), /on balanced, as a floor/);
 });
 
-test('a timeout with room keeps grok first, so the idle subscription is still spent', () => {
+testWithGrok('a timeout with room keeps grok first, so the idle subscription is still spent', () => {
   const durations = durationProfile(RECEIPTS, { now: NOW });
   const d = decide(REVIEW, LIMITS, { now: NOW, timeoutMs: 30 * MIN, durations });
   assert.equal(d.provider, 'grok');
   assert.ok(!d.notes.some((n) => n.startsWith('time fit:')));
 });
 
-test('no evidence, no move', () => {
+testWithGrok('no evidence, no move', () => {
   const durations = durationProfile(RECEIPTS.slice(0, 2), { now: NOW });
   assert.equal(decide(REVIEW, LIMITS, { now: NOW, timeoutMs: 600_000, durations }).provider, 'grok');
   assert.equal(decide(REVIEW, LIMITS, { now: NOW, timeoutMs: 600_000 }).provider, 'grok', 'no profile at all');
 });
 
-test('a pin is obeyed whatever the clock', () => {
+testWithGrok('a pin is obeyed whatever the clock', () => {
   const durations = durationProfile(RECEIPTS, { now: NOW });
   const d = decide({ ...REVIEW, pin: 'grok' }, LIMITS, { now: NOW, timeoutMs: 600_000, durations });
   assert.equal(d.provider, 'grok');
 });
 
-test('timed-out attempts teach routing: three 600s timeouts and grok stops going first', () => {
+testWithGrok('timed-out attempts teach routing: three 600s timeouts and grok stops going first', () => {
   const timeouts = [1, 2, 3].map((i) => ({
     at: NOW - i * MIN, ok: true, role: 'review', provider: 'codex', failedOver: true,
     attemptLog: [
@@ -181,7 +203,7 @@ test('timed-out attempts teach routing: three 600s timeouts and grok stops going
   assert.match(d.notes.join('\n'), /3 timed out/);
 });
 
-test('a reserved orchestrator is not promoted past a slow vendor', () => {
+testWithGrok('a reserved orchestrator is not promoted past a slow vendor', () => {
   // Review of codex's work: grok or claude. Claude is past reserveAt.
   const limits = { codex: healthy(10), claude: healthy(70), grok: grokReading(9) };
   const durations = durationProfile(RECEIPTS, { now: NOW });
@@ -190,7 +212,7 @@ test('a reserved orchestrator is not promoted past a slow vendor', () => {
   assert.match(d.notes.join('\n'), /claude would fit but is reserved for the orchestrator — raise --timeout/);
 });
 
-test('when nobody fits, nothing moves and the note says to raise the timeout', () => {
+testWithGrok('when nobody fits, nothing moves and the note says to raise the timeout', () => {
   const durations = durationProfile(RECEIPTS, { now: NOW });
   const d = decide(REVIEW, LIMITS, { now: NOW, timeoutMs: 60_000, durations });
   assert.equal(d.provider, 'grok');

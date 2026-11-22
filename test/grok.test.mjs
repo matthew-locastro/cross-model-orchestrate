@@ -5,7 +5,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   grokAuthFrom, grokRpc, grokWindowsFrom, lockGrokEnv, offSubscriptionReason, parseGrokModels,
@@ -17,6 +20,7 @@ import { buildCommand, childEnv, classifyFailure, runAgent } from '../src/run.mj
 import { parseDispatchFile } from '../src/dispatch-file.mjs';
 import { findings, readAudit, summarise } from '../src/audit.mjs';
 import { snapshot } from '../src/ledger.mjs';
+import { loadConfig, resetConfigCache } from '../src/config.mjs';
 
 // ── fixtures, shaped on what grok 1.0.77 actually returned ───────────────
 
@@ -62,6 +66,20 @@ const grokReading = (auth = grokAuthFrom(SUBSCRIPTION), percent = 9) => ({
   windows: [{ key: 'weekly', label: 'Wkly', percentUsed: percent, resetsAt: new Date(Date.now() + 100 * HOUR).toISOString() }],
   auth,
 });
+
+function withGrok(body) {
+  const dir = mkdtempSync(join(tmpdir(), 'cmo-grok-roster-'));
+  const file = join(dir, 'config.json');
+  writeFileSync(file, JSON.stringify({ providers: ['codex', 'claude', 'grok'] }), 'utf8');
+  try {
+    resetConfigCache();
+    loadConfig({ file, reload: true });
+    return body();
+  } finally {
+    resetConfigCache();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 // ── auth ─────────────────────────────────────────────────────────────────
 
@@ -277,18 +295,22 @@ test('an unverified grok is never a candidate or a fallback', () => {
 });
 
 test('research and web work lean to a signed-in grok', () => {
-  const limits = { codex: healthy(0), claude: healthy(0), grok: grokReading() };
-  assert.equal(decide({ role: 'research', complexity: 2, length: 's' }, limits).provider, 'grok');
-  assert.equal(decide({ role: 'implement', complexity: 3, length: 'm', needsWeb: true }, limits).provider, 'grok');
-  // Not for ordinary implementation when the windows are level: the tie breaks
-  // to codex, and claude is held back for the orchestrator.
-  assert.equal(decide({ role: 'implement', complexity: 3, length: 'm' }, limits).provider, 'codex');
+  withGrok(() => {
+    const limits = { codex: healthy(0), claude: healthy(0), grok: grokReading() };
+    assert.equal(decide({ role: 'research', complexity: 2, length: 's' }, limits).provider, 'grok');
+    assert.equal(decide({ role: 'implement', complexity: 3, length: 'm', needsWeb: true }, limits).provider, 'grok');
+    // Not for ordinary implementation when the windows are level: the tie breaks
+    // to codex, and claude is held back for the orchestrator.
+    assert.equal(decide({ role: 'implement', complexity: 3, length: 'm' }, limits).provider, 'codex');
+  });
 });
 
 test('a tight grok loses research to the others', () => {
-  const tight = { ...grokReading(), worstPercent: 80, windows: [{ key: '5h', percentUsed: 80 }] };
-  const d = decide({ role: 'research', complexity: 2, length: 's' }, { codex: healthy(), claude: healthy(), grok: tight });
-  assert.notEqual(d.provider, 'grok');
+  withGrok(() => {
+    const tight = { ...grokReading(), worstPercent: 80, windows: [{ key: '5h', percentUsed: 80 }] };
+    const d = decide({ role: 'research', complexity: 2, length: 's' }, { codex: healthy(), claude: healthy(), grok: tight });
+    assert.notEqual(d.provider, 'grok');
+  });
 });
 
 test('web work never lands on a sandboxed codex, pinned or not', () => {
@@ -314,39 +336,47 @@ test('a review pinned onto its producer is labelled same-vendor, or refused when
 });
 
 test('a failed pin is reported as the pin, not as independence', () => {
-  const d = decide(
-    { role: 'review', independentOf: 'codex', pin: 'grok' },
-    { codex: healthy(), claude: healthy(), grok: grokReading({ ok: false, reason: 'not signed in' }) },
-  );
-  assert.equal(d.ok, false);
-  assert.match(d.reason, /pinned provider grok cannot run/);
+  withGrok(() => {
+    const d = decide(
+      { role: 'review', independentOf: 'codex', pin: 'grok' },
+      { codex: healthy(), claude: healthy(), grok: grokReading({ ok: false, reason: 'not signed in' }) },
+    );
+    assert.equal(d.ok, false);
+    assert.match(d.reason, /pinned provider grok cannot run/);
+  });
 });
 
 test('a review keeps off the producer and may use either other vendor', () => {
-  const limits = { codex: healthy(), claude: healthy(), grok: grokReading() };
-  const ofCodex = decide({ role: 'review', independentOf: 'codex' }, limits);
-  assert.notEqual(ofCodex.provider, 'codex');
-  assert.ok(!ofCodex.fallbacks.some((f) => f.provider === 'codex'), 'never fails over onto the producer');
-  assert.equal(ofCodex.independence, 'cross-vendor');
-  const ofGrok = decide({ role: 'review', independentOf: 'grok' }, limits);
-  assert.notEqual(ofGrok.provider, 'grok');
-  assert.ok(!ofGrok.fallbacks.some((f) => f.provider === 'grok'));
+  withGrok(() => {
+    const limits = { codex: healthy(), claude: healthy(), grok: grokReading() };
+    const ofCodex = decide({ role: 'review', independentOf: 'codex' }, limits);
+    assert.notEqual(ofCodex.provider, 'codex');
+    assert.ok(!ofCodex.fallbacks.some((f) => f.provider === 'codex'), 'never fails over onto the producer');
+    assert.equal(ofCodex.independence, 'cross-vendor');
+    const ofGrok = decide({ role: 'review', independentOf: 'grok' }, limits);
+    assert.notEqual(ofGrok.provider, 'grok');
+    assert.ok(!ofGrok.fallbacks.some((f) => f.provider === 'grok'));
+  });
 });
 
 test('a review degrades only when every other vendor is unusable', () => {
-  const limits = { codex: healthy(), claude: spent(), grok: grokReading({ ok: false, reason: 'not signed in' }) };
-  const d = decide({ role: 'review', independentOf: 'codex' }, limits);
-  assert.equal(d.provider, 'codex');
-  assert.equal(d.independence, 'same-vendor');
-  assert.ok(d.notes.some((n) => /grok not signed in/.test(n)));
-  const strict = decide({ role: 'review', independentOf: 'codex', strictIndependence: true }, limits);
-  assert.equal(strict.ok, false);
+  withGrok(() => {
+    const limits = { codex: healthy(), claude: spent(), grok: grokReading({ ok: false, reason: 'not signed in' }) };
+    const d = decide({ role: 'review', independentOf: 'codex' }, limits);
+    assert.equal(d.provider, 'codex');
+    assert.equal(d.independence, 'same-vendor');
+    assert.ok(d.notes.some((n) => /grok not signed in/.test(n)));
+    const strict = decide({ role: 'review', independentOf: 'codex', strictIndependence: true }, limits);
+    assert.equal(strict.ok, false);
+  });
 });
 
 test('the failover ladder walks every usable vendor', () => {
-  const d = decide({ role: 'implement' }, { codex: healthy(), claude: healthy(), grok: grokReading() });
-  assert.equal(d.fallbacks.length, 2);
-  assert.equal(d.fallback.provider, d.fallbacks[0].provider);
+  withGrok(() => {
+    const d = decide({ role: 'implement' }, { codex: healthy(), claude: healthy(), grok: grokReading() });
+    assert.equal(d.fallbacks.length, 2);
+    assert.equal(d.fallback.provider, d.fallbacks[0].provider);
+  });
 });
 
 // ── the dispatch ─────────────────────────────────────────────────────────
@@ -497,7 +527,7 @@ test('audit counts grok and whether each grok dispatch was proven subscription-b
     { provider: 'claude', model: 'sonnet', ok: true },
   ];
   const sum = summarise(rows);
-  assert.deepEqual(sum.shares, { codex: 25, claude: 25, grok: 50 });
+  assert.deepEqual(sum.shares, { codex: 25, claude: 25, antigravity: 0, grok: 50 });
   assert.deepEqual(sum.grokAuth, { oauth: 1, unverified: 1 });
   const f = findings(rows);
   assert.ok(f.some((x) => x.severity === 'high' && /without the stream confirming/.test(x.finding)));

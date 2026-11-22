@@ -24,7 +24,7 @@
 //   1. pin              — caller forced it
 //   2. independentOf    — adversarial review MUST run on a vendor other than the
 //                         one that produced the artifact (any of the others)
-//   3. can it run       — not installed, not signed in to a subscription (grok),
+//   3. can it run       — not installed, not verified on a subscription,
 //                         exhausted, or unable to do the task (codex has no
 //                         network, so it cannot do web work): not a candidate
 //   4. least-used       — headroom is the dominant score. A provider whose
@@ -36,8 +36,8 @@
 //   5. orchestrator     — the vendor driving the run loses `penalty` points on
 //                         every dispatch, and at or above `reserveAt` pressure
 //                         it ranks below every usable alternative
-//   6. affinity         — grok is preferred for research and web work, because
-//                         it can open and check URLs live
+//   6. affinity         — web-capable vendors are preferred for research and
+//                         web work because they can open and check URLs live
 //   7. tie-break        — `preference` settles a near-tie and nothing wider
 //   8. time fit         — a vendor whose own receipts say it will not finish
 //                         inside the dispatch's timeout goes behind one that
@@ -56,32 +56,37 @@
 // after the tier is set (see `applyEfficiency`). Bulk reading is cheap work on
 // an expensive model, and that is the most common way a fan-out wastes quota.
 
-import { loadConfig, PROVIDERS, TIERS } from './config.mjs';
+import { activeProviders, loadConfig, PROVIDERS, TIERS } from './config.mjs';
 import { expectedDuration, formatElapsed } from './durations.mjs';
 import { providerPressure } from './pace.mjs';
 
 export { PROVIDERS, TIERS };
 
-export const BINARIES = { codex: 'codex', claude: 'claude', grok: 'grok' };
+export const BINARIES = {
+  codex: 'codex',
+  claude: 'claude',
+  antigravity: 'agy',
+  grok: 'grok',
+};
 
 /**
  * What each vendor's agent can reach. Codex runs in a sandbox with no network —
  * no DNS at all — so a Codex agent asked to check a link cannot, and guesses.
- * Claude has WebFetch and WebSearch; grok has web search and fetch and runs
- * unsandboxed on this machine.
+ * Claude, Antigravity and Grok can search and fetch the web.
  */
 export const CAPABILITIES = {
   codex: { web: false },
   claude: { web: true },
+  antigravity: { web: true },
   grok: { web: true },
 };
 
 /**
- * Vendors that must prove a subscription sign-in before they are routable.
- * The grok CLI falls back to pay-per-token API billing when it is not signed
- * in, so an unverified grok is treated exactly like an uninstalled one.
+ * Vendors that must prove a subscription meter before they are routable.
+ * An unverified reading is treated exactly like an uninstalled CLI so routing
+ * never silently falls through to API billing.
  */
-export const REQUIRES_SUBSCRIPTION_CHECK = new Set(['grok']);
+export const REQUIRES_SUBSCRIPTION_CHECK = new Set(['antigravity', 'grok']);
 
 const UNUSABLE = new Set(['exhausted', 'missing', 'unauthenticated']);
 
@@ -258,7 +263,7 @@ function formatPoints(n) {
  *                                               every other competing provider
  *                                               AND every usable competitor has
  *                                               a finite pressure
- *   + affinity                                  research and web, on grok
+ *   + affinity                                  research and web, by config
  *   + preference.weightPoints / 10              tie-break, default 2.5
  *
  * `pressure` is the pace-adjusted percent already on the state. A provider
@@ -271,8 +276,10 @@ function formatPoints(n) {
  * bonus is about the gap to the subscriptions that are.
  */
 export function rankProviders(task, states, preference = loadConfig().preference, affinity = loadConfig().affinity) {
-  const routing = loadConfig().routing;
-  const orchestrator = loadConfig().orchestrator;
+  const config = loadConfig();
+  const providers = activeProviders(config);
+  const routing = config.routing;
+  const orchestrator = config.orchestrator;
   const headroomWeight = Number(routing.headroomWeight) || 0;
   const powerGap = Number(routing.powerGap);
   const powerBonus = Number(routing.powerBonus) || 0;
@@ -281,7 +288,7 @@ export function rankProviders(task, states, preference = loadConfig().preference
   const reserveAt = Number(orchestrator?.reserveAt);
   const tieBreak = Number(preference?.weightPoints) > 0 ? Number(preference.weightPoints) / 10 : 0;
 
-  const scored = PROVIDERS.map((id) => {
+  const scored = providers.map((id) => {
     const s = states[id] ?? { state: 'unknown', percent: null, resetsAt: null };
     let score = 0;
     const why = [];
@@ -309,11 +316,13 @@ export function rankProviders(task, states, preference = loadConfig().preference
       why.push(`${id} healthy (${describeHeadroom(s)})`);
     }
 
-    // Work that has to open live URLs cannot run where there is no network.
-    if (task.needsWeb && CAPABILITIES[id]?.web === false && !(id === 'codex' && task.fullAccess)) {
+    // Research and work that has to open live URLs cannot run in Codex's
+    // networkless sandbox. Full access supplies a network for either case.
+    const needsNetwork = task.needsWeb || task.role === 'research';
+    if (needsNetwork && CAPABILITIES[id]?.web === false && !(id === 'codex' && task.fullAccess)) {
       incapable = true;
       score -= 1000;
-      why.push(`${id} has no network in its sandbox, so it cannot open or verify URLs`);
+      why.push(`${id} has no network in its sandbox, so it cannot do research or open and verify URLs`);
     }
 
     // What a vendor is better placed to do than the others. Applied only to a
@@ -422,7 +431,7 @@ export function rankProviders(task, states, preference = loadConfig().preference
     candidate.score = Math.min(candidate.score, floor - 1);
   }
 
-  scored.sort((a, b) => b.score - a.score || PROVIDERS.indexOf(a.provider) - PROVIDERS.indexOf(b.provider));
+  scored.sort((a, b) => b.score - a.score || providers.indexOf(a.provider) - providers.indexOf(b.provider));
   return scored;
 }
 
@@ -460,7 +469,7 @@ export function formatRoutingLine(ranked) {
 export function routingLine(limits, now = Date.now()) {
   const bands = pressure();
   const states = Object.fromEntries(
-    PROVIDERS.map((id) => [id, providerState(limits?.[id], bands, now, id)]),
+    activeProviders().map((id) => [id, providerState(limits?.[id], bands, now, id)]),
   );
   return formatRoutingLine(rankProviders({ role: 'implement' }, states));
 }
@@ -528,10 +537,10 @@ export function fitToTimeout(usable, { role, tier, timeoutMs, durations, fit = l
  *   needsSchema     the caller wants a validated object back
  *   needsRepoWrite  the agent edits files in the working tree
  *   needsWeb        the agent must open live URLs (research, link checks)
- *   independentOf   'codex'|'claude'|'grok' — must NOT run on that vendor
- *   pin             'codex'|'claude'|'grok' — caller overrides provider selection
+ *   independentOf   a known provider id — must NOT run on that vendor
+ *   pin             a known provider id — caller overrides provider selection
  *   pinModel        exact model id, bypassing the tier map
- * @param {object} limits  { codex, claude, grok } from limits.mjs
+ * @param {object} limits  provider readings from limits.mjs
  * @param {object} opts    { now, timeoutMs, durations }
  *   now         epoch ms, so pace is testable; defaults to the clock
  *   timeoutMs   the dispatch's timeout; with `durations`, enables the time fit
@@ -571,7 +580,9 @@ export function decide(task = {}, limits = {}, opts = {}) {
   const notes = [...efficiency.notes];
 
   const bands = pressure();
-  const states = Object.fromEntries(PROVIDERS.map((id) => [id, providerState(limits[id], bands, now, id)]));
+  const states = Object.fromEntries(
+    activeProviders().map((id) => [id, providerState(limits[id], bands, now, id)]),
+  );
 
   let ranked = rankProviders(normalized, states);
   for (const candidate of ranked) {
@@ -641,7 +652,8 @@ export function decide(task = {}, limits = {}, opts = {}) {
 
   // A missing CLI is as unusable as a spent one — filtering only on
   // 'exhausted' let --strict-independence hand back a provider that cannot run.
-  // The same goes for an unverified grok and for codex on web work.
+  // The same goes for an unverified metered vendor and for sandboxed codex on
+  // research or web work.
   const usable = ranked.filter(isUsable);
 
   if (usable.length === 0) {
