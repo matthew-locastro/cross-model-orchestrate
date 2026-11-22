@@ -48,6 +48,34 @@ test('a tight five-hour Gemini bucket is the binding window', async () => {
   assert.equal(result.worstPercent, 95);
 });
 
+test('an epoch reset inside the Gemini Models group is ignored', async () => {
+  const withEpochFiveHour = JSON.stringify({
+    status: 'SUCCESS',
+    command: {
+      name: 'usage',
+      data: {
+        groups: [
+          {
+            name: 'Gemini Models',
+            buckets: [
+              { id: 'gemini-5h', remaining_fraction: 0, reset_time: '1970-01-01T00:00:00Z' },
+              { id: 'gemini-weekly', remaining_fraction: 0.6, reset_time: '2030-01-08T00:00:00Z' },
+            ],
+          },
+        ],
+      },
+    },
+  });
+  const result = await readAntigravityLimits({ probe: async () => ({ code: 0, stdout: withEpochFiveHour }) });
+  assert.equal(result.available, true);
+  assert.equal(result.auth.ok, true);
+  assert.deepEqual(result.windows.map((w) => [w.key, w.percentUsed, w.resetsAt]), [
+    ['weekly', 40, '2030-01-08T00:00:00.000Z'],
+  ]);
+  assert.equal(result.worstWindow, 'weekly');
+  assert.equal(result.worstPercent, 40);
+});
+
 test('exit 2 means an API-key login has no subscription quota and is not routable', async () => {
   const result = await readAntigravityLimits({ probe: async () => ({ code: 2, stdout: '' }) });
   assert.equal(result.available, false);

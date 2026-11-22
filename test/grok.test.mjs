@@ -286,8 +286,8 @@ test('an unverified grok is unauthenticated, whatever its meter says', () => {
   assert.equal(providerState(undefined, bands, Date.now(), 'codex').state, 'unknown');
 });
 
-test('an unverified grok is never a candidate or a fallback', () => {
-  withGrok(() => {
+test('an unverified grok is never a candidate or a fallback', async () => {
+  await withGrok(() => {
     const d = decide({ role: 'implement', complexity: 3, length: 'm' }, { codex: healthy(), claude: healthy() });
     assert.equal(d.provider, 'codex');
     assert.deepEqual(d.fallbacks.map((f) => f.provider), ['claude']);
@@ -296,8 +296,8 @@ test('an unverified grok is never a candidate or a fallback', () => {
   });
 });
 
-test('research and web work lean to a signed-in grok', () => {
-  withGrok(() => {
+test('research and web work lean to a signed-in grok', async () => {
+  await withGrok(() => {
     const limits = { codex: healthy(0), claude: healthy(0), grok: grokReading() };
     assert.equal(decide({ role: 'research', complexity: 2, length: 's' }, limits).provider, 'grok');
     assert.equal(decide({ role: 'implement', complexity: 3, length: 'm', needsWeb: true }, limits).provider, 'grok');
@@ -307,8 +307,8 @@ test('research and web work lean to a signed-in grok', () => {
   });
 });
 
-test('a tight grok loses research to the others', () => {
-  withGrok(() => {
+test('a tight grok loses research to the others', async () => {
+  await withGrok(() => {
     const tight = { ...grokReading(), worstPercent: 80, windows: [{ key: '5h', percentUsed: 80 }] };
     const d = decide({ role: 'research', complexity: 2, length: 's' }, { codex: healthy(), claude: healthy(), grok: tight });
     assert.notEqual(d.provider, 'grok');
@@ -340,8 +340,8 @@ test('a review pinned onto its producer is labelled same-vendor, or refused when
   assert.match(strict.reason, /strict-independence/);
 });
 
-test('a failed pin is reported as the pin, not as independence', () => {
-  withGrok(() => {
+test('a failed pin is reported as the pin, not as independence', async () => {
+  await withGrok(() => {
     const d = decide(
       { role: 'review', independentOf: 'codex', pin: 'grok' },
       { codex: healthy(), claude: healthy(), grok: grokReading({ ok: false, reason: 'not signed in' }) },
@@ -351,8 +351,8 @@ test('a failed pin is reported as the pin, not as independence', () => {
   });
 });
 
-test('a review keeps off the producer and may use either other vendor', () => {
-  withGrok(() => {
+test('a review keeps off the producer and may use either other vendor', async () => {
+  await withGrok(() => {
     const limits = { codex: healthy(), claude: healthy(), grok: grokReading() };
     const ofCodex = decide({ role: 'review', independentOf: 'codex' }, limits);
     assert.notEqual(ofCodex.provider, 'codex');
@@ -364,8 +364,8 @@ test('a review keeps off the producer and may use either other vendor', () => {
   });
 });
 
-test('a review degrades only when every other vendor is unusable', () => {
-  withGrok(() => {
+test('a review degrades only when every other vendor is unusable', async () => {
+  await withGrok(() => {
     const limits = { codex: healthy(), claude: spent(), grok: grokReading({ ok: false, reason: 'not signed in' }) };
     const d = decide({ role: 'review', independentOf: 'codex' }, limits);
     assert.equal(d.provider, 'codex');
@@ -376,8 +376,8 @@ test('a review degrades only when every other vendor is unusable', () => {
   });
 });
 
-test('the failover ladder walks every usable vendor', () => {
-  withGrok(() => {
+test('the failover ladder walks every usable vendor', async () => {
+  await withGrok(() => {
     const d = decide({ role: 'implement' }, { codex: healthy(), claude: healthy(), grok: grokReading() });
     assert.equal(d.fallbacks.length, 2);
     assert.equal(d.fallback.provider, d.fallbacks[0].provider);

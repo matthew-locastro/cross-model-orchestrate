@@ -17,7 +17,9 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { readLimits } from '../src/limits.mjs';
-import { decide, isUsable, providerState, pressure, routingLine } from '../src/policy.mjs';
+import {
+  decide, isUsable, providerState, pressure, REQUIRES_SUBSCRIPTION_CHECK, routingLine,
+} from '../src/policy.mjs';
 import { formatDuration, providerPressure } from '../src/pace.mjs';
 import { runAgent, DEFAULT_TIMEOUT_MS } from '../src/run.mjs';
 import { doctor } from '../src/doctor.mjs';
@@ -121,12 +123,13 @@ export function renderLimits(limits, now = Date.now()) {
       ? `pressure ${s.percent}%${s.window ? ` (${s.window})` : ''} `
       : '';
     const via = p.available && typeof p.source === 'string' && p.source.startsWith('claude -p') ? 'via the claude CLI ' : '';
-    // For grok the sign-in is the headline: an unverified grok is not routable
-    // however much allowance it has, and the reason is the thing to fix.
-    const auth = provider === 'grok' && p.auth
-      ? (p.auth.ok ? `auth=${p.auth.authMode ?? p.auth.method} ` : `NOT ROUTABLE: ${p.auth.reason} `)
-      : '';
-    const why = p.available || (provider === 'grok' && p.auth && !p.auth.ok) ? '' : `unavailable: ${p.error}`;
+    // For vendors that must prove a subscription sign-in, an unverified meter
+    // is the headline: the vendor is not routable however much allowance it has.
+    const unverified = REQUIRES_SUBSCRIPTION_CHECK.has(provider) && p.auth?.ok !== true;
+    const auth = unverified
+      ? `NOT ROUTABLE: ${p.auth?.reason ?? s.reason} `
+      : (provider === 'grok' && p.auth?.ok ? `auth=${p.auth.authMode ?? p.auth.method} ` : '');
+    const why = p.available || unverified ? '' : `unavailable: ${p.error}`;
     const stale = p.stale
       ? `last good reading ${Math.max(1, Math.round((now - (Date.parse(p.stale.since) || now)) / 60_000))}m ago${p.stale.error ? ` (meter: ${p.stale.error})` : ''} `
       : '';

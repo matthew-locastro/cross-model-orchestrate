@@ -1119,6 +1119,40 @@ test('limits omit inactive grok and fail when every active vendor is exhausted',
   assert.equal(limitsExitStatus(limits, roster, now), 3);
 });
 
+test('renderLimits prints NOT ROUTABLE for an unverified subscription-gated vendor, including antigravity', () => {
+  const now = Date.parse('2026-11-22T00:00:00.000Z');
+  const limits = {
+    codex: healthy(),
+    claude: healthy(),
+    antigravity: {
+      available: false,
+      provider: 'antigravity',
+      error: 'an API-key login has no subscription quota; cmo never bills an API key',
+      windows: [],
+      auth: {
+        ok: false,
+        method: 'unknown',
+        reason: 'an API-key login has no subscription quota; cmo never bills an API key',
+      },
+    },
+    inFlight: {},
+  };
+  const rendered = renderLimits(limits, now);
+  const agyLine = rendered.split('\n').find((line) => line.startsWith('antigravity '));
+  assert.ok(agyLine, 'antigravity should appear in active limits output');
+  assert.match(agyLine, /unauthenticated\s+NOT ROUTABLE: an API-key login has no subscription quota; cmo never bills an API key/);
+  assert.doesNotMatch(agyLine, /unavailable:/);
+
+  const unchecked = renderLimits({
+    codex: healthy(),
+    claude: healthy(),
+    antigravity: { ...healthy(), provider: 'antigravity' },
+    inFlight: {},
+  }, now);
+  const uncheckedLine = unchecked.split('\n').find((line) => line.startsWith('antigravity '));
+  assert.match(uncheckedLine, /unauthenticated\s+NOT ROUTABLE: antigravity has not been checked for a subscription sign-in/);
+});
+
 test('human report share excludes inactive grok', async () => {
   const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-report-share-'));
   await writeFile(join(cacheDir, 'dispatches.jsonl'), `${JSON.stringify({

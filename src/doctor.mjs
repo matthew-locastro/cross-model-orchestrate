@@ -34,6 +34,7 @@ const FAIL = 'FAIL';
 const INSTALL_COMMAND = {
   codex: 'npm install -g @openai/codex',
   claude: 'npm install -g @anthropic-ai/claude-code',
+  antigravity: 'curl -fsSL https://antigravity.google/cli/install.sh | bash',
   grok: 'curl -fsSL https://x.ai/cli/install.sh | bash',
 };
 
@@ -164,6 +165,14 @@ async function skillLocations(skillName) {
       }
       rows.push({ host: host.id, state: live ? OK : FAIL, detail: live ? via : `${via} (broken)` });
     } catch {
+      if (host.requires) {
+        try {
+          await lstat(host.requires);
+        } catch {
+          rows.push({ host: host.id, state: OK, detail: 'not initialized (optional)' });
+          continue;
+        }
+      }
       rows.push({ host: host.id, state: WARN, detail: 'not installed' });
     }
   }
@@ -210,7 +219,8 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
   }
   if (active.has('antigravity')) {
     line(agyVersion ? OK : WARN, 'agy',
-      agyVersion ? `${agyVersion}  (${binaries.antigravity})` : 'not on PATH');
+      agyVersion ? `${agyVersion}  (${binaries.antigravity})` : `not on PATH — ${INSTALL_COMMAND.antigravity}`);
+    if (!agyVersion) todo.push([INSTALL_COMMAND.antigravity, 'an active vendor is unavailable']);
   }
   if (active.has('grok')) {
     line(grokVersion ? OK : WARN, 'grok',
@@ -244,30 +254,32 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
   });
 
   log('\nauth');
-  if (active.has('claude')) try {
-    const raw = JSON.parse(await readFile(config.claudeCredentials, 'utf8'));
-    const token = raw?.claudeAiOauth?.accessToken;
-    const expiresAt = raw?.claudeAiOauth?.expiresAt;
-    if (!token) line(WARN, 'claude oauth', 'no accessToken — run `claude` once');
-    else if (typeof expiresAt === 'number' && expiresAt < Date.now()) {
-      line(WARN, 'claude oauth', 'token expired — run `claude` once to refresh');
-    } else line(OK, 'claude oauth', config.claudeCredentials);
-  } catch {
-    // Three different situations produce the same ENOENT, and they have three
-    // different remedies. Saying only "unreadable" makes the reader guess.
-    if (!claudeVersion) {
-      line(WARN, 'claude oauth', 'no claude CLI yet, so there are no credentials to read');
-    } else if (process.platform === 'darwin' && config.claudeCliProbe !== false) {
-      // Not a fault. Claude Code on macOS keeps its credentials in the login
-      // Keychain, so this file never exists there; the meter reads the windows
-      // through the CLI instead, and the headroom section below shows whether
-      // that worked.
-      if (limits.claude?.auth?.ok !== false) {
-        line(OK, 'claude oauth', 'credentials are in the macOS Keychain — the meter reads through the claude CLI');
+  if (active.has('claude')) {
+    try {
+      const raw = JSON.parse(await readFile(config.claudeCredentials, 'utf8'));
+      const token = raw?.claudeAiOauth?.accessToken;
+      const expiresAt = raw?.claudeAiOauth?.expiresAt;
+      if (!token) line(WARN, 'claude oauth', 'no accessToken — run `claude` once');
+      else if (typeof expiresAt === 'number' && expiresAt < Date.now()) {
+        line(WARN, 'claude oauth', 'token expired — run `claude` once to refresh');
+      } else line(OK, 'claude oauth', config.claudeCredentials);
+    } catch {
+      // Three different situations produce the same ENOENT, and they have three
+      // different remedies. Saying only "unreadable" makes the reader guess.
+      if (!claudeVersion) {
+        line(WARN, 'claude oauth', 'no claude CLI yet, so there are no credentials to read');
+      } else if (process.platform === 'darwin' && config.claudeCliProbe !== false) {
+        // Not a fault. Claude Code on macOS keeps its credentials in the login
+        // Keychain, so this file never exists there; the meter reads the windows
+        // through the CLI instead, and the headroom section below shows whether
+        // that worked.
+        if (limits.claude?.auth?.ok !== false) {
+          line(OK, 'claude oauth', 'credentials are in the macOS Keychain — the meter reads through the claude CLI');
+        }
+      } else {
+        line(WARN, 'claude oauth', `not logged in — run \`claude\` once (expected ${config.claudeCredentials})`);
+        todo.push(['claude', 'log in, then quit — this writes the credentials the meter reads']);
       }
-    } else {
-      line(WARN, 'claude oauth', `not logged in — run \`claude\` once (expected ${config.claudeCredentials})`);
-      todo.push(['claude', 'log in, then quit — this writes the credentials the meter reads']);
     }
   }
 
@@ -279,7 +291,6 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
     todo.push(['claude', 'then type /login and finish in the browser — the terminal CLI is signed out, so claude dispatches fail']);
   }
 
-  // Grok: is it the subscription, and can anything make it the API instead?
   if (active.has('antigravity')) {
     const a = limits.antigravity?.auth;
     if (config.agyProbe === false) {
@@ -291,6 +302,7 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
     }
   }
 
+  // Grok: is it the subscription, and can anything make it the API instead?
   let grokListing = null;
   if (active.has('grok') && grokVersion) {
     const g = limits.grok;

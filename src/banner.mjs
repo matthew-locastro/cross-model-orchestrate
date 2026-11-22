@@ -33,7 +33,8 @@ export function nextSteps({ version = '', done = null, stream = process.stdout }
     '',
     ...step(1, 'cmo install', [
       'Wires the skill and the codex-runner subagent into Claude Code,',
-      'Codex, Kilo, OpenCode and Antigravity. npm gave you the CLI and nothing else.',
+      'Codex, Kilo and OpenCode, and links Antigravity when ~/.gemini exists.',
+      'npm gave you the CLI and nothing else.',
     ]),
     ...step(2, 'cmo doctor', [
       'Checks that active vendor CLIs are installed and logged in — cmo',

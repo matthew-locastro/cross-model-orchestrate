@@ -150,6 +150,50 @@ function runInstall(home, args = []) {
   );
 }
 
+function runDoctor(home, { config, stubs = [] } = {}) {
+  const stateDir = mkdtempSync(join(tmpdir(), 'cmo-doctor-state-'));
+  const configDir = mkdtempSync(join(tmpdir(), 'cmo-doctor-config-'));
+  const binDir = mkdtempSync(join(tmpdir(), 'cmo-doctor-bin-'));
+  try {
+    if (config !== undefined) {
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify(config), 'utf8');
+    }
+    for (const name of stubs) {
+      const stub = join(binDir, name);
+      writeFileSync(stub, `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(`${name} 0.0.0-stub\n`)});\n`, { mode: 0o755 });
+    }
+    const env = { ...process.env };
+    for (const key of [
+      'CMO_AGY_BIN', 'CMO_GROK_BIN', 'CMO_FLEET_URL', 'CMO_FLEET_TOKEN',
+      'CMO_CLAUDE_CREDENTIALS', 'CMO_CODEX_SESSIONS', 'XAI_API_KEY', 'GROK_CODE_XAI_API_KEY',
+    ]) {
+      delete env[key];
+    }
+    Object.assign(env, {
+      HOME: home,
+      PATH: binDir,
+      CMO_CACHE_DIR: stateDir,
+      CMO_CONFIG_DIR: configDir,
+      CMO_CLAUDE_CLI_PROBE: '0',
+      CMO_GROK_PROBE: '0',
+      CMO_AGY_PROBE: '0',
+    });
+    const stdout = execFileSync(
+      process.execPath,
+      [join(PACKAGE_ROOT, 'bin', 'cmo.mjs'), 'doctor'],
+      { env, encoding: 'utf8' },
+    );
+    return { code: 0, stdout };
+  } catch (err) {
+    if (typeof err?.stdout === 'string') return { code: err.status ?? 1, stdout: err.stdout };
+    throw err;
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(configDir, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+}
+
 test('install wires the skill into every available host and the agent into Claude', () => {
   fakeHome((home) => {
     mkdirSync(join(home, '.gemini'), { recursive: true });
@@ -198,11 +242,43 @@ test('Antigravity links only after its home directory exists', async () => {
   }
 });
 
-test('banner describes orchestration from every host', () => {
+test('banner describes orchestration from every host and says Antigravity links when ~/.gemini exists', () => {
   const text = nextSteps();
+  assert.match(text, /links Antigravity when ~\/\.gemini exists/);
+  assert.doesNotMatch(text, /OpenCode and Antigravity\./);
   assert.match(text, /Any host with the skill can orchestrate with \`cmo run\` units/);
   assert.match(text, /Claude Code\s+adds Workflow fan-outs and steering/);
   assert.match(text, /Codex orchestrator needs network \(full access\)/);
+});
+
+test('doctor reports an uninitialized optional skill host without a warning', () => {
+  fakeHome((home) => {
+    runInstall(home, ['install']);
+    const sessionDir = join(home, '.codex/sessions/2026/11/22');
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      join(sessionDir, 'rollout-1.jsonl'),
+      `${JSON.stringify({ payload: { type: 'token_count', rate_limits: { primary: { used_percent: 5, window_minutes: 300 } } } })}\n`,
+      'utf8',
+    );
+
+    const absent = runDoctor(home, { config: { providers: ['codex'] }, stubs: ['codex'] });
+    assert.equal(absent.code, 0);
+    assert.match(absent.stdout, /^\s+ok\s+antigravity\s+not initialized \(optional\)$/m);
+    assert.match(absent.stdout, /^everything checks out\.$/m);
+
+    mkdirSync(join(home, '.gemini'), { recursive: true });
+    const unlinked = runDoctor(home, { config: { providers: ['codex'] }, stubs: ['codex'] });
+    assert.match(unlinked.stdout, /^\s+warn\s+antigravity\s+not installed$/m);
+  });
+});
+
+test('doctor adds an install hint and todo step when agy is missing', () => {
+  fakeHome((home) => {
+    const out = runDoctor(home, { stubs: ['codex', 'claude'] });
+    assert.match(out.stdout, /^\s+warn\s+agy\s+not on PATH — curl -fsSL https:\/\/antigravity\.google\/cli\/install\.sh \| bash$/m);
+    assert.match(out.stdout, /to finish setup[\s\S]*curl -fsSL https:\/\/antigravity\.google\/cli\/install\.sh \| bash\s+# an active vendor is unavailable/);
+  });
 });
 
 test('install is idempotent', () => {
