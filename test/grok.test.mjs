@@ -67,14 +67,14 @@ const grokReading = (auth = grokAuthFrom(SUBSCRIPTION), percent = 9) => ({
   auth,
 });
 
-function withGrok(body) {
+async function withGrok(body) {
   const dir = mkdtempSync(join(tmpdir(), 'cmo-grok-roster-'));
   const file = join(dir, 'config.json');
   writeFileSync(file, JSON.stringify({ providers: ['codex', 'claude', 'grok'] }), 'utf8');
   try {
     resetConfigCache();
     loadConfig({ file, reload: true });
-    return body();
+    return await body();
   } finally {
     resetConfigCache();
     rmSync(dir, { recursive: true, force: true });
@@ -261,19 +261,19 @@ test('the test suite never probes the real grok CLI', async () => {
   assert.match(r.auth.reason, /disabled/);
 });
 
-test('readLimits reports grok alongside the others, unverified unless a reader says otherwise', async () => {
+test('readLimits reports grok alongside the others, unverified unless a reader says otherwise', async () => withGrok(async () => {
   const codex = async () => healthy();
   const claude = async () => healthy();
   const without = await readLimits({ readers: { codex, claude }, refresh: true });
   assert.equal(without.grok.auth.ok, false);
-  const withGrok = await readLimits({
+  const withGrokReading = await readLimits({
     readers: { codex, claude, grok: async () => grokReading() },
     refresh: true,
   });
-  assert.equal(withGrok.grok.auth.ok, true);
-  assert.equal(typeof withGrok.grok.pressurePercent, 'number');
-  assert.equal(withGrok.inFlight.grok, 0);
-});
+  assert.equal(withGrokReading.grok.auth.ok, true);
+  assert.equal(typeof withGrokReading.grok.pressurePercent, 'number');
+  assert.equal(withGrokReading.inFlight.grok, 0);
+}));
 
 // ── routing ──────────────────────────────────────────────────────────────
 

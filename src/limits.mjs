@@ -63,7 +63,7 @@ import { access, readFile, readdir, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { delimiter, join } from 'node:path';
 
-import { CACHE_DIR, loadConfig } from './config.mjs';
+import { activeProviders, CACHE_DIR, loadConfig } from './config.mjs';
 import { GROK_METER_SOURCE, probeGrok } from './grok.mjs';
 import {
   applyCommitted, freshProbe, inFlight, lastGoodReading, mutate, rememberGoodReading, snapshot,
@@ -79,6 +79,7 @@ const FETCH_TIMEOUT_MS = 5_000;
 export const CLAUDE_CLI_SOURCE = 'claude -p stream-json rate_limit_event';
 const CLI_PROBE_TIMEOUT_MS = 60_000;
 const PROBE_MODEL = 'claude-haiku-4-5-20251001';
+export const ANTIGRAVITY_METER_SOURCE = 'agy -p /usage --output-format json';
 
 /**
  * Is the vendor CLI even on PATH?
@@ -707,6 +708,93 @@ export async function readClaudeLimits({ credentialsPath, fetchImpl, refresh, cl
   return unavailable('claude', `${viaOAuth.error}; and through the CLI: ${viaCli?.error ?? 'no reading'}`);
 }
 
+// ── antigravity ──────────────────────────────────────────────────────────
+
+/** Run the no-inference `/usage` slash command. It must not disable slash commands. */
+async function runAntigravityProbe(binary) {
+  const { spawn } = await import('node:child_process');
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(binary, ['-p', '/usage', '--output-format', 'json'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+function unverifiedAntigravity(error) {
+  return {
+    ...unavailable('antigravity', error),
+    auth: { ok: false, method: 'unknown', reason: error },
+  };
+}
+
+/**
+ * Read the Antigravity subscription windows from its local `/usage` command.
+ * A successful response is the subscription proof: API-key sessions exit 2
+ * because they have no account quota, and are never eligible for routing.
+ */
+export async function readAntigravityLimits({ probe } = {}) {
+  const cfg = loadConfig();
+  if (!probe && cfg.agyProbe === false) {
+    return unverifiedAntigravity('the antigravity probe is disabled, so its subscription sign-in is unverified');
+  }
+  try {
+    const result = await (probe ?? (() => runAntigravityProbe(cfg.agyBinary)))();
+    const code = typeof result === 'object' && result !== null ? result.code : 0;
+    if (code === 2) {
+      return unverifiedAntigravity('an API-key login has no subscription quota; cmo never bills an API key');
+    }
+    if (code !== 0) {
+      return unverifiedAntigravity(`agy /usage exited ${code ?? 'without an exit code'}`);
+    }
+    const stdout = typeof result === 'string' ? result : result?.stdout;
+    const envelope = typeof stdout === 'string' ? JSON.parse(stdout) : null;
+    const groups = envelope?.command?.data?.groups;
+    if (!Array.isArray(groups)) throw new Error('the agy /usage response has no quota groups');
+    const gemini = groups.find((group) => group?.name === 'Gemini Models');
+    if (!gemini || !Array.isArray(gemini.buckets)) throw new Error('the agy /usage response has no Gemini Models group');
+    const keys = new Map([['gemini-5h', { key: '5h', label: '5hr' }], ['gemini-weekly', { key: 'weekly', label: 'Wkly' }]]);
+    const windows = gemini.buckets.flatMap((bucket) => {
+      const named = keys.get(bucket?.id);
+      const remaining = Number(bucket?.remaining_fraction);
+      const reset = normalizeReset(bucket?.reset_time);
+      if (!named || !Number.isFinite(remaining) || remaining < 0 || remaining > 1 || !reset || Date.parse(reset) <= 0) return [];
+      return [{ ...named, percentUsed: clampPercent((1 - remaining) * 100), resetsAt: reset }];
+    });
+    if (windows.length === 0) throw new Error('the agy /usage response has no Gemini subscription windows');
+    return {
+      ...summarize('antigravity', windows, { source: ANTIGRAVITY_METER_SOURCE }),
+      auth: { ok: true, method: 'subscription' },
+      installed: true,
+    };
+  } catch (err) {
+    const missing = err?.code === 'ENOENT';
+    const message = missing ? 'agy is not on PATH' : (err instanceof Error ? err.message : String(err));
+    return {
+      ...unverifiedAntigravity(`could not read agy /usage: ${message}`),
+      ...(missing ? { installed: false } : {}),
+    };
+  }
+}
+
+/** Stand-in when callers inject readers but do not mention Antigravity. */
+async function antigravityNotProbed() {
+  return unverifiedAntigravity('antigravity was not probed, so its subscription sign-in is unverified');
+}
+
 // ── grok ──────────────────────────────────────────────────────────────────
 
 /**
@@ -830,53 +918,55 @@ export async function holdLastGood(provider, value, { now = Date.now(), maxAgeMs
 export async function readLimits({ refresh = false, now = Date.now(), readers, includeCommitted = true } = {}) {
   const cfg = loadConfig();
   const nowFn = () => now;
-  const readCodex = readers?.codex ?? readCodexLimits;
-  const readClaude = readers?.claude ?? readClaudeLimits;
-  // Injected readers are a test deciding what the probes say; one that does not
-  // mention grok gets an unverified grok rather than a real CLI call.
-  const readGrok = readers?.grok ?? (readers ? grokNotProbed : readGrokLimits);
+  const providers = activeProviders(cfg);
+  const readersByProvider = {
+    codex: readers?.codex ?? readCodexLimits,
+    claude: readers?.claude ?? readClaudeLimits,
+    antigravity: readers?.antigravity ?? (readers ? antigravityNotProbed : readAntigravityLimits),
+    // Injected readers are a test deciding what the probes say; one that does not
+    // mention grok gets an unverified grok rather than a real CLI call.
+    grok: readers?.grok ?? (readers ? grokNotProbed : readGrokLimits),
+  };
   const holding = (provider, read) => async () => holdLastGood(provider, await read(), {
     now, maxAgeMs: cfg.freshness.lastGood ?? 0,
   });
-
-  const [codexProbe, claudeProbe, grokProbe] = await Promise.all([
-    freshProbe('codex', refresh ? -1 : cfg.freshness.codex, holding('codex', readCodex), { now: nowFn }),
-    // A reading taken through the CLI cost a turn rather than a GET, so it is
-    // reused for longer. Decided per entry: the same machine can hold either.
-    freshProbe('claude', refresh ? -1 : (entry) => (
+  const freshnessFor = (provider) => {
+    if (refresh) return -1;
+    if (provider === 'claude') return (entry) => (
       entry?.value?.source === CLAUDE_CLI_SOURCE
         ? Math.max(cfg.freshness.claude, cfg.freshness.claudeCli ?? 0)
         : cfg.freshness.claude
-    ), holding('claude', readClaude), { now: nowFn }),
-    // A signed-out grok is re-asked sooner: `grok login` is the fix, and the
-    // first dispatch after it should not wait out a minute of stale "no".
-    freshProbe('grok', refresh ? -1 : (entry) => (
+    );
+    if (provider === 'grok') return (entry) => (
       entry?.value?.auth?.ok ? cfg.freshness.grok : (cfg.freshness.grokSignedOut ?? cfg.freshness.grok)
-    ), holding('grok', readGrok), { now: nowFn }),
-  ]);
+    );
+    return cfg.freshness[provider];
+  };
+  const probes = Object.fromEntries(await Promise.all(providers.map(async (provider) => [
+    provider,
+    await freshProbe(provider, freshnessFor(provider), holding(provider, readersByProvider[provider]), { now: nowFn }),
+  ])));
 
   const state = await snapshot({ now: nowFn });
   const committed = (probe, provider) => (
     includeCommitted ? applyCommitted(probe.value, state, provider) : probe.value
   );
-  const codex = committed(codexProbe, 'codex');
-  const claude = committed(claudeProbe, 'claude');
-  const grok = committed(grokProbe, 'grok');
+  const values = Object.fromEntries(providers.map((provider) => [provider, committed(probes[provider], provider)]));
 
   // Recorded on the reading itself so the routing decision can tell an absent
   // CLI from an unreadable meter. Injected readers (tests) are exempt: they are
   // deciding what the probe says, so PATH is not theirs to be judged by.
   if (!readers) {
-    const grokBinary = cfg.grokBinary ?? 'grok';
-    const [codexInstalled, claudeInstalled, grokInstalled] = await Promise.all([
-      binaryOnPath('codex'), binaryOnPath('claude'),
-      grokBinary.includes('/')
-        ? access(grokBinary, constants.X_OK).then(() => true, () => false)
-        : binaryOnPath(grokBinary),
-    ]);
-    if (codex && typeof codex === 'object') codex.installed = codexInstalled;
-    if (claude && typeof claude === 'object') claude.installed = claudeInstalled;
-    if (grok && typeof grok === 'object') grok.installed = grokInstalled;
+    const binaries = { codex: 'codex', claude: 'claude', antigravity: cfg.agyBinary ?? 'agy', grok: cfg.grokBinary ?? 'grok' };
+    const installed = Object.fromEntries(await Promise.all(providers.map(async (provider) => {
+      const binary = binaries[provider];
+      return [provider, binary.includes('/')
+        ? await access(binary, constants.X_OK).then(() => true, () => false)
+        : await binaryOnPath(binary)];
+    })));
+    for (const provider of providers) {
+      if (values[provider] && typeof values[provider] === 'object') values[provider].installed = installed[provider];
+    }
   }
 
   // Pace-adjusted pressure, attached to the reading so a JSON consumer sees the
@@ -895,15 +985,9 @@ export async function readLimits({ refresh = false, now = Date.now(), readers, i
   };
 
   return {
-    codex: withPressure(codex),
-    claude: withPressure(claude),
-    grok: withPressure(grok),
-    cached: { codex: codexProbe.cached, claude: claudeProbe.cached, grok: grokProbe.cached },
-    inFlight: {
-      codex: inFlight(state, 'codex'),
-      claude: inFlight(state, 'claude'),
-      grok: inFlight(state, 'grok'),
-    },
+    ...Object.fromEntries(providers.map((provider) => [provider, withPressure(values[provider])])),
+    cached: Object.fromEntries(providers.map((provider) => [provider, probes[provider].cached])),
+    inFlight: Object.fromEntries(providers.map((provider) => [provider, inFlight(state, provider)])),
     // Whether these figures cover the whole fleet or only this machine, and
     // where the in-flight work actually is. The caller needs to know which,
     // because a single-box view during a coordinator outage is a weaker claim.

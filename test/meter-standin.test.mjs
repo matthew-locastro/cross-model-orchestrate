@@ -119,7 +119,7 @@ test('a rate-limit error moves the last good reading forward: a later meter fail
   assert.equal(providerState(held, undefined, NOW + 3 * MIN, 'grok').state, 'exhausted');
 });
 
-test('a cached stand-in is not served past its expiry', async () => {
+test('a cached stand-in is not served past its expiry', async () => withGrok(async () => {
   let calls = 0;
   const T = NOW + 10 * 24 * 60 * MIN; // a fresh stretch of this file's ledger
   const good = { ...GROK_GOOD, windows: [{ ...GROK_GOOD.windows[0], resetsAt: new Date(T + 3 * 24 * 60 * MIN).toISOString() }] };
@@ -135,15 +135,15 @@ test('a cached stand-in is not served past its expiry', async () => {
   const past = await readLimits({ readers, now: T + 30.2 * MIN });
   assert.equal(calls, 3, 'the expired stand-in was not served from cache');
   assert.equal(past.grok.available, false);
-});
+}));
 
-test('on an equal clock the later write is the last good reading', async () => {
+test('on an equal clock the later write is the last good reading', async () => withGrok(async () => {
   const T = NOW + 20 * 24 * 60 * MIN;
   await holdLastGood('grok', grokAt(6), { now: T });
   await markExhausted('grok', { now: T });
   const held = await holdLastGood('grok', GROK_METER_FAILED, { now: T + MIN });
   assert.equal(held.hardBlocked, true);
-});
+}));
 
 test('a stand-in ends exactly at its age limit', async () => {
   const T = NOW + 30 * 24 * 60 * MIN;

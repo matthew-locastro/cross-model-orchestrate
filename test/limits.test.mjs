@@ -10,6 +10,22 @@ import {
   CLAUDE_CLI_SOURCE, parseClaudeRateLimitEvents, readClaudeLimits, readClaudeLimitsViaCli, readLimits,
 } from '../src/limits.mjs';
 
+test('readLimits reads only the default active roster, so Grok has no row or probe', async () => {
+  const calls = [];
+  const reading = (provider) => ({ provider, available: true, windows: [], worstPercent: 5 });
+  const limits = await readLimits({
+    refresh: true,
+    readers: {
+      codex: async () => { calls.push('codex'); return reading('codex'); },
+      claude: async () => { calls.push('claude'); return reading('claude'); },
+      antigravity: async () => { calls.push('antigravity'); return reading('antigravity'); },
+      grok: async () => { calls.push('grok'); return reading('grok'); },
+    },
+  });
+  assert.deepEqual(calls.sort(), ['antigravity', 'claude', 'codex']);
+  assert.deepEqual(Object.keys(limits).filter((key) => ['codex', 'claude', 'antigravity', 'grok'].includes(key)).sort(), ['antigravity', 'claude', 'codex']);
+});
+
 // The Claude OAuth token lives for hours, not days. When it lapses the usage
 // endpoint stops answering, headroom reads as unknown, and unknown is treated
 // as usable — so a blind meter fails toward over-dispatching. That happened on
