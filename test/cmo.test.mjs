@@ -9,8 +9,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 
 import {
   extractLatestRateLimits,
@@ -20,7 +20,7 @@ import {
   normalizeReset,
 } from '../src/limits.mjs';
 import { decide, providerState, tierFor, pressure } from '../src/policy.mjs';
-import { DEFAULT_MODELS, loadConfig, resetConfigCache } from '../src/config.mjs';
+import { CACHE_DIR, CONFIG_DIR, DEFAULT_MODELS, loadConfig, resetConfigCache } from '../src/config.mjs';
 import { packageIsEphemeral } from '../src/install.mjs';
 import {
   backoffMs,
@@ -1047,6 +1047,37 @@ test('outcome --force writes an orphan record', async () => {
   );
 });
 
+test('outcome records against an existing local receipt without marking an orphan', async () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-outcome-local-'));
+  await writeFile(join(cacheDir, 'dispatches.jsonl'), `${JSON.stringify({
+    at: Date.now(), id: 'd-local', provider: 'antigravity', role: 'review', model: 'gemini-4-carbon',
+  })}\n`);
+  const output = captureOutput();
+  const code = await outcomeCommand(
+    [
+      'outcome', 'd-local',
+      '--verdict', 'fixed',
+      '--rounds', '2',
+      '--note', 're-verified after patch',
+      '--by', 'codex',
+    ],
+    cacheDir,
+    output.sink,
+  );
+
+  assert.equal(code, 0);
+  assert.equal(output.text('stderr'), '');
+  const printed = JSON.parse(output.text('stdout').trim());
+  const saved = JSON.parse((await readFile(join(cacheDir, 'outcomes.jsonl'), 'utf8')).trim());
+  assert.deepEqual(printed, saved);
+  assert.equal(saved.id, 'd-local');
+  assert.equal(saved.verdict, 'fixed');
+  assert.equal(saved.rounds, 2);
+  assert.equal(saved.note, 're-verified after patch');
+  assert.equal(saved.by, 'codex');
+  assert.equal(Object.hasOwn(saved, 'orphan'), false);
+});
+
 test('outcome rejects invalid verdicts and round counts with usage status', async () => {
   const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-outcome-invalid-'));
   const badVerdict = captureOutput();
@@ -1082,15 +1113,45 @@ test('report --quality --json emits the stable quality envelope', async () => {
       orphans: 0,
       groups: [{
         provider: 'codex', role: 'review', model: 'gpt-5.6-terra', n: 1,
-        firstRoundApprovals: 1, blocked: 0, confirmed: 0,
+        firstRoundApprovals: 1, firstRoundApprovalRate: 1, blocked: 0, confirmed: 0,
         falsePositive: 0, missed: 0, meanRounds: 1,
       }],
     },
   });
 });
 
+test('report --quality formats human output with first-round approval rate and counts', async () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-report-quality-human-'));
+  const now = Date.now();
+  await writeFile(join(cacheDir, 'dispatches.jsonl'), [
+    JSON.stringify({ at: now, id: 'd-q1', provider: 'codex', role: 'review', model: 'gpt-5.6-terra' }),
+    JSON.stringify({ at: now, id: 'd-q2', provider: 'codex', role: 'review', model: 'gpt-5.6-terra' }),
+    '',
+  ].join('\n'));
+  await writeFile(join(cacheDir, 'outcomes.jsonl'), [
+    JSON.stringify({ at: now, id: 'd-q1', verdict: 'approved', rounds: 1 }),
+    JSON.stringify({ at: now, id: 'd-q2', verdict: 'blocked', rounds: 3 }),
+    JSON.stringify({ at: now, id: 'd-orphan', verdict: 'approved', rounds: 1, orphan: true }),
+    '',
+  ].join('\n'));
+  const output = captureOutput();
+
+  assert.equal(await cmoMain(
+    ['report', '--quality'], { cacheDir, outputSink: output.sink },
+  ), 0);
+  assert.equal(output.text('stderr'), '');
+  const text = output.text('stdout');
+  assert.match(text, /quality outcomes — last 24h/);
+  assert.match(text, /2 outcomes · 1 orphan\b/);
+  assert.match(
+    text,
+    /codex \/ review \/ gpt-5\.6-terra: n=2 first-round approvals=1\/2 \(50%\) mean rounds=2 blocked=1 confirmed=0 false-positive=0 missed=0/,
+  );
+});
+
 test('help names the active roster and keeps grok explicitly opt-in', () => {
   assert.match(USAGE, /^\s*outcome\s+/m);
+  assert.match(USAGE, /--hosts\s+comma-separated subset: claude,codex,agents,kilo,opencode,antigravity/);
   assert.match(USAGE, /codex\|claude\|antigravity/);
   assert.match(USAGE, /config "providers"/);
   assert.doesNotMatch(USAGE, /grok first/i);
@@ -1159,9 +1220,97 @@ test('human report share excludes inactive grok', async () => {
     at: Date.now(), id: 'd-share', provider: 'codex', role: 'implement', model: 'gpt-5.6-terra',
   })}\n`);
   const output = captureOutput();
+  const limits = {
+    codex: healthy(),
+    claude: healthy(),
+    antigravity: { ...healthy(), provider: 'antigravity', auth: { ok: true, method: 'subscription' } },
+  };
+  const readLimits = async () => { throw new Error('report should not probe live meters'); };
 
-  assert.equal(await cmoMain(['report'], { cacheDir, outputSink: output.sink }), 0);
+  assert.equal(await cmoMain(['report'], { cacheDir, outputSink: output.sink, limits, readLimits }), 0);
   const shareLine = output.text('stdout').split('\n').find((line) => line.includes('· share '));
   assert.match(shareLine, /codex 100% \/ claude 0% \/ antigravity 0%/);
   assert.doesNotMatch(shareLine, /grok/);
+});
+
+test('test isolation keeps every test-time path out of the real home directory', () => {
+  const home = homedir();
+  const isInside = (target, root) => {
+    const rel = relative(resolve(root), resolve(target));
+    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  };
+  resetConfigCache();
+  const cfg = loadConfig({ reload: true });
+  const forbidden = [
+    ['claudeCredentials', cfg.claudeCredentials, join(home, '.claude')],
+    ['codexSessionsRoot', cfg.codexSessionsRoot, join(home, '.codex')],
+    ['GROK_HOME', process.env.GROK_HOME ?? join(home, '.grok'), join(home, '.grok')],
+    ['CACHE_DIR', CACHE_DIR, join(home, '.cache', 'cross-model-orchestrate')],
+    ['CONFIG_DIR', CONFIG_DIR, join(home, '.config', 'cross-model-orchestrate')],
+    ['configFile', cfg.configFile, join(home, '.config', 'cross-model-orchestrate')],
+  ];
+  for (const [label, target, root] of forbidden) {
+    assert.equal(isInside(target, root), false, `${label} (${target}) must not resolve inside ${root}`);
+  }
+  assert.equal(cfg.claudeCliProbe, false);
+  assert.equal(cfg.grokProbe, false);
+  assert.equal(cfg.agyProbe, false);
+});
+
+test('cmoMain injects limits or readLimits for report and limits without probing live meters', async () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-inject-limits-'));
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => { throw new Error(`unexpected network request during test: ${url}`); };
+
+  try {
+    const injected = {
+      codex: { available: false, error: 'injected-codex-dark' },
+      claude: healthy(),
+      antigravity: { ...healthy(), provider: 'antigravity', auth: { ok: true, method: 'subscription' } },
+      inFlight: {},
+    };
+    const reportOut = captureOutput();
+    assert.equal(await cmoMain(['report'], {
+      cacheDir,
+      outputSink: reportOut.sink,
+      limits: injected,
+      readLimits: async () => { throw new Error('must not call readLimits when limits are injected'); },
+    }), 0);
+    assert.match(reportOut.text('stdout'), /the codex meter is dark: injected-codex-dark/);
+
+    let reads = 0;
+    const readerOut = captureOutput();
+    assert.equal(await cmoMain(['report', '--json'], {
+      cacheDir,
+      outputSink: readerOut.sink,
+      readLimits: async () => {
+        reads += 1;
+        return injected;
+      },
+    }), 0);
+    assert.equal(reads, 1);
+    const parsedReport = JSON.parse(readerOut.text('stdout'));
+    assert.match(parsedReport.findings[0].finding, /injected-codex-dark/);
+
+    const limitsOut = captureOutput();
+    assert.equal(await cmoMain(['limits', '--human'], {
+      outputSink: limitsOut.sink,
+      limits: {
+        codex: healthy(12),
+        claude: healthy(24),
+        antigravity: { ...healthy(36), provider: 'antigravity', auth: { ok: true, method: 'subscription' } },
+        inFlight: {},
+      },
+      readLimits: async () => { throw new Error('must not call readLimits when limits are injected'); },
+    }), 0);
+    assert.match(limitsOut.text('stdout'), /^codex\s+ok/m);
+    assert.match(limitsOut.text('stdout'), /^antigravity\s+ok/m);
+
+    // Even an un-injected report stays strictly offline under test/isolate.mjs.
+    const offlineOut = captureOutput();
+    assert.equal(await cmoMain(['report'], { cacheDir, outputSink: offlineOut.sink }), 0);
+    assert.doesNotMatch(offlineOut.text('stdout'), /antigravity meter is dark/);
+  } finally {
+    globalThis.fetch = oldFetch;
+  }
 });

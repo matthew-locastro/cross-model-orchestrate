@@ -19,7 +19,8 @@ import { appendFile, mkdir, open, readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
-import { CACHE_DIR, PROVIDERS } from './config.mjs';
+import { activeProviders, CACHE_DIR, PROVIDERS } from './config.mjs';
+import { REQUIRES_SUBSCRIPTION_CHECK } from './policy.mjs';
 
 export const AUDIT_FILE = join(CACHE_DIR, 'dispatches.jsonl');
 
@@ -175,7 +176,11 @@ export function qualityReport(receipts, outcomes) {
     total,
     orphans,
     groups: [...groups.values()]
-      .map(({ rounds, ...group }) => ({ ...group, meanRounds: Math.round((rounds / group.n) * 100) / 100 }))
+      .map(({ rounds, ...group }) => ({
+        ...group,
+        firstRoundApprovalRate: Math.round((group.firstRoundApprovals / group.n) * 100) / 100,
+        meanRounds: Math.round((rounds / group.n) * 100) / 100,
+      }))
       .sort((a, b) => a.provider.localeCompare(b.provider) || a.role.localeCompare(b.role) || a.model.localeCompare(b.model)),
   };
 }
@@ -229,6 +234,13 @@ export function failureTaxonomy(rows) {
   return Object.fromEntries(Object.entries(kinds).sort((a, b) => b[1] - a[1]));
 }
 
+const SUBSCRIPTION_SIGN_IN_ACTION = {
+  antigravity: 'Sign in to an Antigravity subscription with `agy` (and unset any API-key override). '
+    + 'cmo never dispatches to antigravity on an API key, so until then its allowance goes unused.',
+  grok: 'Run `grok login` (browser OAuth to the SuperGrok account). cmo never dispatches to grok on an '
+    + 'API key, so until then its allowance goes unused and its research work lands on claude.',
+};
+
 /**
  * The recommendations. Each one names what was measured, so it can be argued
  * with rather than merely obeyed.
@@ -241,22 +253,11 @@ export function findings(rows, { perAgentCost = null, limits = null } = {}) {
   // the first day of a soak: an expired Claude OAuth token silently blinded the
   // Claude side, and the tool carried on dispatching as if the window were
   // unknown-and-usable.
-  // Grok first: an unverified sign-in is not a dark meter, it is a vendor that
-  // cannot be used at all — and the fix is one command.
-  const grok = limits?.grok;
-  if (grok?.auth && grok.auth.ok === false && !/probe (is )?disabled|not probed/.test(grok.auth.reason ?? '')) {
-    out.push({
-      severity: 'medium',
-      finding: `grok is not routable: ${grok.auth.reason}`,
-      action: 'Run `grok login` (browser OAuth to the SuperGrok account). cmo never dispatches to grok on an '
-        + 'API key, so until then its allowance goes unused and its research work lands on claude.',
-    });
-  }
-
   for (const provider of PROVIDERS) {
     const p = limits?.[provider];
-    // An unverified grok has no meter to read; that is the finding above.
-    if (provider === 'grok' && p?.auth?.ok === false) continue;
+    // Vendors that require a verified subscription fail closed rather than
+    // routing blind, so an unverified sign-in is not a dark meter.
+    if (REQUIRES_SUBSCRIPTION_CHECK.has(provider) && p?.auth?.ok === false) continue;
     if (p && p.available === false) {
       out.push({
         severity: 'high',
@@ -266,6 +267,20 @@ export function findings(rows, { perAgentCost = null, limits = null } = {}) {
             + 'unknown, which the policy treats as usable — so it will keep dispatching into a window it cannot see.'
           : 'Fix the probe before trusting anything else here. Unknown headroom is treated as usable by design, '
             + 'so a blind meter fails toward over-dispatching.',
+      });
+    }
+  }
+
+  for (const provider of PROVIDERS) {
+    if (!REQUIRES_SUBSCRIPTION_CHECK.has(provider)) continue;
+    const p = limits?.[provider];
+    const reason = p?.auth?.reason ?? p?.error ?? '';
+    if (p?.auth && p.auth.ok === false && !/probe (is )?disabled|not probed/.test(reason)) {
+      out.push({
+        severity: 'medium',
+        finding: `${provider} is not routable: ${reason || 'subscription sign-in is unverified'}`,
+        action: SUBSCRIPTION_SIGN_IN_ACTION[provider]
+          ?? `Sign in to ${provider}'s subscription account so cmo can route work to it.`,
       });
     }
   }
@@ -309,14 +324,28 @@ export function findings(rows, { perAgentCost = null, limits = null } = {}) {
   }
 
   // The orchestrator is a Claude session, so the question is how much of the
-  // fan-out went OFF claude — to codex or to grok — not how much went to codex.
-  const codex = rows.filter((r) => r.provider === 'codex').length;
-  const grokRows = rows.filter((r) => r.provider === 'grok');
-  const offClaude = pct(codex + grokRows.length, total);
+  // fan-out went OFF claude — across every non-claude vendor — not how much
+  // went to codex alone.
+  const offClaudeCounts = new Map();
+  let offClaudeCount = 0;
+  for (const r of rows) {
+    if (r.provider && r.provider !== 'claude') {
+      offClaudeCount += 1;
+      offClaudeCounts.set(r.provider, (offClaudeCounts.get(r.provider) ?? 0) + 1);
+    }
+  }
+  const offClaude = pct(offClaudeCount, total);
   if (offClaude < 50) {
+    const breakdownProviders = [...new Set([
+      ...activeProviders().filter((p) => p !== 'claude'),
+      ...offClaudeCounts.keys(),
+    ])];
+    const breakdown = breakdownProviders.length
+      ? ` (${breakdownProviders.map((p) => `${p} ${pct(offClaudeCounts.get(p) ?? 0, total)}%`).join(', ')})`
+      : '';
     out.push({
       severity: 'high',
-      finding: `only ${offClaude}% of dispatches went off claude (codex ${pct(codex, total)}%, grok ${pct(grokRows.length, total)}%)`,
+      finding: `only ${offClaude}% of dispatches went off claude${breakdown}`,
       action: 'The orchestrator is a Claude session and cannot move. Route more fan-out through codex-runner, '
         + 'or the run competes with the thing driving it.',
     });
@@ -324,6 +353,7 @@ export function findings(rows, { perAgentCost = null, limits = null } = {}) {
 
   // Every completed grok dispatch should carry the stream's own word that it ran
   // on the subscription. One that does not is the finding that matters most.
+  const grokRows = rows.filter((r) => r.provider === 'grok');
   const unproven = grokRows.filter((r) => r.ok !== false && r.auth !== 'oauth').length;
   if (unproven) {
     out.push({

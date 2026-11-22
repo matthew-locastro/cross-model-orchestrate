@@ -112,3 +112,102 @@ test('a dark meter is reported even with no dispatches at all', () => {
   assert.equal(f.length, 1);
   assert.match(f[0].finding, /codex meter is dark/);
 });
+
+test('antigravity counts toward off-claude share and inactive grok is omitted', () => {
+  const rows = [
+    ...many(1, { provider: 'codex', model: 'gpt-5.6-terra' }),
+    ...many(3, { provider: 'antigravity', model: 'gemini-4-carbon' }),
+  ];
+  const f = findings(rows);
+  assert.equal(f.find((x) => /off claude/.test(x.finding)), undefined);
+  assert.equal(f.some((x) => /grok/i.test(`${x.finding} ${x.action}`)), false);
+  assert.deepEqual(f, []);
+});
+
+test('a Claude-heavy window breaks down off-claude share by active providers plus non-zero legacy providers', () => {
+  const activeOnly = [
+    ...many(2, { provider: 'codex', model: 'gpt-5.6-terra' }),
+    ...many(2, { provider: 'antigravity', model: 'gemini-4-carbon' }),
+    ...many(16, { provider: 'claude', model: 'sonnet' }),
+  ];
+  const fActive = findings(activeOnly).find((x) => /off claude/.test(x.finding));
+  assert.equal(fActive.severity, 'high');
+  assert.match(fActive.finding, /only 20% of dispatches went off claude \(codex 10%, antigravity 10%\)/);
+  assert.doesNotMatch(fActive.finding, /grok/);
+
+  const withLegacyGrok = [
+    ...many(2, { provider: 'codex', model: 'gpt-5.6-terra' }),
+    row({ provider: 'grok', model: 'grok-4.7', auth: 'oauth' }),
+    ...many(17, { provider: 'claude', model: 'sonnet' }),
+  ];
+  const fLegacy = findings(withLegacyGrok).find((x) => /off claude/.test(x.finding));
+  assert.equal(fLegacy.severity, 'high');
+  assert.match(fLegacy.finding, /only 15% of dispatches went off claude \(codex 10%, antigravity 0%, grok 5%\)/);
+});
+
+test('an unverified subscription-gated vendor is not routable rather than a dark meter', () => {
+  const unverified = findings([], {
+    limits: {
+      antigravity: {
+        available: false,
+        error: 'an API-key login has no subscription quota; cmo never bills an API key',
+        auth: {
+          ok: false,
+          method: 'unknown',
+          reason: 'an API-key login has no subscription quota; cmo never bills an API key',
+        },
+      },
+    },
+  });
+  assert.equal(unverified.length, 1);
+  assert.equal(unverified[0].severity, 'medium');
+  assert.match(unverified[0].finding, /antigravity is not routable: an API-key login has no subscription quota/);
+  assert.doesNotMatch(unverified[0].finding, /meter is dark/);
+  assert.match(unverified[0].action, /agy/);
+
+  const probeDisabled = findings([], {
+    limits: {
+      antigravity: {
+        available: false,
+        error: 'the antigravity probe is disabled, so its subscription sign-in is unverified',
+        auth: {
+          ok: false,
+          method: 'unknown',
+          reason: 'the antigravity probe is disabled, so its subscription sign-in is unverified',
+        },
+      },
+    },
+  });
+  assert.deepEqual(probeDisabled, []);
+
+  const notProbed = findings([], {
+    limits: {
+      antigravity: {
+        available: false,
+        error: 'antigravity was not probed, so its subscription sign-in is unverified',
+        auth: {
+          ok: false,
+          method: 'unknown',
+          reason: 'antigravity was not probed, so its subscription sign-in is unverified',
+        },
+      },
+    },
+  });
+  assert.deepEqual(notProbed, []);
+
+  const withDarkMeter = findings([], {
+    limits: {
+      claude: { available: false, error: 'claude oauth token expired' },
+      antigravity: {
+        available: false,
+        error: 'agy /usage exited 1',
+        auth: { ok: false, method: 'unknown', reason: 'agy /usage exited 1' },
+      },
+    },
+  });
+  assert.equal(withDarkMeter.length, 2);
+  assert.equal(withDarkMeter[0].severity, 'high');
+  assert.match(withDarkMeter[0].finding, /claude meter is dark/);
+  assert.equal(withDarkMeter[1].severity, 'medium');
+  assert.match(withDarkMeter[1].finding, /antigravity is not routable: agy \/usage exited 1/);
+});

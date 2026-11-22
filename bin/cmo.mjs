@@ -215,7 +215,7 @@ dispatch
 install options
   --skill-name  install the skill under a different directory name
   --copy        copy instead of symlinking (automatic under npx)
-  --hosts       comma-separated subset: claude,codex,agents,kilo,opencode
+  --hosts       comma-separated subset: claude,codex,agents,kilo,opencode,antigravity
 
 update options
   --yes         actually run it. Without this, update only prints the plan.
@@ -352,7 +352,12 @@ export async function outcomeCommand(argv, cacheDir = CACHE_DIR, outputSink = pr
 
 export async function main(
   argv = process.argv.slice(2),
-  { cacheDir = CACHE_DIR, outputSink = processOutput } = {},
+  {
+    cacheDir = CACHE_DIR,
+    outputSink = processOutput,
+    limits: injectedLimits,
+    readLimits: readLimitsFn = readLimits,
+  } = {},
 ) {
   const args = parseArgs(argv);
   const command = args._[0];
@@ -480,13 +485,16 @@ export async function main(
       outputSink(`quality outcomes — last ${spec}\n`, 'stdout');
       outputSink(`${quality.total} outcomes · ${quality.orphans} orphan${quality.orphans === 1 ? '' : 's'}\n`, 'stdout');
       for (const group of quality.groups) {
-        outputSink(`  ${group.provider} / ${group.role} / ${group.model}: n=${group.n} first-round approvals=${group.firstRoundApprovals} mean rounds=${group.meanRounds} blocked=${group.blocked} confirmed=${group.confirmed} false-positive=${group.falsePositive} missed=${group.missed}\n`, 'stdout');
+        const approvalPct = Math.round(group.firstRoundApprovalRate * 100);
+        outputSink(`  ${group.provider} / ${group.role} / ${group.model}: n=${group.n} first-round approvals=${group.firstRoundApprovals}/${group.n} (${approvalPct}%) mean rounds=${group.meanRounds} blocked=${group.blocked} confirmed=${group.confirmed} false-positive=${group.falsePositive} missed=${group.missed}\n`, 'stdout');
       }
       return 0;
     }
     const rows = await readAudit({ sinceMs, cacheDir });
     const cost = await perAgentCost('codex').catch(() => null);
-    const lim = await readLimits().catch(() => null);
+    const lim = injectedLimits !== undefined
+      ? injectedLimits
+      : await readLimitsFn().catch(() => null);
     const sum = summarise(rows);
     const tiers = tierStats(rows);
     const fails = failureTaxonomy(rows);
@@ -538,11 +546,13 @@ export async function main(
   }
 
   if (command === 'limits') {
-    const limits = await readLimits({ refresh: Boolean(args.refresh) });
+    const limits = injectedLimits !== undefined
+      ? injectedLimits
+      : await readLimitsFn({ refresh: Boolean(args.refresh) });
     if (args.human) {
-      process.stdout.write(`${renderLimits(limits)}\n`);
+      outputSink(`${renderLimits(limits)}\n`, 'stdout');
     } else {
-      process.stdout.write(`${JSON.stringify(limits, null, 2)}\n`);
+      outputSink(`${JSON.stringify(limits, null, 2)}\n`, 'stdout');
     }
     // Non-zero when no provider can take work, so a shell caller can branch.
     return limitsExitStatus(limits);
@@ -560,7 +570,9 @@ export async function main(
       process.stderr.write(`cmo plan: ${err.message}\n`);
       return 2;
     }
-    const limits = await readLimits({ refresh: Boolean(planArgs.refresh) });
+    const limits = injectedLimits !== undefined
+      ? injectedLimits
+      : await readLimitsFn({ refresh: Boolean(planArgs.refresh) });
     const decision = decide(taskFromArgs(planArgs), limits, await timing(planArgs));
     if (args.human) {
       if (!decision.ok) {
@@ -625,7 +637,9 @@ export async function main(
       process.stderr.write(`cmo run: ${err.message}\n`);
       return 2;
     }
-    const limits = await readLimits({ refresh: Boolean(runArgs.refresh) });
+    const limits = injectedLimits !== undefined
+      ? injectedLimits
+      : await readLimitsFn({ refresh: Boolean(runArgs.refresh) });
     const { timeoutMs, durations } = await timing(runArgs);
     const decision = decide(taskFromArgs(runArgs), limits, { timeoutMs, durations });
     if (!decision.ok) {

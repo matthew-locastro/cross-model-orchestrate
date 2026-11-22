@@ -41,8 +41,32 @@ test('quality report groups outcomes by provider, role and model with exact metr
     total: 5,
     orphans: 1,
     groups: [
-      { provider: 'claude', role: 'implement', model: 'sonnet', n: 3, firstRoundApprovals: 0, meanRounds: 2.67, blocked: 0, confirmed: 1, falsePositive: 1, missed: 1 },
-      { provider: 'codex', role: 'review', model: 'gpt-5.6-terra', n: 2, firstRoundApprovals: 1, meanRounds: 2, blocked: 1, confirmed: 0, falsePositive: 0, missed: 0 },
+      {
+        provider: 'claude', role: 'implement', model: 'sonnet', n: 3,
+        firstRoundApprovals: 0, firstRoundApprovalRate: 0, meanRounds: 2.67,
+        blocked: 0, confirmed: 1, falsePositive: 1, missed: 1,
+      },
+      {
+        provider: 'codex', role: 'review', model: 'gpt-5.6-terra', n: 2,
+        firstRoundApprovals: 1, firstRoundApprovalRate: 0.5, meanRounds: 2,
+        blocked: 1, confirmed: 0, falsePositive: 0, missed: 0,
+      },
     ],
   });
+});
+
+test('quality report rounds fractional first-round approval rates to a 0..1 ratio', () => {
+  const receipts = [
+    { id: 'd-a1', provider: 'antigravity', role: 'implement', model: 'gemini-4-carbon' },
+    { id: 'd-a2', provider: 'antigravity', role: 'implement', model: 'gemini-4-carbon' },
+    { id: 'd-a3', provider: 'antigravity', role: 'implement', model: 'gemini-4-carbon' },
+  ];
+  const outcomes = [
+    { id: 'd-a1', verdict: 'approved', rounds: 1 },
+    { id: 'd-a2', verdict: 'approved', rounds: 1 },
+    { id: 'd-a3', verdict: 'fixed', rounds: 2 },
+  ];
+  const report = qualityReport(receipts, outcomes);
+  assert.equal(report.groups[0].firstRoundApprovals, 2);
+  assert.equal(report.groups[0].firstRoundApprovalRate, 0.67);
 });
