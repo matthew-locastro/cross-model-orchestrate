@@ -14,8 +14,9 @@
 //                stall: past its time budget an agent that keeps producing
 //                output keeps going, and only silence or the hard ceiling
 //                stops it. Cutting off good progress wastes the whole run.
-//   stdin prompt Prompts go down stdin, never argv. Long prompts blow argv
-//                limits and shell-quoting bugs corrupt them silently.
+//   prompt path  Prompts use each CLI's non-interactive channel. Codex reads
+//                stdin, Grok reads a file and Antigravity uses -p until the
+//                prompt is too large, then switches to one stream-json line.
 //   retries      Bounded, classified, with exponential backoff and jitter.
 //                A deterministic error is not retried; retrying it just burns
 //                quota N times before failing anyway.
@@ -55,6 +56,10 @@ import {
 import { MAX_LEASE_MS, mutate, recordSample, releaseReservation, reserve, snapshot } from './ledger.mjs';
 import { newDispatchId, record } from './audit.mjs';
 import { identity } from './remote.mjs';
+import {
+  antigravityInput, antigravitySoftDenyWarning, classifyAntigravityFailure, isAntigravityModel,
+  isJsonObject, isLongAgyPrompt, parseAntigravityStdout,
+} from './antigravity.mjs';
 
 // The time budget. Thirty minutes, not twenty: Grok's reviews and balanced
 // implementations run 15–18 minutes at p50, and a budget they fit inside is
@@ -181,7 +186,29 @@ export function buildCommand(decision, opts) {
     sandbox = 'workspace-write',
     allowedTools = null,
     grokBinary = null,
+    prompt = '',
+    timeoutMs = DEFAULT_TIMEOUT_MS,
   } = opts;
+
+  if (decision.provider === 'antigravity') {
+    if (!isAntigravityModel(decision.model)) {
+      throw new Error(`antigravity requires an explicit Gemini model, got "${decision.model ?? ''}"`);
+    }
+    const longPrompt = isLongAgyPrompt(prompt);
+    const args = longPrompt
+      ? ['--input-format', 'stream-json', '--output-format', 'stream-json']
+      : ['-p', prompt, '--output-format', 'json'];
+    args.push('--model', decision.model);
+    if (decision.effort) args.push('--effort', decision.effort);
+    args.push('--disable-slash-commands');
+    args.push('--print-timeout', `${Math.max(1, Math.ceil(timeoutMs / 1000))}s`);
+    if (schemaFile) args.push('--json-schema', schemaFile);
+    const role = decision.factors?.role;
+    const mayWrite = role === 'implement'
+      || (role === 'mechanical' && decision.factors?.needsRepoWrite === true);
+    if (mayWrite) args.push('--dangerously-skip-permissions');
+    return { binary: loadConfig().agyBinary ?? 'agy', args };
+  }
 
   if (decision.provider === 'grok') {
     // The prompt travels in a file: grok's headless mode takes it from
@@ -257,6 +284,8 @@ export function childEnv(base = process.env) {
   const env = lockGrokEnv(base);
   delete env.ANTHROPIC_API_KEY;
   delete env.CLAUDE_API_KEY;
+  delete env.GEMINI_API_KEY;
+  delete env.GOOGLE_API_KEY;
   delete env.OPENAI_API_KEY;
   for (const name of GROK_KEY_VARS) delete env[name];
   env.CI = env.CI ?? '1'; // suppress spinners/TTY affordances
@@ -881,6 +910,7 @@ export async function runAgent(decision, prompt, opts = {}) {
   const workdir = await mkdtemp(join(tmpdir(), 'cmo-'));
   const lastMessageFile = join(workdir, 'last-message.txt');
   let codexSchemaFile = null;
+  let antigravitySchemaFile = null;
   if (schema) {
     codexSchemaFile = join(workdir, 'schema.json');
     // This asymmetry is deliberate. Codex's endpoint requires its strict
@@ -888,6 +918,8 @@ export async function runAgent(decision, prompt, opts = {}) {
     // prompt contract; normalising that prompt would silently change the
     // contract the caller wrote.
     await writeFile(codexSchemaFile, JSON.stringify(normalizeSchemaForCodex(schema)), 'utf8');
+    antigravitySchemaFile = join(workdir, 'agy-schema.json');
+    await writeFile(antigravitySchemaFile, JSON.stringify(schema), 'utf8');
   }
 
   // A grader running on the vendor that produced the artifact is predisposed to
@@ -930,6 +962,14 @@ export async function runAgent(decision, prompt, opts = {}) {
       const target = ladder[rung];
 
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        if (target.provider === 'antigravity' && !isAntigravityModel(target.model)) {
+          lastError = `antigravity refused: an explicit Gemini model is required, got "${target.model ?? ''}"`;
+          attempts.push({
+            provider: 'antigravity', model: target.model, attempt: attempt + 1, exitCode: null,
+            timedOut: false, failure: 'invalid-model', stderr: lastError,
+          });
+          break;
+        }
         // Grok is dispatched only on a session verified as the subscription,
         // verified HERE, on this machine, before every attempt — not when the
         // plan was made. A decision can be minutes old, built from a cached or
@@ -950,14 +990,21 @@ export async function runAgent(decision, prompt, opts = {}) {
         // Never let a previous attempt's final message be read as this one's.
         await rm(lastMessageFile, { force: true }).catch(() => {});
 
-        const { binary, args } = buildCommand(target, {
+        const commandTarget = target.provider === 'antigravity'
+          ? { ...target, factors: decision.factors }
+          : target;
+        const { binary, args } = buildCommand(commandTarget, {
           cwd,
           lastMessageFile,
           promptFile,
-          schemaFile: target.provider === 'codex' ? codexSchemaFile : null,
+          schemaFile: target.provider === 'codex'
+            ? codexSchemaFile
+            : target.provider === 'antigravity' ? antigravitySchemaFile : null,
           fullAccess,
           sandbox,
           allowedTools,
+          prompt: fullPrompt,
+          timeoutMs,
         });
 
         // Claim headroom for the duration of the call, so concurrent
@@ -980,8 +1027,13 @@ export async function runAgent(decision, prompt, opts = {}) {
             binary,
             args,
             cwd,
-            // Grok has its prompt in a file; its stdin gets EOF at once.
-            prompt: target.provider === 'grok' ? '' : fullPrompt,
+            // Grok has its prompt in a file. Short agy prompts are argv. Long
+            // agy prompts are one stream-json line followed by EOF.
+            prompt: target.provider === 'grok'
+              ? ''
+              : target.provider === 'antigravity'
+                ? (isLongAgyPrompt(fullPrompt) ? antigravityInput(fullPrompt) : '')
+                : fullPrompt,
             timeoutMs,
             idleMs,
             maxMs,
@@ -1000,6 +1052,9 @@ export async function runAgent(decision, prompt, opts = {}) {
         let schemaRejected = false;
         let offSubscription = null;
         let authSource = null;
+        let structuredOutput = null;
+        let providerFailure = null;
+        let warning = null;
         // The endpoint's own error message, kept apart from the transport's.
         // classifyFailure subtracts it before pattern-matching, because it
         // quotes the caller's schema back and that is user input, not a signal.
@@ -1032,6 +1087,19 @@ export async function runAgent(decision, prompt, opts = {}) {
             text = (await readFile(lastMessageFile, 'utf8')).trim();
           } catch {
             text = '';
+          }
+        } else if (target.provider === 'antigravity') {
+          const parsed = parseAntigravityStdout(result.stdout);
+          text = parsed.text;
+          usage = parsed.usage;
+          structuredOutput = parsed.structuredOutput;
+          providerFailure = classifyAntigravityFailure(result, parsed);
+          warning = antigravitySoftDenyWarning(result.stderr);
+          if (parsed.error) {
+            result = {
+              ...result,
+              stderr: [result.stderr?.trim(), parsed.error].filter(Boolean).join('\n'),
+            };
           }
         } else if (target.provider === 'grok') {
           const stream = parseGrokStream(result.stdout);
@@ -1093,13 +1161,16 @@ export async function runAgent(decision, prompt, opts = {}) {
 
         const failure = offSubscription
           ? 'not-subscription'
-          : classifyFailure({
-            ...result,
-            hasOutput: text.length > 0,
-            schemaRejected,
-            structuredError,
-          });
-        const succeeded = failure === 'none' && text.length > 0;
+          : providerFailure
+            ?? classifyFailure({
+              ...result,
+              hasOutput: text.length > 0,
+              schemaRejected,
+              structuredError,
+            });
+        const hasUsableOutput = text.length > 0
+          || (target.provider === 'antigravity' && schema && isJsonObject(structuredOutput));
+        const succeeded = failure === 'none' && hasUsableOutput;
 
         attempts.push({
           provider: target.provider,
@@ -1114,12 +1185,18 @@ export async function runAgent(decision, prompt, opts = {}) {
           timedOut: result.timedOut,
           ...(result.stopReason ? { stopReason: result.stopReason } : {}),
           failure: succeeded ? null : failure === 'none' ? 'empty-output' : failure,
+          ...(warning ? { warning } : {}),
           stderr: succeeded ? undefined : result.stderr.slice(-2_000),
         });
 
         if (succeeded) {
-          const resultJson = schema ? extractJson(text) : null;
-          if (schema && resultJson == null) {
+          const resultJson = schema
+            ? (target.provider === 'antigravity' && isJsonObject(structuredOutput)
+              ? structuredOutput
+              : extractJson(text))
+            : null;
+          if (schema && (resultJson == null
+              || (target.provider === 'antigravity' && !isJsonObject(resultJson)))) {
             // A schema violation is a real failure: the script branches on this
             // object, and a run that mis-reads a "no" as a "yes" is worse than a
             // run that stops.
@@ -1152,6 +1229,9 @@ export async function runAgent(decision, prompt, opts = {}) {
               in: totalInputTokens(usage),
               out: usage.output_tokens ?? usage.outputTokens ?? null,
             } : null,
+            ...(attempts.some((a) => a.warning)
+              ? { warnings: attempts.map((a) => a.warning).filter(Boolean) }
+              : {}),
             // How the session authenticated, as the vendor's own stream said.
             // For grok this is the per-dispatch proof of subscription billing.
             ...(target.provider === 'grok' ? { auth: authSource ?? 'unknown' } : {}),
@@ -1179,6 +1259,9 @@ export async function runAgent(decision, prompt, opts = {}) {
             usage,
             result: text,
             resultJson,
+            ...(attempts.some((a) => a.warning)
+              ? { warnings: attempts.map((a) => a.warning).filter(Boolean) }
+              : {}),
           };
         }
 
@@ -1207,7 +1290,17 @@ export async function runAgent(decision, prompt, opts = {}) {
           // routes around claude instead of failing the same way.
           await markClaudeSignedOut(providerError.split('\n').pop().slice(0, 300)).catch(() => {});
         }
-        if (failure === 'auth' || failure === 'fatal') break;
+        if (failure === 'signed-out' && target.provider === 'antigravity') {
+          const reason = providerError.split('\n').pop().slice(0, 300);
+          await mutate((state) => {
+            const previous = state.probes.antigravity?.value ?? { provider: 'antigravity' };
+            state.probes.antigravity = {
+              storedAt: now(),
+              value: { ...previous, available: false, auth: { ok: false, method: 'none', reason } },
+            };
+          }, { now }).catch(() => {});
+        }
+        if (failure === 'auth' || failure === 'signed-out' || failure === 'fatal') break;
         // A timeout is the most expensive failure to repeat and the least
         // likely to come out differently: the same prompt on the same model
         // with the same clock will run out of clock again. Three attempts at
