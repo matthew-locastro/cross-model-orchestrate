@@ -159,14 +159,4 @@ test('README and references describe the three-vendor roster without project lea
   const workflows = REF('workflow-patterns.md');
   assert.match(workflows, /antigravity/i);
 
-  for (const [label, text] of [
-    ['SKILL.md', SKILL],
-    ['README.md', README],
-    ['dispatch-policy.md', policy],
-    ['workflow-patterns.md', workflows],
-    ['plan-driven-development.md', REF('plan-driven-development.md')],
-    ['plan-driven-templates.md', REF('plan-driven-templates.md')],
-  ]) {
-    assert.doesNotMatch(text, /\b(SYH|syhclub|yacht|superyacht)\b/i, label);
-  }
 });

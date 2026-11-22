@@ -23,33 +23,49 @@ test('outcomes are append-only beside dispatch receipts in the configured cache'
 
 test('quality report groups outcomes by provider, role and model with exact metrics', () => {
   const receipts = [
-    { id: 'd-1', provider: 'codex', role: 'review', model: 'gpt-5.6-terra' },
-    { id: 'd-2', provider: 'codex', role: 'review', model: 'gpt-5.6-terra' },
+    { id: 'd-1', provider: 'claude', role: 'implement', model: 'sonnet' },
+    { id: 'd-2', provider: 'claude', role: 'implement', model: 'sonnet' },
     { id: 'd-3', provider: 'claude', role: 'implement', model: 'sonnet' },
     { id: 'd-4', provider: 'claude', role: 'implement', model: 'sonnet' },
-    { id: 'd-5', provider: 'claude', role: 'implement', model: 'sonnet' },
+    { id: 'd-5', provider: 'antigravity', role: 'implement', model: 'gemini-4-carbon' },
+    { id: 'd-6', provider: 'antigravity', role: 'implement', model: 'gemini-4-carbon' },
+    { id: 'd-7', provider: 'codex', role: 'review', model: 'gpt-5.6-terra' },
+    { id: 'd-8', provider: 'codex', role: 'review', model: 'gpt-5.6-terra' },
+    { id: 'd-9', provider: 'codex', role: 'review', model: 'gpt-5.6-terra' },
   ];
   const outcomes = [
     { id: 'd-1', verdict: 'approved', rounds: 1 },
-    { id: 'd-2', verdict: 'blocked', rounds: 3 },
+    { id: 'd-2', verdict: 'fixed', rounds: 2 },
     { id: 'd-3', verdict: 'confirmed', rounds: 2 },
-    { id: 'd-4', verdict: 'false-positive', rounds: 2 },
-    { id: 'd-5', verdict: 'missed', rounds: 4 },
+    { id: 'd-4', verdict: 'missed', rounds: 4 },
+    { id: 'd-5', verdict: 'rejected', rounds: 3 },
+    { id: 'd-6', verdict: 'blocked', rounds: 3 },
+    { id: 'd-7', verdict: 'confirmed', rounds: 1 },
+    { id: 'd-8', verdict: 'false-positive', rounds: 1 },
+    { id: 'd-9', verdict: 'missed', rounds: 1 },
     { id: 'd-orphan', verdict: 'approved', rounds: 1, orphan: true },
   ];
   assert.deepEqual(qualityReport(receipts, outcomes), {
-    total: 5,
+    total: 9,
     orphans: 1,
     groups: [
       {
-        provider: 'claude', role: 'implement', model: 'sonnet', n: 3,
-        firstRoundApprovals: 0, firstRoundApprovalRate: 0, meanRounds: 2.67,
-        blocked: 0, confirmed: 1, falsePositive: 1, missed: 1,
+        provider: 'antigravity', role: 'implement', model: 'gemini-4-carbon', n: 2,
+        producerOutcomes: 2, firstRoundApprovals: 0, firstRoundApprovalRate: 0,
+        reviewAccuracy: null, meanRounds: 3,
+        blocked: 1, confirmed: 0, falsePositive: 0, missed: 0,
       },
       {
-        provider: 'codex', role: 'review', model: 'gpt-5.6-terra', n: 2,
-        firstRoundApprovals: 1, firstRoundApprovalRate: 0.5, meanRounds: 2,
-        blocked: 1, confirmed: 0, falsePositive: 0, missed: 0,
+        provider: 'claude', role: 'implement', model: 'sonnet', n: 4,
+        producerOutcomes: 2, firstRoundApprovals: 1, firstRoundApprovalRate: 0.5,
+        reviewAccuracy: 0.5, meanRounds: 2.25,
+        blocked: 0, confirmed: 1, falsePositive: 0, missed: 1,
+      },
+      {
+        provider: 'codex', role: 'review', model: 'gpt-5.6-terra', n: 3,
+        producerOutcomes: 0, firstRoundApprovals: 0, firstRoundApprovalRate: null,
+        reviewAccuracy: 0.33, meanRounds: 1,
+        blocked: 0, confirmed: 1, falsePositive: 1, missed: 1,
       },
     ],
   });

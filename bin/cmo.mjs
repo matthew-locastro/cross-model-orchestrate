@@ -485,8 +485,9 @@ export async function main(
       outputSink(`quality outcomes — last ${spec}\n`, 'stdout');
       outputSink(`${quality.total} outcomes · ${quality.orphans} orphan${quality.orphans === 1 ? '' : 's'}\n`, 'stdout');
       for (const group of quality.groups) {
-        const approvalPct = Math.round(group.firstRoundApprovalRate * 100);
-        outputSink(`  ${group.provider} / ${group.role} / ${group.model}: n=${group.n} first-round approvals=${group.firstRoundApprovals}/${group.n} (${approvalPct}%) mean rounds=${group.meanRounds} blocked=${group.blocked} confirmed=${group.confirmed} false-positive=${group.falsePositive} missed=${group.missed}\n`, 'stdout');
+        const approvalPct = group.firstRoundApprovalRate == null ? 'n/a' : `${Math.round(group.firstRoundApprovalRate * 100)}%`;
+        const reviewAccuracy = group.reviewAccuracy == null ? 'n/a' : `${Math.round(group.reviewAccuracy * 100)}%`;
+        outputSink(`  ${group.provider} / ${group.role} / ${group.model}: n=${group.n} first-round approvals=${group.firstRoundApprovals}/${group.producerOutcomes} (${approvalPct}) review accuracy=${reviewAccuracy} mean rounds=${group.meanRounds} blocked=${group.blocked} confirmed=${group.confirmed} false-positive=${group.falsePositive} missed=${group.missed}\n`, 'stdout');
       }
       return 0;
     }

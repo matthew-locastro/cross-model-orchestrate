@@ -1099,7 +1099,7 @@ test('report --quality --json emits the stable quality envelope', async () => {
     at: now, id: 'd-quality', provider: 'codex', role: 'review', model: 'gpt-5.6-terra',
   })}\n`);
   await writeFile(join(cacheDir, 'outcomes.jsonl'), `${JSON.stringify({
-    at: now, id: 'd-quality', verdict: 'approved', rounds: 1,
+    at: now, id: 'd-quality', verdict: 'confirmed', rounds: 1,
   })}\n`);
   const output = captureOutput();
 
@@ -1113,8 +1113,9 @@ test('report --quality --json emits the stable quality envelope', async () => {
       orphans: 0,
       groups: [{
         provider: 'codex', role: 'review', model: 'gpt-5.6-terra', n: 1,
-        firstRoundApprovals: 1, firstRoundApprovalRate: 1, blocked: 0, confirmed: 0,
-        falsePositive: 0, missed: 0, meanRounds: 1,
+        producerOutcomes: 0, firstRoundApprovals: 0, firstRoundApprovalRate: null,
+        reviewAccuracy: 1, blocked: 0, confirmed: 1, falsePositive: 0, missed: 0,
+        meanRounds: 1,
       }],
     },
   });
@@ -1129,8 +1130,8 @@ test('report --quality formats human output with first-round approval rate and c
     '',
   ].join('\n'));
   await writeFile(join(cacheDir, 'outcomes.jsonl'), [
-    JSON.stringify({ at: now, id: 'd-q1', verdict: 'approved', rounds: 1 }),
-    JSON.stringify({ at: now, id: 'd-q2', verdict: 'blocked', rounds: 3 }),
+    JSON.stringify({ at: now, id: 'd-q1', verdict: 'confirmed', rounds: 1 }),
+    JSON.stringify({ at: now, id: 'd-q2', verdict: 'missed', rounds: 3 }),
     JSON.stringify({ at: now, id: 'd-orphan', verdict: 'approved', rounds: 1, orphan: true }),
     '',
   ].join('\n'));
@@ -1145,7 +1146,7 @@ test('report --quality formats human output with first-round approval rate and c
   assert.match(text, /2 outcomes · 1 orphan\b/);
   assert.match(
     text,
-    /codex \/ review \/ gpt-5\.6-terra: n=2 first-round approvals=1\/2 \(50%\) mean rounds=2 blocked=1 confirmed=0 false-positive=0 missed=0/,
+    /codex \/ review \/ gpt-5\.6-terra: n=2 first-round approvals=0\/0 \(n\/a\) review accuracy=50% mean rounds=2 blocked=0 confirmed=1 false-positive=0 missed=1/,
   );
 });
 

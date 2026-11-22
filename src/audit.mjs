@@ -141,6 +141,7 @@ export function summarise(rows, { expected = null } = {}) {
  * is useful when moving history, but it must not inflate provider results.
  */
 export function qualityReport(receipts, outcomes) {
+  const producerVerdicts = new Set(['approved', 'fixed', 'rejected', 'blocked']);
   const byId = new Map(receipts.map((receipt) => [receipt.id, receipt]));
   const groups = new Map();
   let total = 0;
@@ -158,13 +159,16 @@ export function qualityReport(receipts, outcomes) {
     const model = receipt.model ?? 'unknown';
     const key = `${provider}\u0000${role}\u0000${model}`;
     const group = groups.get(key) ?? {
-      provider, role, model, n: 0, firstRoundApprovals: 0, rounds: 0,
+      provider, role, model, n: 0, producerOutcomes: 0, firstRoundApprovals: 0, rounds: 0,
       blocked: 0, confirmed: 0, falsePositive: 0, missed: 0,
     };
     const rounds = Number.isInteger(outcome.rounds) && outcome.rounds > 0 ? outcome.rounds : 1;
     group.n += 1;
     group.rounds += rounds;
-    if (outcome.verdict === 'approved' && rounds === 1) group.firstRoundApprovals += 1;
+    if (producerVerdicts.has(outcome.verdict)) {
+      group.producerOutcomes += 1;
+      if (outcome.verdict === 'approved' && rounds === 1) group.firstRoundApprovals += 1;
+    }
     if (outcome.verdict === 'blocked') group.blocked += 1;
     if (outcome.verdict === 'confirmed') group.confirmed += 1;
     if (outcome.verdict === 'false-positive') group.falsePositive += 1;
@@ -178,7 +182,12 @@ export function qualityReport(receipts, outcomes) {
     groups: [...groups.values()]
       .map(({ rounds, ...group }) => ({
         ...group,
-        firstRoundApprovalRate: Math.round((group.firstRoundApprovals / group.n) * 100) / 100,
+        firstRoundApprovalRate: group.producerOutcomes
+          ? Math.round((group.firstRoundApprovals / group.producerOutcomes) * 100) / 100
+          : null,
+        reviewAccuracy: group.confirmed + group.falsePositive + group.missed
+          ? Math.round((group.confirmed / (group.confirmed + group.falsePositive + group.missed)) * 100) / 100
+          : null,
         meanRounds: Math.round((rounds / group.n) * 100) / 100,
       }))
       .sort((a, b) => a.provider.localeCompare(b.provider) || a.role.localeCompare(b.role) || a.model.localeCompare(b.model)),
