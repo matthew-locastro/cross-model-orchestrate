@@ -23,9 +23,10 @@ import { install, uninstall } from '../src/install.mjs';
 import { createCoordinator, DEFAULT_PORT } from '../src/server.mjs';
 import { fleetConfig, health } from '../src/remote.mjs';
 import { mergeDispatch, parseDispatchFile } from '../src/dispatch-file.mjs';
-import { readAudit, summarise, findings, tierStats, failureTaxonomy } from '../src/audit.mjs';
+import { readAudit, summarise, findings, tierStats, failureTaxonomy, qualityReport } from '../src/audit.mjs';
+import { readOutcomes, recordOutcome, VERDICTS } from '../src/outcomes.mjs';
 import { durationProfile } from '../src/durations.mjs';
-import { loadConfig } from '../src/config.mjs';
+import { activeProviders, loadConfig } from '../src/config.mjs';
 import { MAX_LEASE_MS, perAgentCost } from '../src/ledger.mjs';
 import { update } from '../src/update.mjs';
 
@@ -104,10 +105,11 @@ function bar(percent) {
   return `${'█'.repeat(filled)}${'·'.repeat(10 - filled)} ${String(percent).padStart(3)}%`;
 }
 
-function renderLimits(limits, now = Date.now()) {
+export function renderLimits(limits, now = Date.now()) {
   const lines = [];
   const bandsNow = pressure();
-  for (const provider of PROVIDERS) {
+  const providers = activeProviders();
+  for (const provider of providers) {
     const p = limits[provider];
     if (!p) continue;
     const s = providerState(p, bandsNow, now, provider);
@@ -154,7 +156,7 @@ function renderLimits(limits, now = Date.now()) {
   lines.push('');
   const bands = pressure();
   lines.push(`bands (on pressure — usage weighed against time to reset): tight ≥${bands.tight}%  critical ≥${bands.critical}%  exhausted ≥${bands.exhausted}%`);
-  const flight = PROVIDERS.reduce((n, p) => n + (limits.inFlight?.[p] ?? 0), 0);
+  const flight = providers.reduce((n, p) => n + (limits.inFlight?.[p] ?? 0), 0);
   const scope = limits.fleet ? 'the fleet' : 'this machine';
   lines.push(flight === 0
     ? `no dispatches in flight across ${scope}`
@@ -198,8 +200,9 @@ setup
 
 dispatch
   audit       what was ACTUALLY dispatched — the receipt for a fan-out
-  report      read the soak log back: reliability, balance, and what to change
-  limits      report remaining subscription headroom for codex, claude and grok
+  report      read the soak log back: reliability, balance, quality, and what to change
+  outcome     record a quality judgement for a dispatch receipt
+  limits      report remaining subscription headroom for codex, claude and antigravity
   plan        show which provider/model/effort a task would get, and why
   run         plan, then execute the subagent and print a JSON envelope
   selftest    offline checks of the decision table
@@ -270,6 +273,14 @@ run options
 report options
   --since           how far back: 90 (minutes), 24h, or 7d (default 24h)
   --json            structured findings, for pasting to an agent to act on
+  --quality         summarize recorded outcomes by provider, role, and model
+
+outcome options
+  --verdict         approved|fixed|rejected|blocked|confirmed|false-positive|missed
+  --rounds          review rounds (default 1)
+  --note            optional judgement note
+  --by              optional reviewer identifier
+  --force           record an unknown dispatch ID as an orphan
 
 audit options
   --since           minutes to look back (default 60)
@@ -386,12 +397,63 @@ async function main() {
     return sum.undispatched ? 3 : 0;
   }
 
+  if (command === 'outcome') {
+    const id = args._[1];
+    const verdict = args.verdict;
+    if (!id || typeof verdict !== 'string' || !VERDICTS.has(verdict)) {
+      process.stderr.write('cmo outcome: provide a dispatch ID and a valid --verdict\n');
+      return 2;
+    }
+    let rounds = 1;
+    if (args.rounds !== undefined) {
+      rounds = Number(args.rounds);
+      if (!Number.isInteger(rounds) || rounds < 1) {
+        process.stderr.write('cmo outcome: --rounds must be a positive integer\n');
+        return 2;
+      }
+    }
+    const receipt = (await readAudit()).some((row) => row.id === id);
+    if (!receipt && !args.force) {
+      process.stderr.write(`cmo outcome: no local receipt for ${id}; use --force to record an orphan\n`);
+      return 1;
+    }
+    const outcome = {
+      at: Date.now(), id, verdict, rounds,
+      ...(typeof args.note === 'string' ? { note: args.note } : {}),
+      ...(typeof args.by === 'string' ? { by: args.by } : {}),
+      ...(!receipt ? { orphan: true } : {}),
+    };
+    try {
+      await recordOutcome(outcome);
+    } catch (err) {
+      process.stderr.write(`cmo outcome: ${err.message}\n`);
+      return 1;
+    }
+    process.stdout.write(`${JSON.stringify(outcome)}\n`);
+    return 0;
+  }
+
   if (command === 'report') {
     const spec = String(args.since ?? '24h');
     const mins = /^\d+d$/.test(spec) ? parseInt(spec, 10) * 1440
       : /^\d+h$/.test(spec) ? parseInt(spec, 10) * 60
         : Number(spec) || 1440;
-    const rows = await readAudit({ sinceMs: Date.now() - mins * 60_000 });
+    const sinceMs = Date.now() - mins * 60_000;
+    if (args.quality) {
+      const [receipts, outcomes] = await Promise.all([readAudit(), readOutcomes({ sinceMs })]);
+      const quality = qualityReport(receipts, outcomes);
+      if (args.json) {
+        process.stdout.write(`${JSON.stringify({ window: spec, quality }, null, 2)}\n`);
+        return 0;
+      }
+      process.stdout.write(`quality outcomes — last ${spec}\n`);
+      process.stdout.write(`${quality.total} outcomes · ${quality.orphans} orphan${quality.orphans === 1 ? '' : 's'}\n`);
+      for (const group of quality.groups) {
+        process.stdout.write(`  ${group.provider} / ${group.role} / ${group.model}: n=${group.n} first-round approvals=${group.firstRoundApprovals} mean rounds=${group.meanRounds} blocked=${group.blocked} confirmed=${group.confirmed} false-positive=${group.falsePositive} missed=${group.missed}\n`);
+      }
+      return 0;
+    }
+    const rows = await readAudit({ sinceMs });
     const cost = await perAgentCost('codex').catch(() => null);
     const lim = await readLimits().catch(() => null);
     const sum = summarise(rows);
@@ -452,7 +514,7 @@ async function main() {
       process.stdout.write(`${JSON.stringify(limits, null, 2)}\n`);
     }
     // Non-zero when no provider can take work, so a shell caller can branch.
-    const usable = PROVIDERS.some((p) => isUsable({ state: providerState(limits[p], pressure(), Date.now(), p).state }));
+    const usable = activeProviders().some((p) => isUsable({ state: providerState(limits[p], pressure(), Date.now(), p).state }));
     return usable ? 0 : 3;
   }
 

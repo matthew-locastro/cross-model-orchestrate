@@ -133,6 +133,52 @@ export function summarise(rows, { expected = null } = {}) {
   };
 }
 
+/**
+ * Join append-only quality outcomes to their immutable dispatch receipts.
+ * Outcomes without a local receipt are deliberately kept separate: `--force`
+ * is useful when moving history, but it must not inflate provider results.
+ */
+export function qualityReport(receipts, outcomes) {
+  const byId = new Map(receipts.map((receipt) => [receipt.id, receipt]));
+  const groups = new Map();
+  let total = 0;
+  let orphans = 0;
+
+  for (const outcome of outcomes) {
+    const receipt = byId.get(outcome.id);
+    if (!receipt) {
+      orphans += 1;
+      continue;
+    }
+    total += 1;
+    const provider = receipt.provider ?? 'unknown';
+    const role = receipt.role ?? 'unknown';
+    const model = receipt.model ?? 'unknown';
+    const key = `${provider}\u0000${role}\u0000${model}`;
+    const group = groups.get(key) ?? {
+      provider, role, model, n: 0, firstRoundApprovals: 0, rounds: 0,
+      blocked: 0, confirmed: 0, falsePositive: 0, missed: 0,
+    };
+    const rounds = Number.isInteger(outcome.rounds) && outcome.rounds > 0 ? outcome.rounds : 1;
+    group.n += 1;
+    group.rounds += rounds;
+    if (outcome.verdict === 'approved' && rounds === 1) group.firstRoundApprovals += 1;
+    if (outcome.verdict === 'blocked') group.blocked += 1;
+    if (outcome.verdict === 'confirmed') group.confirmed += 1;
+    if (outcome.verdict === 'false-positive') group.falsePositive += 1;
+    if (outcome.verdict === 'missed') group.missed += 1;
+    groups.set(key, group);
+  }
+
+  return {
+    total,
+    orphans,
+    groups: [...groups.values()]
+      .map(({ rounds, ...group }) => ({ ...group, meanRounds: Math.round((rounds / group.n) * 100) / 100 }))
+      .sort((a, b) => a.provider.localeCompare(b.provider) || a.role.localeCompare(b.role) || a.model.localeCompare(b.model)),
+  };
+}
+
 // ── soak analysis ─────────────────────────────────────────────────────────
 //
 // A multi-day soak that ends with "it felt fine" taught nothing. These turn the
