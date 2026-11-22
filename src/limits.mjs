@@ -61,6 +61,7 @@
 
 import { access, readFile, readdir, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 
 import { activeProviders, CACHE_DIR, loadConfig } from './config.mjs';
@@ -78,6 +79,7 @@ const FETCH_TIMEOUT_MS = 5_000;
 /** Stamped on a reading taken through the CLI, so its longer TTL can be told apart. */
 export const CLAUDE_CLI_SOURCE = 'claude -p stream-json rate_limit_event';
 const CLI_PROBE_TIMEOUT_MS = 60_000;
+const ANTIGRAVITY_PROBE_TIMEOUT_MS = 35_000;
 const PROBE_MODEL = 'claude-haiku-4-5-20251001';
 export const ANTIGRAVITY_METER_SOURCE = 'agy -p /usage --output-format json';
 
@@ -711,12 +713,13 @@ export async function readClaudeLimits({ credentialsPath, fetchImpl, refresh, cl
 // ── antigravity ──────────────────────────────────────────────────────────
 
 /** Run the no-inference `/usage` slash command. It must not disable slash commands. */
-async function runAntigravityProbe(binary) {
+export async function runAntigravityProbe(binary, { timeoutMs = ANTIGRAVITY_PROBE_TIMEOUT_MS } = {}) {
   const { spawn } = await import('node:child_process');
   return new Promise((resolve, reject) => {
     let child;
     try {
       child = spawn(binary, ['-p', '/usage', '--output-format', 'json'], {
+        cwd: tmpdir(),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (err) {
@@ -725,12 +728,25 @@ async function runAntigravityProbe(binary) {
     }
     let stdout = '';
     let stderr = '';
+    let killTimer = null;
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      killTimer = setTimeout(() => { child.kill('SIGKILL'); }, 1_000);
+    }, timeoutMs);
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk) => { stdout += chunk; });
     child.stderr.on('data', (chunk) => { stderr += chunk; });
-    child.on('error', reject);
-    child.on('close', (code) => resolve({ code, stdout, stderr }));
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      reject(err);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      resolve({ code, stdout, stderr });
+    });
   });
 }
 
@@ -769,9 +785,17 @@ export async function readAntigravityLimits({ probe } = {}) {
     const keys = new Map([['gemini-5h', { key: '5h', label: '5hr' }], ['gemini-weekly', { key: 'weekly', label: 'Wkly' }]]);
     const windows = gemini.buckets.flatMap((bucket) => {
       const named = keys.get(bucket?.id);
-      const remaining = Number(bucket?.remaining_fraction);
+      const rawRemaining = bucket?.remaining_fraction;
+      const remaining = (typeof rawRemaining === 'number' || (typeof rawRemaining === 'string' && rawRemaining.trim() !== ''))
+        ? Number(rawRemaining)
+        : NaN;
       const reset = normalizeReset(bucket?.reset_time);
-      if (!named || !Number.isFinite(remaining) || remaining < 0 || remaining > 1 || !reset || Date.parse(reset) <= 0) return [];
+      if (!named || !Number.isFinite(remaining) || remaining < 0 || remaining > 1 || !reset) return [];
+      // Freshly-reset Gemini windows use the Unix epoch as a sentinel. It is a
+      // valid zero-use reading only when the CLI says the entire window remains.
+      if (Date.parse(reset) <= 0) {
+        return remaining === 1 ? [{ ...named, percentUsed: 0, resetsAt: null }] : [];
+      }
       return [{ ...named, percentUsed: clampPercent((1 - remaining) * 100), resetsAt: reset }];
     });
     if (windows.length === 0) throw new Error('the agy /usage response has no Gemini subscription windows');

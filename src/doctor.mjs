@@ -291,7 +291,7 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
     todo.push(['claude', 'then type /login and finish in the browser — the terminal CLI is signed out, so claude dispatches fail']);
   }
 
-  if (active.has('antigravity')) {
+  if (active.has('antigravity') && agyVersion) {
     const a = limits.antigravity?.auth;
     if (config.agyProbe === false) {
       line(WARN, 'antigravity sign-in', 'not checked — the agy probe is disabled');
@@ -299,6 +299,7 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
       line(OK, 'antigravity sign-in', 'subscription quota verified');
     } else {
       line(FAIL, 'antigravity sign-in', a?.reason ?? 'unverified — antigravity is not routable');
+      todo.push(['agy', 'sign in to a subscription account — antigravity dispatches are not routable']);
     }
   }
 
@@ -347,11 +348,8 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
   for (const provider of providers) {
     const p = limits[provider];
     if (provider === 'grok' && !grokVersion) continue;
+    if (provider === 'antigravity' && !agyVersion) continue;
     if (p?.auth && p.auth.ok === false) {
-      line(WARN, provider, `not read — ${p.auth.reason}`);
-      continue;
-    }
-    if (provider === 'grok' && p?.auth && !p.auth.ok) {
       line(WARN, provider, `not read — ${p.auth.reason}`);
       continue;
     }

@@ -150,7 +150,7 @@ function runInstall(home, args = []) {
   );
 }
 
-function runDoctor(home, { config, stubs = [] } = {}) {
+function runDoctor(home, { config, stubs = [], agyProbe = false, agyResponse, agyExit = 0 } = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), 'cmo-doctor-state-'));
   const configDir = mkdtempSync(join(tmpdir(), 'cmo-doctor-config-'));
   const binDir = mkdtempSync(join(tmpdir(), 'cmo-doctor-bin-'));
@@ -160,7 +160,12 @@ function runDoctor(home, { config, stubs = [] } = {}) {
     }
     for (const name of stubs) {
       const stub = join(binDir, name);
-      writeFileSync(stub, `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(`${name} 0.0.0-stub\n`)});\n`, { mode: 0o755 });
+      const output = name === 'agy' && agyResponse !== undefined ? agyResponse : `${name} 0.0.0-stub\n`;
+      const exit = name === 'agy' ? agyExit : 0;
+      const body = name === 'agy'
+        ? `if (process.argv.includes('/usage')) { process.stdout.write(${JSON.stringify(output)}); process.exit(${exit}); }\nprocess.stdout.write('agy 0.0.0-stub\\n');\n`
+        : `process.stdout.write(${JSON.stringify(output)});\nprocess.exit(${exit});\n`;
+      writeFileSync(stub, `#!${process.execPath}\n${body}`, { mode: 0o755 });
     }
     const env = { ...process.env };
     for (const key of [
@@ -176,7 +181,7 @@ function runDoctor(home, { config, stubs = [] } = {}) {
       CMO_CONFIG_DIR: configDir,
       CMO_CLAUDE_CLI_PROBE: '0',
       CMO_GROK_PROBE: '0',
-      CMO_AGY_PROBE: '0',
+      CMO_AGY_PROBE: agyProbe ? '1' : '0',
     });
     const stdout = execFileSync(
       process.execPath,
@@ -278,6 +283,37 @@ test('doctor adds an install hint and todo step when agy is missing', () => {
     const out = runDoctor(home, { stubs: ['codex', 'claude'] });
     assert.match(out.stdout, /^\s+warn\s+agy\s+not on PATH — curl -fsSL https:\/\/antigravity\.google\/cli\/install\.sh \| bash$/m);
     assert.match(out.stdout, /to finish setup[\s\S]*curl -fsSL https:\/\/antigravity\.google\/cli\/install\.sh \| bash\s+# an active vendor is unavailable/);
+  });
+});
+
+test('doctor does not fail the antigravity sign-in or headroom rows when agy is absent', () => {
+  fakeHome((home) => {
+    const out = runDoctor(home, { stubs: ['codex', 'claude'], agyProbe: true });
+    assert.equal(out.code, 0);
+    assert.doesNotMatch(out.stdout, /^\s+FAIL\s+antigravity sign-in/m);
+    assert.doesNotMatch(out.stdout, /^\s+FAIL\s+antigravity\s+not read/m);
+  });
+});
+
+test('doctor verifies a fake installed agy subscription meter', () => {
+  fakeHome((home) => {
+    const usage = JSON.stringify({ command: { data: { groups: [{ name: 'Gemini Models', buckets: [
+      { id: 'gemini-5h', remaining_fraction: 1, reset_time: '1970-01-01T00:00:00Z' },
+      { id: 'gemini-weekly', remaining_fraction: 1, reset_time: '1970-01-01T00:00:00Z' },
+    ] }] } } });
+    const out = runDoctor(home, { stubs: ['codex', 'claude', 'agy'], agyProbe: true, agyResponse: usage });
+    assert.equal(out.code, 0);
+    assert.match(out.stdout, /^\s+ok\s+antigravity sign-in\s+subscription quota verified/m);
+    assert.match(out.stdout, /^\s+ok\s+antigravity\s+5hr 0%  Wkly 0%/m);
+  });
+});
+
+test('doctor gives an installed but unsigned agy a sign-in todo', () => {
+  fakeHome((home) => {
+    const out = runDoctor(home, { stubs: ['codex', 'claude', 'agy'], agyProbe: true, agyExit: 2 });
+    assert.equal(out.code, 1);
+    assert.match(out.stdout, /^\s+FAIL\s+antigravity sign-in\s+an API-key login has no subscription quota/m);
+    assert.match(out.stdout, /agy\s+# sign in to a subscription account — antigravity dispatches are not routable/);
   });
 });
 
