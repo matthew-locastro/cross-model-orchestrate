@@ -11,9 +11,11 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
-import { loadConfig, TIERS } from './config.mjs';
+import { activeProviders, loadConfig, TIERS } from './config.mjs';
 import { GROK_KEY_VARS, lockGrokEnv, parseGrokModels } from './grok.mjs';
-import { readLimits } from './limits.mjs';
+import {
+  readAntigravityLimits, readClaudeLimits, readCodexLimits, readGrokLimits, readLimits,
+} from './limits.mjs';
 import { AGENT_DIR, SKILL_HOSTS } from './install.mjs';
 import { health } from './remote.mjs';
 
@@ -170,6 +172,8 @@ async function skillLocations(skillName) {
 
 export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) => process.stdout.write(`${l}\n`) } = {}) {
   const config = loadConfig({ reload: true });
+  const providers = activeProviders(config);
+  const active = new Set(providers);
   let failures = 0;
   let warnings = 0;
   const line = (state, label, detail = '') => {
@@ -180,26 +184,45 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
 
   log('provider CLIs');
   const grokBinary = config.grokBinary ?? 'grok';
-  const [codexVersion, claudeVersion, grokVersion] = await Promise.all([
-    binaryVersion('codex'),
-    binaryVersion('claude'),
-    binaryVersion(grokBinary),
-  ]);
+  const binaries = {
+    codex: 'codex',
+    claude: 'claude',
+    antigravity: config.agyBinary ?? 'agy',
+    grok: grokBinary,
+  };
+  const versions = Object.fromEntries(await Promise.all(providers.map(async (provider) => [
+    provider, await binaryVersion(binaries[provider]),
+  ])));
+  const codexVersion = versions.codex;
+  const claudeVersion = versions.claude;
+  const agyVersion = versions.antigravity;
+  const grokVersion = versions.grok;
   const todo = []; // what a human has to type to finish setup, in order
-  line(codexVersion ? OK : WARN, 'codex',
-    codexVersion ?? `not on PATH — ${INSTALL_COMMAND.codex}`);
-  line(claudeVersion ? OK : WARN, 'claude',
-    claudeVersion ?? `not on PATH — ${INSTALL_COMMAND.claude}`);
-  line(grokVersion ? OK : WARN, 'grok',
-    grokVersion ? `${grokVersion}  (${grokBinary})` : `not installed — ${INSTALL_COMMAND.grok}`);
-  if (!codexVersion) todo.push([INSTALL_COMMAND.codex, 'the vendor cmo prefers — without it every dispatch fails over']);
-  if (!claudeVersion) todo.push([INSTALL_COMMAND.claude, 'the orchestrator itself runs here']);
-  if (!grokVersion) todo.push([INSTALL_COMMAND.grok, 'optional third vendor: web research and link checks, on a SuperGrok plan']);
-  if (!codexVersion && !claudeVersion) {
-    line(FAIL, 'at least one provider', 'install codex or claude and log in');
+  if (active.has('codex')) {
+    line(codexVersion ? OK : WARN, 'codex',
+      codexVersion ?? `not on PATH — ${INSTALL_COMMAND.codex}`);
+    if (!codexVersion) todo.push([INSTALL_COMMAND.codex, 'an active vendor is unavailable']);
+  }
+  if (active.has('claude')) {
+    line(claudeVersion ? OK : WARN, 'claude',
+      claudeVersion ?? `not on PATH — ${INSTALL_COMMAND.claude}`);
+    if (!claudeVersion) todo.push([INSTALL_COMMAND.claude, 'an active vendor is unavailable']);
+  }
+  if (active.has('antigravity')) {
+    line(agyVersion ? OK : WARN, 'agy',
+      agyVersion ? `${agyVersion}  (${binaries.antigravity})` : 'not on PATH');
+  }
+  if (active.has('grok')) {
+    line(grokVersion ? OK : WARN, 'grok',
+      grokVersion ? `${grokVersion}  (${grokBinary})` : `not installed — ${INSTALL_COMMAND.grok}`);
+    if (!grokVersion) todo.push([INSTALL_COMMAND.grok, 'an active vendor is unavailable']);
+  }
+  if (!providers.some((provider) => versions[provider])) {
+    line(FAIL, 'at least one provider', 'install an active provider and log in');
   }
 
-  for (const binary of ['codex', 'claude', 'grok']) {
+  for (const provider of providers) {
+    const binary = binaries[provider];
     const paths = await shadowed(binary);
     if (paths) {
       // Which one runs depends on PATH, and an agent's PATH is rarely a login
@@ -210,10 +233,18 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
 
   // One reading for both the auth and the headroom sections. For grok it is the
   // same call routing makes, so what doctor says is what dispatch will do.
-  const limits = await readLimits({ refresh: true });
+  const limits = await readLimits({
+    refresh: true,
+    readers: {
+      codex: readCodexLimits,
+      claude: readClaudeLimits,
+      antigravity: readAntigravityLimits,
+      grok: readGrokLimits,
+    },
+  });
 
   log('\nauth');
-  try {
+  if (active.has('claude')) try {
     const raw = JSON.parse(await readFile(config.claudeCredentials, 'utf8'));
     const token = raw?.claudeAiOauth?.accessToken;
     const expiresAt = raw?.claudeAiOauth?.expiresAt;
@@ -243,14 +274,25 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
   // The terminal CLI keeps its own login, apart from the desktop app's, and it
   // is what every claude dispatch runs. When it lapses the app keeps working
   // and only dispatches fail, so nothing else would say so.
-  if (claudeVersion && limits.claude?.auth?.ok === false) {
+  if (active.has('claude') && claudeVersion && limits.claude?.auth?.ok === false) {
     line(WARN, 'claude sign-in', `${limits.claude.auth.reason} — claude is not routable`);
     todo.push(['claude', 'then type /login and finish in the browser — the terminal CLI is signed out, so claude dispatches fail']);
   }
 
   // Grok: is it the subscription, and can anything make it the API instead?
+  if (active.has('antigravity')) {
+    const a = limits.antigravity?.auth;
+    if (config.agyProbe === false) {
+      line(WARN, 'antigravity sign-in', 'not checked — the agy probe is disabled');
+    } else if (a?.ok) {
+      line(OK, 'antigravity sign-in', 'subscription quota verified');
+    } else {
+      line(FAIL, 'antigravity sign-in', a?.reason ?? 'unverified — antigravity is not routable');
+    }
+  }
+
   let grokListing = null;
-  if (grokVersion) {
+  if (active.has('grok') && grokVersion) {
     const g = limits.grok;
     const a = g?.auth;
     if (a?.ok) {
@@ -271,7 +313,7 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
     }
   }
   // Presence only: the value is never read, printed or passed on.
-  const keysInEnv = GROK_KEY_VARS.filter((name) => process.env[name]);
+  const keysInEnv = active.has('grok') ? GROK_KEY_VARS.filter((name) => process.env[name]) : [];
   if (keysInEnv.length) {
     line(WARN, 'xAI API key in env', `${keysInEnv.join(', ')} set in this shell — cmo strips it from every child,`
       + ' but grok run by hand would bill it');
@@ -290,7 +332,7 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
   }
 
   log('\nheadroom');
-  for (const provider of ['codex', 'claude', 'grok']) {
+  for (const provider of providers) {
     const p = limits[provider];
     if (provider === 'grok' && !grokVersion) continue;
     if (p?.auth && p.auth.ok === false) {
@@ -324,10 +366,10 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
   const missingCodexModels = [];
   log('\nmodels');
   log(`  ${config.configFileFound ? 'from' : 'defaults; no config at'} ${config.configFile}`);
-  const cache = await codexKnownModels();
+  const cache = active.has('codex') ? await codexKnownModels() : null;
   const known = cache?.ids ?? null;
   const grokOffered = grokListing?.models?.length ? new Set(grokListing.models) : null;
-  for (const provider of ['codex', 'claude', 'grok']) {
+  for (const provider of providers) {
     for (const tier of TIERS) {
       const spec = config.models[provider][tier];
       const extra = spec.effort ? `effort=${spec.effort}` : spec.reasoning ? `reasoning=${spec.reasoning}` : '';
@@ -345,7 +387,7 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
       line(state, `${provider} ${tier}`, `${spec.model} ${note}`.trim());
     }
   }
-  if (!known) {
+  if (active.has('codex') && !known) {
     log('  (no codex model cache found — model IDs were not cross-checked)');
   }
 
@@ -387,11 +429,13 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
   for (const row of await skillLocations(skillName)) {
     line(row.state, row.host, row.detail);
   }
-  try {
-    await lstat(join(AGENT_DIR, 'codex-runner.md'));
-    line(OK, 'claude codex-runner agent', AGENT_DIR);
-  } catch {
-    line(WARN, 'claude codex-runner agent', 'not installed — workflows cannot dispatch to codex');
+  if (active.has('claude')) {
+    try {
+      await lstat(join(AGENT_DIR, 'codex-runner.md'));
+      line(OK, 'claude codex-runner agent', AGENT_DIR);
+    } catch {
+      line(WARN, 'claude codex-runner agent', 'not installed — workflows cannot dispatch to codex');
+    }
   }
 
   log('');

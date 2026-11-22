@@ -14,6 +14,7 @@ import { join } from 'node:path';
 
 import { DEFAULT_MODELS, loadConfig, resetConfigCache } from '../src/config.mjs';
 import { decide } from '../src/policy.mjs';
+import { nextSteps } from '../src/banner.mjs';
 import { install, uninstall, packageIsEphemeral, PACKAGE_ROOT } from '../src/install.mjs';
 
 const healthy = (percent = 5) => ({
@@ -128,6 +129,17 @@ function fakeHome(body) {
   }
 }
 
+async function withInstallHome(home, body) {
+  const realHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const module = await import(`../src/install.mjs?home=${encodeURIComponent(home)}`);
+    return await body(module);
+  } finally {
+    process.env.HOME = realHome;
+  }
+}
+
 // install.mjs reads HOME at import time, so exercise it through a subprocess
 // that gets a fresh module graph with the fake HOME already set.
 function runInstall(home, args = []) {
@@ -138,8 +150,9 @@ function runInstall(home, args = []) {
   );
 }
 
-test('install wires the skill into every host and the agent into Claude', () => {
+test('install wires the skill into every available host and the agent into Claude', () => {
   fakeHome((home) => {
+    mkdirSync(join(home, '.gemini'), { recursive: true });
     const out = runInstall(home, ['install']);
     for (const dir of [
       join(home, '.claude/skills/cross-model-orchestrate'),
@@ -147,6 +160,7 @@ test('install wires the skill into every host and the agent into Claude', () => 
       join(home, '.agents/skills/cross-model-orchestrate'),
       join(home, '.kilo/skills/cross-model-orchestrate'),
       join(home, '.config/opencode/skills/cross-model-orchestrate'),
+      join(home, '.gemini/config/skills/cross-model-orchestrate'),
     ]) {
       assert.ok(existsSync(join(dir, 'SKILL.md')), `${dir} should hold a readable skill`);
     }
@@ -156,8 +170,39 @@ test('install wires the skill into every host and the agent into Claude', () => 
     assert.match(out, /cmo install/);
     assert.match(out, /claude --model opus --effort high/);
     assert.match(out, /\/cross-model-orchestrate <what you want built>/);
-    assert.match(out, /runs from Claude Code only/);
+    assert.match(out, /Any host with the skill can orchestrate with \`cmo run\` units/);
+    assert.match(out, /Claude Code\s+adds Workflow fan-outs and steering/);
+    assert.match(out, /Codex orchestrator needs network \(full access\)/);
   });
+});
+
+test('Antigravity links only after its home directory exists', async () => {
+  const absentHome = mkdtempSync(join(tmpdir(), 'cmo-home-'));
+  const presentHome = mkdtempSync(join(tmpdir(), 'cmo-home-'));
+  try {
+    const absentLog = [];
+    await withInstallHome(absentHome, ({ install }) => install({ log: (line) => absentLog.push(line) }));
+    assert.ok(!existsSync(join(absentHome, '.gemini')));
+    assert.match(absentLog.join('\n'), /skip\s+.*\.gemini\/config\/skills\/cross-model-orchestrate.*\.gemini is absent/s);
+
+    mkdirSync(join(presentHome, '.gemini'), { recursive: true });
+    await withInstallHome(presentHome, async ({ install, uninstall }) => {
+      await install({ log: () => {} });
+      assert.ok(existsSync(join(presentHome, '.gemini/config/skills/cross-model-orchestrate/SKILL.md')));
+      await uninstall({ log: () => {} });
+    });
+    assert.ok(!existsSync(join(presentHome, '.gemini/config/skills/cross-model-orchestrate')));
+  } finally {
+    rmSync(absentHome, { recursive: true, force: true });
+    rmSync(presentHome, { recursive: true, force: true });
+  }
+});
+
+test('banner describes orchestration from every host', () => {
+  const text = nextSteps();
+  assert.match(text, /Any host with the skill can orchestrate with \`cmo run\` units/);
+  assert.match(text, /Claude Code\s+adds Workflow fan-outs and steering/);
+  assert.match(text, /Codex orchestrator needs network \(full access\)/);
 });
 
 test('install is idempotent', () => {
@@ -247,6 +292,7 @@ test('--hosts limits the fan-out', () => {
 
 test('uninstall removes what install made and nothing else', () => {
   fakeHome((home) => {
+    mkdirSync(join(home, '.gemini'), { recursive: true });
     runInstall(home, ['install']);
     const foreign = join(home, '.kilo/skills/someone-elses');
     mkdirSync(foreign, { recursive: true });
@@ -255,6 +301,7 @@ test('uninstall removes what install made and nothing else', () => {
     runInstall(home, ['uninstall']);
 
     assert.ok(!existsSync(join(home, '.claude/skills/cross-model-orchestrate')));
+    assert.ok(!existsSync(join(home, '.gemini/config/skills/cross-model-orchestrate')));
     assert.ok(!existsSync(join(home, '.claude/agents/codex-runner.md')));
     assert.ok(existsSync(join(foreign, 'SKILL.md')), 'unrelated skills survive uninstall');
   });

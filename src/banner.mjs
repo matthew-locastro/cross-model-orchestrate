@@ -33,10 +33,10 @@ export function nextSteps({ version = '', done = null, stream = process.stdout }
     '',
     ...step(1, 'cmo install', [
       'Wires the skill and the codex-runner subagent into Claude Code,',
-      'Codex, Kilo and OpenCode. npm gave you the CLI and nothing else.',
+      'Codex, Kilo, OpenCode and Antigravity. npm gave you the CLI and nothing else.',
     ]),
     ...step(2, 'cmo doctor', [
-      'Checks that both vendor CLIs are installed and logged in — cmo',
+      'Checks that active vendor CLIs are installed and logged in — cmo',
       'drives them, it does not replace them. Names the exact command',
       'for anything missing, so run it before your first dispatch.',
     ]),
@@ -49,8 +49,8 @@ export function nextSteps({ version = '', done = null, stream = process.stdout }
       'subagents on Codex as well as Claude — and grading every artifact',
       'on the vendor that did not produce it.',
     ]),
-    `  ${dim('The orchestration runs from Claude Code only. Codex does the work,')}`,
-    `  ${dim('it does not do the deciding.')}`,
+    `  ${dim('Any host with the skill can orchestrate with \`cmo run\` units. Claude Code')}`,
+    `  ${dim('adds Workflow fan-outs and steering. A Codex orchestrator needs network (full access).')}`,
     '',
     `  ${cyan('cmo limits')}   ${dim("what's left on each subscription — costs nothing")}`,
     `  ${cyan('cmo report')}   ${dim('what recent dispatches actually did, ranked as findings')}`,

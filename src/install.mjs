@@ -23,6 +23,11 @@ export const SKILL_HOSTS = [
   { id: 'agents', dir: join(homedir(), '.agents', 'skills') },
   { id: 'kilo', dir: join(homedir(), '.kilo', 'skills') },
   { id: 'opencode', dir: join(homedir(), '.config', 'opencode', 'skills') },
+  {
+    id: 'antigravity',
+    dir: join(homedir(), '.gemini', 'config', 'skills'),
+    requires: join(homedir(), '.gemini'),
+  },
 ];
 
 export const AGENT_DIR = join(homedir(), '.claude', 'agents');
@@ -150,6 +155,13 @@ export async function install(opts = {}) {
   log(`skill "${skillName}":`);
   for (const host of SKILL_HOSTS) {
     if (!hosts.includes(host.id)) continue;
+    if (host.requires && (await pathKind(host.requires)).kind === 'missing') {
+      const target = join(host.dir, skillName);
+      log('  skip   ' + target + '\n         ' + host.requires
+        + ' is absent — Antigravity has not been initialized');
+      results.push({ host: host.id, action: 'skipped', reason: 'host-not-initialized' });
+      continue;
+    }
     await mkdir(host.dir, { recursive: true });
     results.push({
       host: host.id,
@@ -168,11 +180,15 @@ export async function install(opts = {}) {
     ),
   });
 
-  const skipped = results.filter((r) => r.action === 'skipped');
+  const skipped = results.filter((r) => r.action === 'skipped' && !r.reason);
+  const unavailable = results.filter((r) => r.reason === 'host-not-initialized');
   log('');
   if (skipped.length) {
     log(`${skipped.length} location(s) skipped — remove them by hand, or pass --skill-name`);
     log('to install under a different name.');
+  }
+  if (unavailable.length) {
+    log(`${unavailable.map((r) => r.host).join(', ')} skipped — initialize that host, then run cmo install again.`);
   }
   const { nextSteps } = await import('./banner.mjs');
   log(nextSteps({ done: 1 }).trimEnd());
