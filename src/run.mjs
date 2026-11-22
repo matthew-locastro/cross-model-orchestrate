@@ -188,6 +188,7 @@ export function buildCommand(decision, opts) {
     grokBinary = null,
     prompt = '',
     timeoutMs = DEFAULT_TIMEOUT_MS,
+    maxMs = timeoutMs,
   } = opts;
 
   if (decision.provider === 'antigravity') {
@@ -201,7 +202,8 @@ export function buildCommand(decision, opts) {
     args.push('--model', decision.model);
     if (decision.effort) args.push('--effort', decision.effort);
     args.push('--disable-slash-commands');
-    args.push('--print-timeout', `${Math.max(1, Math.ceil(timeoutMs / 1000))}s`);
+    const printTimeoutMs = Math.max(timeoutMs, maxMs);
+    args.push('--print-timeout', `${Math.max(1, Math.ceil(printTimeoutMs / 1000))}s`);
     if (schemaFile) args.push('--json-schema', schemaFile);
     const role = decision.factors?.role;
     const mayWrite = role === 'implement'
@@ -615,7 +617,9 @@ function tryParse(s) {
 /**
  * When a schema is requested, Claude gets the contract in the prompt because it
  * has no --output-schema flag. Codex gets both: the flag enforces it and the
- * sentence stops it narrating around the object.
+ * sentence stops it narrating around the object. Antigravity gets only its
+ * native --json-schema contract, whose own schema turn must see the original
+ * task rather than JSON already produced in response to this text contract.
  */
 export function schemaContract(schema) {
   return [
@@ -943,7 +947,8 @@ export async function runAgent(decision, prompt, opts = {}) {
     'and may be re-run later against the other vendor.',
   ].join('\n') : '';
 
-  const fullPrompt = `${prompt}${handicap}${schema ? `\n${schemaContract(schema)}` : ''}`;
+  const promptWithoutSchemaContract = `${prompt}${handicap}`;
+  const fullPrompt = `${promptWithoutSchemaContract}${schema ? `\n${schemaContract(schema)}` : ''}`;
   // Grok reads its prompt from a file, never stdin.
   const promptFile = join(workdir, 'prompt.md');
   await writeFile(promptFile, fullPrompt, 'utf8');
@@ -993,6 +998,9 @@ export async function runAgent(decision, prompt, opts = {}) {
         const commandTarget = target.provider === 'antigravity'
           ? { ...target, factors: decision.factors }
           : target;
+        const targetPrompt = target.provider === 'antigravity' && schema
+          ? promptWithoutSchemaContract
+          : fullPrompt;
         const { binary, args } = buildCommand(commandTarget, {
           cwd,
           lastMessageFile,
@@ -1003,8 +1011,9 @@ export async function runAgent(decision, prompt, opts = {}) {
           fullAccess,
           sandbox,
           allowedTools,
-          prompt: fullPrompt,
+          prompt: targetPrompt,
           timeoutMs,
+          maxMs,
         });
 
         // Claim headroom for the duration of the call, so concurrent
@@ -1032,8 +1041,8 @@ export async function runAgent(decision, prompt, opts = {}) {
             prompt: target.provider === 'grok'
               ? ''
               : target.provider === 'antigravity'
-                ? (isLongAgyPrompt(fullPrompt) ? antigravityInput(fullPrompt) : '')
-                : fullPrompt,
+                ? (isLongAgyPrompt(targetPrompt) ? antigravityInput(targetPrompt) : '')
+                : targetPrompt,
             timeoutMs,
             idleMs,
             maxMs,

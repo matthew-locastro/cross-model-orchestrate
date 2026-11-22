@@ -59,6 +59,16 @@ case "$CMO_AGY_SCENARIO" in
     printf '%s\\n' 'OAuth login required' >&2
     exit 1
     ;;
+  structured-auth-conflict)
+    printf '%s' '{"status":"ERROR","response":"","error":"agent stopped"}'
+    printf '%s\\n' 'quota rate-limit' >&2
+    printf '%s\\n' 'AGY_ERROR: {"status":"ERROR","reason":"login_required"}' >&2
+    exit 1
+    ;;
+  success-noisy)
+    printf '%s' "$success"
+    printf '%s\\n' 'docs: npm run login; auth, quota, rate-limit, and print_timeout are examples' >&2
+    ;;
   status-error)
     printf '%s' '{"status":"ERROR","response":"partial answer","error":"agent stopped"}'
     ;;
@@ -122,9 +132,9 @@ async function withFakeAgy(scenario, body) {
   }
 }
 
-test('short antigravity runs use agy -p with explicit Gemini, effort, timeout and write permission', async () => {
+test('short antigravity runs use agy -p with explicit Gemini, effort, hard ceiling and write permission', async () => {
   const { value: out, captured } = await withFakeAgy('success', () => runAgent(AGY, 'do the task', {
-    timeoutMs: 30_000, maxAttempts: 1, failover: false,
+    timeoutMs: 30_000, maxMs: 120_000, maxAttempts: 1, failover: false,
   }));
   assert.equal(out.ok, true, JSON.stringify({ out, captured }));
   assert.equal(out.provider, 'antigravity');
@@ -136,7 +146,7 @@ test('short antigravity runs use agy -p with explicit Gemini, effort, timeout an
     '--model', 'gemini-4-carbon',
     '--effort', 'high',
     '--disable-slash-commands',
-    '--print-timeout', '30s',
+    '--print-timeout', '120s',
     '--dangerously-skip-permissions',
   ]);
   assert.equal(captured.stdin, '');
@@ -176,6 +186,8 @@ test('schemas use the original schema file and structured_output object', async 
   assert.deepEqual(out.resultJson, { verdict: 'approved' });
   assert.ok(captured.args.includes('--json-schema'));
   assert.deepEqual(JSON.parse(captured.schema), schema);
+  assert.equal(captured.args[captured.args.indexOf('-p') + 1], 'judge it');
+  assert.ok(!captured.args.join(' ').includes('RETURN FORMAT'));
 });
 
 test('schemas fall back to response JSON but still require an object', async () => {
@@ -220,6 +232,22 @@ test('auth failures are signed-out and exit zero with non-SUCCESS status still f
   }));
   assert.equal(badStatus.value.ok, false);
   assert.equal(badStatus.value.attempts[0].failure, 'fatal');
+});
+
+test('structured AGY_ERROR classification wins over conflicting stderr text', async () => {
+  const auth = await withFakeAgy('structured-auth-conflict', () => runAgent(AGY, 'sign in', {
+    timeoutMs: 30_000, maxAttempts: 1, failover: false,
+  }));
+  assert.equal(auth.value.ok, false);
+  assert.equal(auth.value.attempts[0].failure, 'signed-out');
+});
+
+test('SUCCESS envelopes ignore failure words in stderr', async () => {
+  const { value: out } = await withFakeAgy('success-noisy', () => runAgent(AGY, 'inspect', {
+    timeoutMs: 30_000, maxAttempts: 1, failover: false,
+  }));
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.equal(out.result, 'ok');
 });
 
 test('soft-deny stderr is retained as a receipt warning without discarding success', async () => {

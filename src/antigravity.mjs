@@ -58,8 +58,24 @@ export function parseAntigravityStdout(stdout) {
 
 /** Classify only Antigravity transport/envelope evidence, never response text. */
 export function classifyAntigravityFailure(result, parsed) {
+  if (result.code === 0 && parsed.status === 'SUCCESS') return 'none';
+
+  if (result.timedOut) return 'timeout';
+
+  const agyError = structuredAgyError(result.stderr);
+  if (agyError) {
+    const diagnostic = `${agyError.status ?? ''}\n${agyError.reason ?? ''}`.replace(/[_-]+/g, ' ');
+    if (/\b(?:DEADLINE EXCEEDED|print timeout|timed? out|timeout)\b/i.test(diagnostic)) return 'timeout';
+    if (/\b(?:RESOURCE EXHAUSTED|quota|rate limit(?:ed)?|429)\b/i.test(diagnostic)) return 'rate-limit';
+    if (/\b(?:UNAUTHENTICATED|AUTHENTICATION FAILED|auth(?:entication)?|oauth|log ?in|required login|login required|signed out|not signed in)\b/i.test(diagnostic)) {
+      return 'signed-out';
+    }
+    if (/\b(?:UNAVAILABLE|INTERNAL|ABORTED|CANCELLED)\b/i.test(diagnostic)) return 'transient';
+    return 'fatal';
+  }
+
   const diagnostic = `${result.stderr ?? ''}\n${parsed.error ?? ''}\n${parsed.envelope?.finished_reason ?? ''}`;
-  if (result.timedOut || result.code === 3 || /\bprint_timeout\b/i.test(diagnostic)) return 'timeout';
+  if (result.code === 3 || /\bprint_timeout\b/i.test(diagnostic)) return 'timeout';
   if (/\b(?:RESOURCE_EXHAUSTED|quota|rate[ _-]?limit(?:ed)?|429)\b/i.test(diagnostic)) return 'rate-limit';
   if (/\b(?:auth(?:entication)?|oauth|log[ -]?in|logged out|signed out|not signed in)\b/i.test(diagnostic)) {
     return 'signed-out';
@@ -67,6 +83,18 @@ export function classifyAntigravityFailure(result, parsed) {
   if (result.signal) return 'transient';
   if (result.code !== 0) return 'fatal';
   return parsed.status === 'SUCCESS' ? 'none' : 'fatal';
+}
+
+function structuredAgyError(stderr = '') {
+  for (const line of stderr.split('\n')) {
+    const match = line.match(/\bAGY_ERROR:\s*(\{.*\})\s*$/);
+    if (!match) continue;
+    try {
+      const parsed = JSON.parse(match[1]);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    } catch { /* malformed structured diagnostics fall back to text */ }
+  }
+  return null;
 }
 
 export function antigravitySoftDenyWarning(stderr = '') {
