@@ -9,16 +9,16 @@ export const OUTCOMES_FILE = join(CACHE_DIR, 'outcomes.jsonl');
 export const VERDICTS = new Set(['approved', 'fixed', 'rejected', 'blocked', 'confirmed', 'false-positive', 'missed']);
 
 /** Record a judgement without altering the receipt that it evaluates. */
-export async function recordOutcome(entry) {
-  await mkdir(CACHE_DIR, { recursive: true });
-  await appendFile(OUTCOMES_FILE, `${JSON.stringify(entry)}\n`, 'utf8');
+export async function recordOutcome(entry, { cacheDir = CACHE_DIR } = {}) {
+  await mkdir(cacheDir, { recursive: true });
+  await appendFile(join(cacheDir, 'outcomes.jsonl'), `${JSON.stringify(entry)}\n`, 'utf8');
 }
 
 /** Read valid outcome lines. A torn final line never breaks a report. */
-export async function readOutcomes({ sinceMs = null } = {}) {
+export async function readOutcomes({ sinceMs = null, cacheDir = CACHE_DIR } = {}) {
   let text;
   try {
-    text = await readFile(OUTCOMES_FILE, 'utf8');
+    text = await readFile(join(cacheDir, 'outcomes.jsonl'), 'utf8');
   } catch {
     return [];
   }

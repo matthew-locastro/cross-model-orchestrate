@@ -34,6 +34,21 @@ import {
   runAgent,
 } from '../src/run.mjs';
 import { readAudit } from '../src/audit.mjs';
+import {
+  USAGE,
+  limitsExitStatus,
+  main as cmoMain,
+  outcomeCommand,
+  renderLimits,
+} from '../bin/cmo.mjs';
+
+function captureOutput() {
+  const writes = [];
+  return {
+    sink(text, stream = 'stdout') { writes.push({ stream, text }); },
+    text(stream) { return writes.filter((write) => write.stream === stream).map((write) => write.text).join(''); },
+  };
+}
 
 const healthy = (percent = 5) => ({
   available: true,
@@ -997,4 +1012,122 @@ test('a timeout is reported, not swallowed as an empty answer', async () => {
   );
   assert.equal(out.ok, false);
   assert.ok(out.attempts.every((a) => a.failure === 'timeout'));
+});
+
+// ── CLI handlers ─────────────────────────────────────────────────────────────
+
+test('outcome rejects an unknown dispatch without writing an outcome', async () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-outcome-unknown-'));
+  const output = captureOutput();
+  const code = await outcomeCommand(
+    ['outcome', 'd-missing', '--verdict', 'approved'],
+    cacheDir,
+    output.sink,
+  );
+
+  assert.equal(code, 1);
+  assert.equal(output.text('stdout'), '');
+  await assert.rejects(readFile(join(cacheDir, 'outcomes.jsonl'), 'utf8'), { code: 'ENOENT' });
+});
+
+test('outcome --force writes an orphan record', async () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-outcome-force-'));
+  const output = captureOutput();
+  const code = await outcomeCommand(
+    ['outcome', 'd-orphan', '--verdict', 'fixed', '--force'],
+    cacheDir,
+    output.sink,
+  );
+
+  assert.equal(code, 0);
+  const saved = JSON.parse((await readFile(join(cacheDir, 'outcomes.jsonl'), 'utf8')).trim());
+  assert.deepEqual(
+    { id: saved.id, verdict: saved.verdict, rounds: saved.rounds, orphan: saved.orphan },
+    { id: 'd-orphan', verdict: 'fixed', rounds: 1, orphan: true },
+  );
+});
+
+test('outcome rejects invalid verdicts and round counts with usage status', async () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-outcome-invalid-'));
+  const badVerdict = captureOutput();
+  const badRounds = captureOutput();
+
+  assert.equal(await outcomeCommand(
+    ['outcome', 'd-any', '--verdict', 'maybe'], cacheDir, badVerdict.sink,
+  ), 2);
+  assert.equal(await outcomeCommand(
+    ['outcome', 'd-any', '--verdict', 'approved', '--rounds', '1.5'], cacheDir, badRounds.sink,
+  ), 2);
+  await assert.rejects(readFile(join(cacheDir, 'outcomes.jsonl'), 'utf8'), { code: 'ENOENT' });
+});
+
+test('report --quality --json emits the stable quality envelope', async () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-report-quality-'));
+  const now = Date.now();
+  await writeFile(join(cacheDir, 'dispatches.jsonl'), `${JSON.stringify({
+    at: now, id: 'd-quality', provider: 'codex', role: 'review', model: 'gpt-5.6-terra',
+  })}\n`);
+  await writeFile(join(cacheDir, 'outcomes.jsonl'), `${JSON.stringify({
+    at: now, id: 'd-quality', verdict: 'approved', rounds: 1,
+  })}\n`);
+  const output = captureOutput();
+
+  assert.equal(await cmoMain(
+    ['report', '--quality', '--json'], { cacheDir, outputSink: output.sink },
+  ), 0);
+  assert.deepEqual(JSON.parse(output.text('stdout')), {
+    window: '24h',
+    quality: {
+      total: 1,
+      orphans: 0,
+      groups: [{
+        provider: 'codex', role: 'review', model: 'gpt-5.6-terra', n: 1,
+        firstRoundApprovals: 1, blocked: 0, confirmed: 0,
+        falsePositive: 0, missed: 0, meanRounds: 1,
+      }],
+    },
+  });
+});
+
+test('help names the active roster and keeps grok explicitly opt-in', () => {
+  assert.match(USAGE, /^\s*outcome\s+/m);
+  assert.match(USAGE, /codex\|claude\|antigravity/);
+  assert.match(USAGE, /config "providers"/);
+  assert.doesNotMatch(USAGE, /grok first/i);
+});
+
+test('limits omit inactive grok and fail when every active vendor is exhausted', () => {
+  const now = Date.parse('2026-11-22T00:00:00.000Z');
+  const exhausted = (provider) => ({
+    available: true,
+    provider,
+    worstPercent: 99,
+    reportedPercent: 99,
+    hardBlocked: true,
+    windows: [{ key: 'weekly', label: 'Wkly', percentUsed: 99, resetsAt: '2026-11-23T00:00:00.000Z' }],
+  });
+  const limits = {
+    codex: exhausted('codex'),
+    claude: exhausted('claude'),
+    antigravity: exhausted('antigravity'),
+    grok: { ...healthy(), provider: 'grok' },
+    inFlight: {},
+  };
+  const roster = ['codex', 'claude', 'antigravity'];
+
+  assert.doesNotMatch(renderLimits(limits, now), /^grok\s/m);
+  assert.equal(limitsExitStatus(limits, roster, now), 3);
+});
+
+test('human report share excludes inactive grok', async () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-report-share-'));
+  await writeFile(join(cacheDir, 'dispatches.jsonl'), `${JSON.stringify({
+    at: Date.now(), id: 'd-share', provider: 'codex', role: 'implement', model: 'gpt-5.6-terra',
+  })}\n`);
+  const output = captureOutput();
+
+  assert.equal(await cmoMain(['report'], { cacheDir, outputSink: output.sink }), 0);
+  const shareLine = output.text('stdout').split('\n').find((line) => line.includes('· share '));
+  assert.match(shareLine, /codex 100% \/ claude 0% \/ antigravity 0%/);
+  assert.doesNotMatch(shareLine, /grok/);
 });

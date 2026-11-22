@@ -12,10 +12,12 @@
 // Workflow scripts and the codex-runner agent shell out to this exact surface,
 // so treat the flags as an API. See README.md.
 
-import { readFile } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { readLimits } from '../src/limits.mjs';
-import { decide, isUsable, providerState, pressure, PROVIDERS, routingLine } from '../src/policy.mjs';
+import { decide, isUsable, providerState, pressure, routingLine } from '../src/policy.mjs';
 import { formatDuration, providerPressure } from '../src/pace.mjs';
 import { runAgent, DEFAULT_TIMEOUT_MS } from '../src/run.mjs';
 import { doctor } from '../src/doctor.mjs';
@@ -26,7 +28,7 @@ import { mergeDispatch, parseDispatchFile } from '../src/dispatch-file.mjs';
 import { readAudit, summarise, findings, tierStats, failureTaxonomy, qualityReport } from '../src/audit.mjs';
 import { readOutcomes, recordOutcome, VERDICTS } from '../src/outcomes.mjs';
 import { durationProfile } from '../src/durations.mjs';
-import { activeProviders, loadConfig } from '../src/config.mjs';
+import { activeProviders, CACHE_DIR, loadConfig } from '../src/config.mjs';
 import { MAX_LEASE_MS, perAgentCost } from '../src/ledger.mjs';
 import { update } from '../src/update.mjs';
 
@@ -189,7 +191,7 @@ async function readPrompt(args) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-const USAGE = `cmo <command> [options]   —   cross-model orchestrate
+export const USAGE = `cmo <command> [options]   —   cross-model orchestrate
 
 setup
   install     install the skill into every agent host, and the Claude subagent
@@ -236,9 +238,10 @@ task options (plan, run)
   --length          xs|s|m|l|xl                (default m)
   --context-tokens  rough input size the agent must read
   --write           the agent edits files in the working tree
-  --web             the agent must open live URLs (research, link checks). Never
-                    routed to codex, whose sandbox has no network; grok first.
-  --independent-of  codex|claude|grok — run on a vendor OTHER than this one
+  --web             the agent must open live URLs (research, link checks). Web
+                    and research work goes to an active vendor with network
+                    access; never codex without --full-access.
+  --independent-of  codex|claude|antigravity — run on a vendor OTHER than this one
                     (adversarial review). If none of the others can run it
                     degrades to a fresh agent on the producer's own vendor and
                     LABELS the verdict same-vendor, because a flagged review
@@ -246,8 +249,9 @@ task options (plan, run)
   --strict-independence
                     never degrade: defer instead of reviewing on the producer's
                     vendor. For verdicts that must be cross-vendor or absent.
-  --pin             codex|claude|grok — override provider selection. Grok is
-                    still refused unless signed in to a subscription.
+  --pin             codex|claude|antigravity — override provider selection.
+                    Additional vendors, including grok, are opt-in through the
+                    config "providers" list.
   --model           exact model id, bypassing the tier map
   --timeout         the time budget in seconds  (default: ${DEFAULT_TIMEOUT_MS / 1000}). Within it
                     nothing is stopped. Past it, an agent still producing
@@ -292,8 +296,61 @@ output
   --human           human-readable instead of JSON (limits, plan)
 `;
 
-async function main() {
-  const argv = process.argv.slice(2);
+function processOutput(text, stream = 'stdout') {
+  process[stream].write(text);
+}
+
+/** Shell status for `limits`, separated from rendering and I/O for callers. */
+export function limitsExitStatus(limits, roster = activeProviders(), now = Date.now()) {
+  const bands = pressure();
+  const usable = roster.some((provider) => isUsable({
+    state: providerState(limits?.[provider], bands, now, provider).state,
+  }));
+  return usable ? 0 : 3;
+}
+
+/** Record one outcome using an explicit cache and sink, so no subprocess is needed. */
+export async function outcomeCommand(argv, cacheDir = CACHE_DIR, outputSink = processOutput) {
+  const args = parseArgs(argv);
+  const id = args._[args._[0] === 'outcome' ? 1 : 0];
+  const verdict = args.verdict;
+  if (!id || typeof verdict !== 'string' || !VERDICTS.has(verdict)) {
+    outputSink('cmo outcome: provide a dispatch ID and a valid --verdict\n', 'stderr');
+    return 2;
+  }
+  let rounds = 1;
+  if (args.rounds !== undefined) {
+    rounds = Number(args.rounds);
+    if (!Number.isInteger(rounds) || rounds < 1) {
+      outputSink('cmo outcome: --rounds must be a positive integer\n', 'stderr');
+      return 2;
+    }
+  }
+  const receipt = (await readAudit({ cacheDir })).some((row) => row.id === id);
+  if (!receipt && !args.force) {
+    outputSink(`cmo outcome: no local receipt for ${id}; use --force to record an orphan\n`, 'stderr');
+    return 1;
+  }
+  const outcome = {
+    at: Date.now(), id, verdict, rounds,
+    ...(typeof args.note === 'string' ? { note: args.note } : {}),
+    ...(typeof args.by === 'string' ? { by: args.by } : {}),
+    ...(!receipt ? { orphan: true } : {}),
+  };
+  try {
+    await recordOutcome(outcome, { cacheDir });
+  } catch (err) {
+    outputSink(`cmo outcome: ${err.message}\n`, 'stderr');
+    return 1;
+  }
+  outputSink(`${JSON.stringify(outcome)}\n`, 'stdout');
+  return 0;
+}
+
+export async function main(
+  argv = process.argv.slice(2),
+  { cacheDir = CACHE_DIR, outputSink = processOutput } = {},
+) {
   const args = parseArgs(argv);
   const command = args._[0];
 
@@ -376,7 +433,7 @@ async function main() {
       process.stdout.write(`  ${prov.padEnd(7)} ${String(info.count).padStart(3)}   ${models}\n`);
     }
     if (sum.codexShare != null) {
-      process.stdout.write(`\nshare: ${PROVIDERS.map((p) => `${p} ${sum.shares?.[p] ?? 0}%`).join(' · ')}\n`);
+      process.stdout.write(`\nshare: ${activeProviders().map((p) => `${p} ${sum.shares?.[p] ?? 0}%`).join(' · ')}\n`);
     }
     if (sum.grokAuth) {
       process.stdout.write(`grok billing: ${sum.grokAuth.oauth} verified subscription (oauth)`
@@ -398,39 +455,7 @@ async function main() {
   }
 
   if (command === 'outcome') {
-    const id = args._[1];
-    const verdict = args.verdict;
-    if (!id || typeof verdict !== 'string' || !VERDICTS.has(verdict)) {
-      process.stderr.write('cmo outcome: provide a dispatch ID and a valid --verdict\n');
-      return 2;
-    }
-    let rounds = 1;
-    if (args.rounds !== undefined) {
-      rounds = Number(args.rounds);
-      if (!Number.isInteger(rounds) || rounds < 1) {
-        process.stderr.write('cmo outcome: --rounds must be a positive integer\n');
-        return 2;
-      }
-    }
-    const receipt = (await readAudit()).some((row) => row.id === id);
-    if (!receipt && !args.force) {
-      process.stderr.write(`cmo outcome: no local receipt for ${id}; use --force to record an orphan\n`);
-      return 1;
-    }
-    const outcome = {
-      at: Date.now(), id, verdict, rounds,
-      ...(typeof args.note === 'string' ? { note: args.note } : {}),
-      ...(typeof args.by === 'string' ? { by: args.by } : {}),
-      ...(!receipt ? { orphan: true } : {}),
-    };
-    try {
-      await recordOutcome(outcome);
-    } catch (err) {
-      process.stderr.write(`cmo outcome: ${err.message}\n`);
-      return 1;
-    }
-    process.stdout.write(`${JSON.stringify(outcome)}\n`);
-    return 0;
+    return outcomeCommand(argv, cacheDir, outputSink);
   }
 
   if (command === 'report') {
@@ -440,20 +465,23 @@ async function main() {
         : Number(spec) || 1440;
     const sinceMs = Date.now() - mins * 60_000;
     if (args.quality) {
-      const [receipts, outcomes] = await Promise.all([readAudit(), readOutcomes({ sinceMs })]);
+      const [receipts, outcomes] = await Promise.all([
+        readAudit({ cacheDir }),
+        readOutcomes({ sinceMs, cacheDir }),
+      ]);
       const quality = qualityReport(receipts, outcomes);
       if (args.json) {
-        process.stdout.write(`${JSON.stringify({ window: spec, quality }, null, 2)}\n`);
+        outputSink(`${JSON.stringify({ window: spec, quality }, null, 2)}\n`, 'stdout');
         return 0;
       }
-      process.stdout.write(`quality outcomes — last ${spec}\n`);
-      process.stdout.write(`${quality.total} outcomes · ${quality.orphans} orphan${quality.orphans === 1 ? '' : 's'}\n`);
+      outputSink(`quality outcomes — last ${spec}\n`, 'stdout');
+      outputSink(`${quality.total} outcomes · ${quality.orphans} orphan${quality.orphans === 1 ? '' : 's'}\n`, 'stdout');
       for (const group of quality.groups) {
-        process.stdout.write(`  ${group.provider} / ${group.role} / ${group.model}: n=${group.n} first-round approvals=${group.firstRoundApprovals} mean rounds=${group.meanRounds} blocked=${group.blocked} confirmed=${group.confirmed} false-positive=${group.falsePositive} missed=${group.missed}\n`);
+        outputSink(`  ${group.provider} / ${group.role} / ${group.model}: n=${group.n} first-round approvals=${group.firstRoundApprovals} mean rounds=${group.meanRounds} blocked=${group.blocked} confirmed=${group.confirmed} false-positive=${group.falsePositive} missed=${group.missed}\n`, 'stdout');
       }
       return 0;
     }
-    const rows = await readAudit({ sinceMs });
+    const rows = await readAudit({ sinceMs, cacheDir });
     const cost = await perAgentCost('codex').catch(() => null);
     const lim = await readLimits().catch(() => null);
     const sum = summarise(rows);
@@ -462,46 +490,46 @@ async function main() {
     const found = findings(rows, { perAgentCost: cost, limits: lim });
 
     if (args.json) {
-      process.stdout.write(`${JSON.stringify({ window: spec, summary: sum, tiers, failures: fails, findings: found }, null, 2)}\n`);
+      outputSink(`${JSON.stringify({ window: spec, summary: sum, tiers, failures: fails, findings: found }, null, 2)}\n`, 'stdout');
       return 0;
     }
 
     const hrs = Math.round(mins / 60);
-    process.stdout.write(`\ncross-model-orchestrate — last ${hrs >= 24 ? `${Math.round(hrs / 24)}d` : `${hrs}h`}\n`);
-    process.stdout.write(`${'─'.repeat(60)}\n`);
+    outputSink(`\ncross-model-orchestrate — last ${hrs >= 24 ? `${Math.round(hrs / 24)}d` : `${hrs}h`}\n`, 'stdout');
+    outputSink(`${'─'.repeat(60)}\n`, 'stdout');
     if (!rows.length) {
-      process.stdout.write('no dispatches recorded in this window.\n');
-      for (const f of found) process.stdout.write(`\n  [${f.severity}] ${f.finding}\n          → ${f.action}\n`);
+      outputSink('no dispatches recorded in this window.\n', 'stdout');
+      for (const f of found) outputSink(`\n  [${f.severity}] ${f.finding}\n          → ${f.action}\n`, 'stdout');
       return 0;
     }
 
-    process.stdout.write(`${sum.total} dispatches · ${sum.failed} failed`
+    outputSink(`${sum.total} dispatches · ${sum.failed} failed`
       + (sum.failedOver ? ` · ${sum.failedOver} failed over` : '')
-      + ` · share ${PROVIDERS.map((p) => `${p} ${sum.shares?.[p] ?? 0}%`).join(' / ')}\n\n`);
+      + ` · share ${activeProviders().map((p) => `${p} ${sum.shares?.[p] ?? 0}%`).join(' / ')}\n\n`, 'stdout');
     for (const [prov, info] of Object.entries(sum.byProvider)) {
       const models = Object.entries(info.models).map(([m, n]) => `${m}x${n}`).join('  ');
-      process.stdout.write(`  ${prov.padEnd(7)} ${String(info.count).padStart(4)}   ${models}\n`);
+      outputSink(`  ${prov.padEnd(7)} ${String(info.count).padStart(4)}   ${models}\n`, 'stdout');
     }
-    process.stdout.write('\n  by role: '
-      + Object.entries(sum.byRole).map(([r, n]) => `${r}x${n}`).join('  ') + '\n');
+    outputSink('\n  by role: '
+      + Object.entries(sum.byRole).map(([r, n]) => `${r}x${n}`).join('  ') + '\n', 'stdout');
     const t = Object.entries(tiers).map(([k, v]) => `${k} p50 ${Math.round(v.p50 / 1000)}s/p95 ${Math.round(v.p95 / 1000)}s`);
-    if (t.length) process.stdout.write(`  timing:  ${t.join('   ')}\n`);
+    if (t.length) outputSink(`  timing:  ${t.join('   ')}\n`, 'stdout');
     if (Object.keys(fails).length) {
-      process.stdout.write(`  failures: ${Object.entries(fails).map(([k, n]) => `${k}x${n}`).join('  ')}\n`);
+      outputSink(`  failures: ${Object.entries(fails).map(([k, n]) => `${k}x${n}`).join('  ')}\n`, 'stdout');
     }
     const ind = sum.independence;
     if (ind['cross-vendor'] || ind['same-vendor']) {
-      process.stdout.write(`  reviews: ${ind['cross-vendor']} cross-vendor, ${ind['same-vendor']} same-vendor\n`);
+      outputSink(`  reviews: ${ind['cross-vendor']} cross-vendor, ${ind['same-vendor']} same-vendor\n`, 'stdout');
     }
 
-    process.stdout.write(`\n${'─'.repeat(60)}\n`);
+    outputSink(`\n${'─'.repeat(60)}\n`, 'stdout');
     if (!found.length) {
-      process.stdout.write('nothing worth changing in this window.\n\n');
+      outputSink('nothing worth changing in this window.\n\n', 'stdout');
       return 0;
     }
-    process.stdout.write(`${found.length} finding(s)\n\n`);
+    outputSink(`${found.length} finding(s)\n\n`, 'stdout');
     for (const f of found) {
-      process.stdout.write(`  [${f.severity}] ${f.finding}\n          → ${f.action}\n\n`);
+      outputSink(`  [${f.severity}] ${f.finding}\n          → ${f.action}\n\n`, 'stdout');
     }
     return 0;
   }
@@ -514,8 +542,7 @@ async function main() {
       process.stdout.write(`${JSON.stringify(limits, null, 2)}\n`);
     }
     // Non-zero when no provider can take work, so a shell caller can branch.
-    const usable = activeProviders().some((p) => isUsable({ state: providerState(limits[p], pressure(), Date.now(), p).state }));
-    return usable ? 0 : 3;
+    return limitsExitStatus(limits);
   }
 
   if (command === 'plan') {
@@ -632,9 +659,25 @@ async function main() {
   return 2;
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((err) => {
-    process.stderr.write(`cmo: ${err?.stack ?? err}\n`);
-    process.exit(1);
-  });
+async function executedDirectly(metaUrl = import.meta.url, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  const modulePath = fileURLToPath(metaUrl);
+  try {
+    const [realModule, realEntry] = await Promise.all([
+      realpath(modulePath),
+      realpath(resolve(argv1)),
+    ]);
+    return realModule === realEntry;
+  } catch {
+    return modulePath === resolve(argv1);
+  }
+}
+
+if (await executedDirectly()) {
+  main()
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      process.stderr.write(`cmo: ${err?.stack ?? err}\n`);
+      process.exit(1);
+    });
+}

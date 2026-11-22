@@ -62,10 +62,11 @@ async function readTail(path, bytes) {
   }
 }
 
-export async function readAudit({ sinceMs = null, tailBytes = null } = {}) {
+export async function readAudit({ sinceMs = null, tailBytes = null, cacheDir = CACHE_DIR } = {}) {
   let text = '';
   try {
-    text = tailBytes > 0 ? await readTail(AUDIT_FILE, tailBytes) : await readFile(AUDIT_FILE, 'utf8');
+    const auditFile = join(cacheDir, 'dispatches.jsonl');
+    text = tailBytes > 0 ? await readTail(auditFile, tailBytes) : await readFile(auditFile, 'utf8');
   } catch {
     return [];
   }
