@@ -1,30 +1,34 @@
 # cross-model-orchestrate
 
-**Run agent fan-outs across two AI subscriptions at once — three, with Grok.**
+**Run agent fan-outs across three AI subscriptions at once: Codex, Claude and Antigravity.**
 
-If you pay for both Claude and ChatGPT/Codex, you have two rate-limit windows and
-one agent using one of them. `cmo` spends both: it picks each subagent's model
-from the task's complexity, length and token cost, checks what's actually left on
-each subscription before dispatching, power-uses whichever subscription is least
-used, keeps Claude's window in reserve for the orchestrator, and — the part that changes output quality —
-**always grades work on the vendor that didn't produce it.**
+If you pay for Claude, ChatGPT/Codex and Antigravity (Gemini), you have three
+rate-limit pools and one agent session spending one of them. `cmo` spends all
+three: it picks each subagent's model from the task's complexity, length and
+token cost, checks what is actually left on each subscription before
+dispatching, power-uses whichever subscription is least used, keeps Claude's
+window in reserve for the orchestrator and — the part that changes output
+quality — **always grades work on a vendor that did not produce it.**
 
-## First, the two CLIs this drives
+## First, the three CLIs this drives
 
-`cmo` has no API keys and no models of its own. It drives the **Claude Code** and
-**Codex** CLIs you are already paying for, so both have to be installed *and
-logged in* before it can do anything. Skip this and `cmo doctor` will tell you —
-but you will have installed a tool that can only reach one vendor, and grading
-work on the vendor that did not produce it is the entire point.
+`cmo` has no API keys and no models of its own. It drives the **Claude Code**,
+**Codex** and **Antigravity** (`agy`) CLIs you are already paying for, so the
+ones you want to route across must be installed *and logged in* before `cmo` can
+use them. Any two give you cross-vendor review; all three give you a third
+independent model family and a dedicated web-capable pool outside Claude's
+orchestrator window.
 
-Node 20 or newer, then:
+Node 20 or newer, then install and sign in to your CLIs:
 
 ```bash
 npm install -g @anthropic-ai/claude-code   # or Claude Code's native installer
 npm install -g @openai/codex
+# plus Antigravity (`agy` on PATH or ~/.local/bin/agy)
 
 claude    # log in, then quit
 codex     # log in, send it one message, then quit
+agy       # sign in with your subscription account (never GEMINI_API_KEY)
 ```
 
 That message to Codex is not ceremony. It writes Codex's first session file, and
@@ -35,97 +39,102 @@ Codex meter reads "no codex session rollouts found" and routing has to guess.
 
 ```bash
 npm install -g cross-model-orchestrate
-cmo install     # wires the skill into Claude Code, Codex, Kilo, OpenCode
-cmo doctor      # every row should read ok
+cmo install     # wires the skill into Claude Code, Codex, ~/.agents, Kilo, OpenCode and Antigravity
+cmo doctor      # checks active vendors, auth, model IDs, headroom and skill links
 ```
 
 Global, not `npx`: the `codex-runner` shim needs `cmo` on `PATH`, and paying
 npx's unpack cost once per subagent across a 250-agent fan-out is not free.
 
 Two steps, both needed. The npm install puts `cmo` on your path and nothing
-else; `cmo install` is what wires the skill and the `codex-runner` subagent into
-your agent tools, which is what makes the command below exist. Running `cmo`
-with no arguments reprints these steps at any time.
+else; `cmo install` wires the skill into Claude Code, Codex, `~/.agents`, Kilo,
+OpenCode and Antigravity (`~/.gemini/config/skills`, skipped and reported when
+`~/.gemini` is absent so machines without Antigravity stay clean), plus the
+`codex-runner` subagent for Claude Code. Running `cmo` with no arguments
+reprints these steps at any time.
 
-`cmo doctor` is the gate: if it is green, a fan-out will work, and if it is not,
-it names the command that fixes each row. Run it before your first dispatch and
-any time something behaves oddly.
+`cmo doctor` checks only your active vendors (`codex`, `claude` and
+`antigravity` by default): if it is green, a fan-out will work, and if it is
+not, it names the command that fixes each row. Run it before your first dispatch
+and any time something behaves oddly.
 
 (Two harmless things npm may say on the way in. It hides our postinstall banner
 unless you pass `--foreground-scripts`, and newer npm warns that the package
 "has install scripts not yet covered by allowScripts". Both are fine to ignore:
 that script only prints text — it writes nothing, touches no directory outside
-the package, and cannot fail your install. `cmo install`, which you type
+the package and cannot fail your install. `cmo install`, which you type
 yourself, is what actually wires anything up.)
 
-**The orchestration runs from Claude Code, and only from Claude Code.** Codex is
-a worker here, not a driver — it executes subagents, it does not run the
-workflow. (The `cmo` CLI itself works anywhere with a shell; see
-[what's portable](#whats-portable-and-what-isnt).)
+**Any host with the skill can orchestrate with `cmo run` units.** Claude Code
+adds `Workflow` fan-outs (`pipeline()`, `parallel()`, resume cache) and live
+subagent steering; Antigravity (`agy`) can run `/cross-model-orchestrate`
+directly inside repositories too; and a Codex orchestrator needs full access
+(network enabled) so it can read the meters and dispatch to the other CLIs (see
+[what's portable](#whats-portable-and-what-isnt)).
 
-```
+```text
 claude --model opus --effort high
 /cross-model-orchestrate build me X, fan it out
 ```
 
 Zero dependencies. Plain Node ESM, no build step, no API keys — it drives the
-`codex` and `claude` CLIs you logged into above.
+`codex`, `claude` and `agy` CLIs you logged into above.
 
-## Optional: Grok as a third vendor
+## Antigravity as the third vendor
 
-If you also pay for **SuperGrok**, `cmo` can dispatch to xAI's Grok Build CLI.
-It earns its place with one thing the other two don't do well from a fan-out:
-it runs on your machine with **live web search and fetch**, so it can open a URL
-and look. Codex's sandbox has no network (no DNS), and a Codex agent asked to
-check links guesses them in prose that reads exactly like having checked.
+Antigravity (`agy`) gives `cmo` a third subscription and a third model family.
+Antigravity dispatches run `agy -p` for short prompts and switch prompts over
+100,000 bytes to `--input-format stream-json` (`--output-format stream-json`) on
+stdin with no `-p`. Every dispatch passes an explicit allowlisted **Gemini**
+model (`^gemini-`: default frontier `gemini-4-neon` effort `xhigh`, balanced
+`gemini-4-carbon` effort `high`, fast `gemini-4-hydrogen` effort `low`), and
+`cmo` refuses any non-Gemini slug (`claude-*`, `gpt-oss-*` or an omitted
+`--model`) before spawning, so a review routed to Antigravity is never secretly
+graded by Claude or GPT under another CLI wrapper.
 
-```bash
-curl -fsSL https://x.ai/cli/install.sh | bash   # xAI's installer
-grok login                                       # browser OAuth to your SuperGrok account
-cmo doctor                                       # "grok sign-in  ok  Oidc (OAuth) on SuperGrok …"
-```
+**Subscription only, never API spend.** `cmo` closes the pay-per-token path in
+two places:
 
-**Subscription only, never API spend.** The grok CLI falls back to pay-per-token
-billing through `XAI_API_KEY` whenever it isn't signed in. `cmo` closes that
-path four ways:
+1. every child process starts with `GEMINI_API_KEY` and `GOOGLE_API_KEY` (along
+   with `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY`, `OPENAI_API_KEY` and xAI key
+   variables) removed from its environment;
+2. before routing, `cmo limits` runs `agy -p /usage --output-format json` (zero
+   tokens, no inference) and reads only the `"Gemini Models"` group's
+   `gemini-5h` and `gemini-weekly` buckets. With an API-key login `/usage` exits
+   2 because an API key has no subscription quota; `cmo` marks Antigravity
+   unauthenticated and unroutable.
 
-1. every child process starts with `XAI_API_KEY` and `GROK_CODE_XAI_API_KEY`
-   removed and `GROK_DISABLE_API_KEY_AUTH=1` set, so the CLI has no key to fall
-   back to and refuses one anyway (checked: with a key present and the lock set,
-   a headless run fails "Not signed in" rather than using it);
-2. before routing, `cmo` asks the CLI's own agent protocol whether the session
-   is an OAuth sign-in on a subscription tier — no sign-in, no grok;
-3. every dispatch's stream names its auth source on its first line, and a
-   session that isn't `oauth` is killed on that line and grok is marked
-   unroutable for every orchestrator on the machine;
-4. every grok receipt records that source, and `cmo audit` / `cmo report`
-   flag any grok dispatch not proven to be subscription-billed.
+What goes to Antigravity: `research`-role dispatches (with or without `--web`)
+and anything dispatched with `--web` (`web: true` in a dispatch file) exclude
+Codex's networkless sandbox unless `--full-access` is set, so Antigravity and
+Claude serve them — with Antigravity ahead while Claude pays the orchestrator
+penalty and reserve. Antigravity also joins the cross-vendor reviewer pool and
+takes ordinary implementation work whenever its window is least used.
 
-`cmo` never reads, stores or sets a key, and never reads `~/.grok/auth.json`.
-
-What goes to Grok: `research`-role work and anything dispatched with `--web`
-(`web: true` in a dispatch file) lean to it while its window is healthy, and it
-joins the pool of cross-vendor reviewers. Ordinary work follows the same
-least-used rule as everything else, so Grok takes it whenever its subscription
-is the differentially idle one, not only after Codex is spent. Its weekly
-allowance is shared with the Grok apps, so `cmo limits` shows the same number
-the app does.
+For permissions, `cmo` passes `--dangerously-skip-permissions` to `agy` only on
+writing roles (`implement` and `mechanical` with `--write`) and omits it on
+read-only roles (`review`, `judge`, `research`, `synthesis`, `architecture`),
+where unapprovable actions are soft-denied in headless mode and recorded as a
+receipt warning. Antigravity's `--sandbox` flag constrains shell commands the
+agent spawns rather than `agy`'s own file tools, so after reviews the reviewer
+runs `git status` and the orchestrator checks working-tree cleanliness at the
+gate instead of relying on `--sandbox` as a write barrier.
 
 ---
 
 ## Why
 
-A grader that didn't make the thing rejects work a self-assessing agent ships. On
-the run this came out of, an independent grader rejected 38 of 57 generated
+A grader that did not make the thing rejects work a self-assessing agent ships.
+On the run this came out of, an independent grader rejected 38 of 57 generated
 images — that rejection loop *was* the quality.
 
 But an independent *Claude* agent grading a *Claude* agent's work still shares
-its blind spots. It's the same model, with the same opinions about what good
+its blind spots. It is the same model, with the same opinions about what good
 looks like, arriving at the same wrong conclusion by a different route. Put the
-grader on the other vendor and the failure modes stop being correlated.
+grader on another vendor and the failure modes stop being correlated.
 
-That needs two subscriptions, which means it needs to know what's left on each
-one. Hence this tool.
+That needs multiple subscriptions, which means knowing what is left on each one.
+Hence this tool.
 
 The second reason is cheaper and more boring: a 250-agent fan-out that hits a
 usage limit at agent 180 has wasted the run. `cmo` watches the meter and stops
@@ -136,33 +145,40 @@ with a reset time instead of finding out the hard way.
 ## What you get
 
 ```bash
-cmo limits --human      # what's left, both providers, zero token cost
+cmo limits --human      # what's left across codex, claude and antigravity, zero token cost
 cmo plan --role judge --complexity 4 --length s --independent-of codex --human
 echo "the task" | cmo run --role implement --complexity 3 --write
+cmo outcome <dispatchId> --verdict approved --rounds 1
+cmo report --quality --since 7d
 cmo selftest            # print the whole decision table, offline
 cmo doctor              # will this work on my machine?
 ```
 
 `cmo limits` on a normal day:
 
-```
-codex   ok        plan=pro
-        Wkly   ··········   2% resets 2026-08-28 07:36Z
-claude  ok
-        5hr    ··········   3% resets 2026-08-21 17:20Z
-        Wkly   ███·······  27% resets 2026-08-27 16:00Z
+```text
+codex       ok        plan=pro
+            Wkly   ··········   2% resets 2026-08-28 07:36Z
+claude      ok
+            5hr    ··········   3% resets 2026-08-21 17:20Z
+            Wkly   ███·······  27% resets 2026-08-27 16:00Z
+antigravity ok
+            5hr    ··········   2% resets 2026-08-21 18:10Z
+            Wkly   █·········   9% resets 2026-08-28 00:11Z
 
-bands: tight ≥65%  critical ≥85%  exhausted ≥95%
+bands (on pressure — usage weighed against time to reset): tight ≥65%  critical ≥85%  exhausted ≥95%
 ```
 
 `cmo plan` tells you what it would do and why, before spending anything:
 
-```
+```text
 $ cmo plan --role judge --complexity 4 --length s --independent-of codex --human
-claude sonnet effort=medium (tier balanced, weight 0.613)
-why: judge · complexity 4/5 · length s → balanced | claude healthy (27%)
+antigravity gemini-4-carbon effort=high (tier balanced, weight 0.613)
+independence: cross-vendor
+why: judge · complexity 4/5 · length s → balanced | antigravity healthy (9%)
 notes:
-  - cross-model review: forced onto claude because the artifact came from codex
+  - cross-model review: forced onto antigravity or claude because the artifact came from codex
+fallback: claude sonnet
 ```
 
 ---
@@ -177,73 +193,73 @@ Three factors set the **tier**. Live subscription headroom picks the **vendor**.
 | length | 30% | `--length xs\|s\|m\|l\|xl` |
 | role | 25% | `--role mechanical\|research\|implement\|review\|synthesis\|judge\|architecture` |
 
-```
+```text
 weight < 0.30 → fast       weight < 0.62 → balanced       else → frontier
 ```
 
-Vendor selection filters first, then scores whoever can run:
+Vendor selection filters first across `activeProviders()` (`codex`, `claude` and
+`antigravity` by default), then scores whoever can run:
 
 1. `--pin` — you forced it.
-2. `--independent-of <vendor>` — cross-model review. Only the *other* vendors are
-   candidates; if none of them can run the call **degrades** to a fresh agent on
-   the producer's vendor, labels the verdict `same-vendor`, raises a tier, and
-   tells the agent it shares the producer's blind spots. A same-vendor
-   independent grader is still worth having — one rejected 38 of 57 candidates
-   on the run this came from. What's dangerous is an *unlabelled* fallback, so
-   it's always labelled. `--strict-independence` refuses instead.
-3. Can it run — a provider ≥95% used, or flagged `rate_limit_reached`, isn't a
-   candidate. Nor is a missing CLI, an unverified Grok, or Codex on `--web` work.
+2. `--independent-of <vendor>` — cross-model review. Only the *other* active
+   vendors are candidates; if none of them can run, the call **degrades** to a
+   fresh agent on the producer's vendor, labels the verdict `same-vendor`,
+   raises a tier and tells the agent it shares the producer's blind spots. A
+   same-vendor independent grader is still worth having — one rejected 38 of 57
+   candidates on the run this came from. What is dangerous is an *unlabeled*
+   fallback, so it is always labeled. `--strict-independence` refuses instead.
+3. Can it run — a provider ≥95% used, or flagged `rate_limit_reached`, is not a
+   candidate. Neither is a missing CLI, an unverified Antigravity subscription,
+   a signed-out Claude CLI or sandboxed Codex on `research` or `--web` work
+   (without `--full-access`).
 4. **Least-used wins.** The dominant term is headroom:
    `headroomWeight` (default 40) × (100 − pressure) / 100. When one competing
    provider's pressure is at least `powerGap` points (default 20) below every
    other provider that is actually competing, it also gets `powerBonus`
    (default 25). The reason reads, for example,
-   `power-use: grok is 61 points less used than codex`.
+   `power-use: antigravity is 61 points less used than codex`.
 5. **Orchestrator reserve.** The vendor driving the run (`orchestrator.vendor`,
    default `claude`) loses `penalty` points (default 30) on every dispatch. At
    or above `reserveAt` pressure (default 60) it ranks below every usable
    alternative and is chosen only when nothing else can run:
    `claude reserved for the orchestrator (pressure 62% ≥ 60%)`.
    `vendor: null` turns the reserve off.
-6. **Affinity** — Grok gets 25 points for `research` and for `--web`, so a
-   healthy Grok still takes that work when no other subscription is
-   differentially idle.
+6. **Network capability and affinity** — `research` and `--web` require network
+   access, excluding Codex unless `--full-access` is passed; optional `affinity`
+   entries in config can add role or web points for a specific vendor.
 7. **Tie-break** — `preference.first` (default `codex`), worth
    `weightPoints / 10` score points (default 2.5). It settles a near-tie and
    nothing wider.
 8. **Time fit** — a vendor whose own recent receipts say it will not finish
-   inside the dispatch's `--timeout` is tried after one that will. The
-   estimate is the p75 of that vendor's last 14 days on the same role, tier and
-   effort (3 samples minimum; a tier with fewer takes the nearest cheaper
-   tier's estimate as a floor), and "will not finish" means over 90% of the
-   timeout. The slow vendor stays on the failover ladder, a pin still wins,
-   and the orchestrator's reserved vendor is never promoted past it. The reason reads, for example,
-   `grok usually overruns a 10.0 min timeout on review·balanced (grok 18.5 min
-   at p75 over 4), so it runs only if codex cannot`. It exists because Grok
-   takes three to four times as long as Codex at the same tier (review p50
-   876s against 202s): power-use sent it reviews with Codex-sized 600s and
-   900s timeouts, it was killed with nothing to show, and Codex did the work
-   anyway. (Since 0.1.30 a run still producing output is not killed at its
-   timeout at all: see the watchdog under Hardening.)
+   inside the dispatch's `--timeout` is tried after one that will. The estimate
+   is the p75 of that vendor's last 14 days on the same role, tier and effort
+   (3 samples minimum; a tier with fewer takes the nearest cheaper tier's
+   estimate as a floor), and "will not finish" means over 90% of the timeout.
+   The slow vendor stays on the failover ladder, a pin still wins and the
+   orchestrator's reserved vendor is never promoted past it. (A run still
+   producing output is not killed at its timeout: see the watchdog under
+   Hardening.)
 
 `cmo limits --human` ends with that call:
 
 ```text
-routing: power-use grok (6%) · codex 67% · claude reserved for orchestrator
+routing: power-use antigravity (6%) · codex 67% · claude reserved for orchestrator
 ```
 
 `cmo plan --human` repeats the power-use and reserve reasons under `notes`.
 
-Headroom is **pace-aware**. Both vendors have a 5-hour and a weekly window, and
-a raw percentage can't tell 80% of a week with five days to go (20% must last
-five days: 4%/day against an even pace of 14.3%/day) from 80% with twelve hours
-to go (plenty, and whatever is left at the reset is lost). So each window gets a
-*pressure* — usage weighed against time to reset, on the same 0–100 scale — and
-the headroom term, the bands and the model downgrade all act on the
-most-pressured window. A weekly squeeze outranks a 5-hour blip that is about to
-clear; budget about to expire counts as room; and pace alone never takes a
-provider out of the running, so it can still serve the cross-vendor reviews
-only it can do. `cmo limits --human` prints the pace line for every window:
+Headroom is **pace-aware**. Vendors can expose 5-hour and weekly windows (Codex
+may report only one), and routing uses every window a vendor reports. A raw
+percentage cannot tell 80% of a week with five days to go (20% must last five
+days: 4%/day against an even pace of 14.3%/day) from 80% with twelve hours to go
+(plenty, and whatever is left at the reset is lost). So each reported window
+gets a *pressure* — usage weighed against time to reset, on the same 0–100 scale
+— and the headroom term, the bands and the model downgrade all act on the
+most-pressured window. A weekly squeeze outranks a 5-hour blip that is
+about to clear; budget about to expire counts as room; and pace alone never
+takes a provider out of the running, so it can still serve the cross-vendor
+reviews only it can do. `cmo limits --human` prints the pace line for every
+window:
 
 ```text
 codex   critical  pressure 94% (weekly) plan=pro
@@ -257,7 +273,7 @@ The arithmetic and a table of worked cases are in
 Plus four token-efficiency corrections, each of which shows up in `notes`:
 
 - large context (≥120k) at complexity ≤3 drops off the frontier tier — bulk
-  reading doesn't need an expensive model;
+  reading does not need an expensive model;
 - a schema-bound `xs` output drops one tier — the schema constrains the answer
   more than the model does;
 - `judge` and `review` never run on the fast tier — a cheap grader is a generous
@@ -272,46 +288,49 @@ Run `cmo selftest` to print the whole table with *your* configured models.
 ## Configuration
 
 Model IDs are the thing most likely to be wrong on your machine — Codex plans
-expose different model lists, and both vendors rename things. So the tier→model
-map is data, not code. `cmo doctor` prints the resolved map and flags any Codex
-model ID your account doesn't actually have.
+expose different model lists, and vendors rename things. So the tier→model map
+is data, not code. Antigravity's default Gemini tier map is provisional until
+measured outcomes confirm the ordering. `cmo doctor` prints the resolved map and
+flags any Codex model ID your account does not actually have.
 
 `~/.config/cross-model-orchestrate/config.json`:
 
 ```json
 {
+  "providers": ["codex", "claude", "antigravity"],
   "models": {
-    "codex":  { "frontier": "gpt-5.6-sol", "balanced": "gpt-5.6-terra", "fast": "gpt-5.6-luna" },
-    "claude": { "frontier": "opus", "balanced": "sonnet", "fast": "haiku" },
-    "grok":   { "frontier": { "model": "grok-4.7", "effort": "high" },
-                "balanced": { "model": "grok-4.7", "effort": "medium" },
-                "fast":     { "model": "grok-4.7", "effort": "low" } }
+    "codex":       { "frontier": "gpt-5.6-sol", "balanced": "gpt-5.6-terra", "fast": "gpt-5.6-luna" },
+    "claude":      { "frontier": "opus", "balanced": "sonnet", "fast": "haiku" },
+    "antigravity": { "frontier": { "model": "gemini-4-neon", "effort": "xhigh" },
+                     "balanced": { "model": "gemini-4-carbon", "effort": "high" },
+                     "fast":     { "model": "gemini-4-hydrogen", "effort": "low" } }
   },
   "preference": { "first": "codex", "weightPoints": 25 },
   "routing": { "headroomWeight": 40, "powerGap": 20, "powerBonus": 25 },
   "orchestrator": { "vendor": "claude", "penalty": 30, "reserveAt": 60 },
-  "affinity": { "grok": { "roles": ["research"], "web": true, "points": 25 } },
   "durationFit": { "enabled": true, "quantile": 0.75, "margin": 0.9, "minSamples": 3, "windowDays": 14 },
   "pressure": { "tight": 65, "critical": 85, "exhausted": 95 }
 }
 ```
 
-`routing`, `orchestrator` and `durationFit` merge the same way `preference` and `affinity` do:
-a key you set replaces that key, and the rest stay at the defaults.
-`orchestrator.vendor` set to `null` turns the reserve off.
+`routing`, `orchestrator` and `durationFit` merge the same way `preference` and
+`affinity` do: a key you set replaces that key, and the rest stay at the
+defaults. `orchestrator.vendor` set to `null` turns the reserve off. Legacy
+`grok` support stays dormant unless you add `"grok"` to `"providers"`
+explicitly.
 
 Or per-tier via the environment: `CMO_CODEX_FRONTIER`, `CMO_CLAUDE_BALANCED`,
-`CMO_GROK_FAST`, …; `CMO_GROK_BIN` names the grok binary if it is neither on
-`PATH` nor in `~/.grok/bin`; `CMO_GROK_PROBE=0` stops the grok meter (and with it,
-grok routing);
-and `CMO_PREFER=claude` flips the near-tie only. If you drive this from a shell
-script or cron, set `"orchestrator": { "vendor": null }` — the default assumes
-the process doing the dispatching is itself a Claude session.
+`CMO_ANTIGRAVITY_FAST`, … (Antigravity overrides must still match `^gemini-`);
+`CMO_AGY_BIN` names the `agy` binary if it is neither on `PATH` nor in
+`~/.local/bin/agy`; `CMO_AGY_PROBE=0` disables the Antigravity meter (and with
+it, Antigravity routing); and `CMO_PREFER=claude` flips the near-tie only. If
+you drive this from a shell script or cron, set
+`"orchestrator": { "vendor": null }` — the default assumes the process doing the
+dispatching is itself a Claude session.
 
 Claude Fable is deliberately outside the tier map (Anthropic documents it as
 substantially more consumption-intensive than Sonnet); reach it with
-`--pin claude --model fable`. Likewise `grok-4.7-build-fast`, which the grok CLI
-lists as "2x the price": `--pin grok --model grok-4.7-build-fast`.
+`--pin claude --model fable`.
 
 ---
 
@@ -319,12 +338,12 @@ lists as "2x the price": `--pin grok --model grok-4.7-build-fast`.
 
 None of the probes costs a model turn, except Claude's on macOS (below).
 
-**Grok** — two JSON-RPC calls to a short-lived `grok agent --no-leader stdio`,
-the account queries behind the TUI's `/usage` panel: `_x.ai/billing` returns the
-weekly `creditUsagePercent` and the period's end, and
-`_x.ai/auth/check_subscription` says whether the session is an OAuth sign-in on
-a subscription tier. About three seconds, reused for a minute (fifteen seconds
-while signed out, so `grok login` takes effect quickly).
+**Antigravity** — `agy -p /usage --output-format json`, the CLI's built-in quota
+command. Zero tokens and no model turn. `cmo` reads only the `"Gemini Models"`
+group's `gemini-5h` and `gemini-weekly` buckets (`remaining_fraction` and
+`reset_time`), ignoring the third-party model bucket group and epoch-1970
+placeholder resets. Reused for 60 seconds (`freshness.antigravity`). An API-key
+session exits 2 with no subscription quota and marks Antigravity unroutable.
 
 **Codex** — local only. Every `codex exec` writes a session rollout under
 `~/.codex/sessions/YYYY/MM/DD/` recording the current rolling-window snapshot, so
@@ -336,15 +355,15 @@ the reading refreshes itself after every Codex subagent.
 
 **Claude** — `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token
 from `~/.claude/.credentials.json`. No inference, so no token cost. Claude Code
-doesn't persist the rolling-window snapshot locally, so there's no offline
-alternative. If you're not comfortable with that call, `cmo` degrades gracefully:
-an unavailable probe reports `unknown` and is treated as usable.
+does not persist the rolling-window snapshot locally, so there is no offline
+alternative. If you are not comfortable with that call, `cmo` degrades
+gracefully: an unavailable probe reports `unknown` and is treated as usable.
 
 On **macOS** that file does not exist: Claude Code keeps its credentials in the
 login Keychain, so the endpoint cannot be read and the meter used to stay dark on
 every Mac. There, `cmo` asks the CLI instead. `claude -p --output-format
 stream-json` emits a `rate_limit_event` carrying both windows on every turn, so
-one minimal haiku turn — tools and MCP switched off, about a thousand input
+one minimal Haiku turn — tools and MCP switched off, about a thousand input
 tokens — yields the same reading without `cmo` ever touching the Keychain. A
 reading taken this way is reused for two minutes rather than 45 seconds
 (`freshness.claudeCli`), and `CMO_CLAUDE_CLI_PROBE=0` switches the fallback off.
@@ -364,7 +383,7 @@ call refreshes it.
 
 `cmo` therefore spends the smallest turn there is: Haiku, an empty working
 directory so no project `CLAUDE.md` or git status is loaded, a one-line system
-prompt in place of the agent preamble, and no skills. A few hundred tokens
+prompt in place of the agent preamble and no skills. A few hundred tokens
 against a five-hour window measured in millions — and only when the token has
 already lapsed, at most once a minute. Measured end to end, a dark meter goes
 back to reporting in about seven seconds.
@@ -372,22 +391,22 @@ back to reporting in about seven seconds.
 (`--bare` is the obvious way to make it cheaper still, and it does not work: it
 deliberately never reads OAuth, so it refreshes nothing.)
 
-If the refresh can't run — no `claude` on `PATH` — nothing is hidden. The probe
+If the refresh cannot run — no `claude` on `PATH` — nothing is hidden. The probe
 reports `claude oauth token expired and auto-refresh could not run`, and `cmo
 report` ranks a dark meter above every other finding, because every number
 underneath it was computed against headroom the tool could not see.
 
 ---
 
-## Many orchestrators, two subscriptions
+## Many orchestrators, three subscriptions
 
 The case this is really built for: several orchestrators, on several projects,
-draining the same two windows at once, none of them aware of the others.
+draining the same subscriptions at once, none of them aware of the others.
 
-Both readings live in one machine-wide file, locked and written atomically so
+All readings live in one machine-wide file, locked and written atomically so
 concurrent processes cannot clobber each other. Freshness windows are short —
-10s Codex, 45s Claude — and single-flighted, so a hundred simultaneous
-dispatches produce one probe, not a hundred.
+10s Codex, 45s Claude, 60s Antigravity — and single-flighted, so a hundred
+simultaneous dispatches produce one probe, not a hundred.
 
 Short freshness is still not enough, because **the vendor's number is a lagging
 indicator.** It describes spend already billed and says nothing about the forty
@@ -399,12 +418,12 @@ and releases afterwards. Effective headroom is what the vendor reported plus wha
 this machine has committed but not yet been billed for — and that is the number
 the decision sees:
 
-```
+```text
 codex   ok        plan=pro
         Wkly   █·········   5% resets 2026-08-28 07:35Z
-        in-flight 3 agent(s) on this machine · reported 5% → effective 8%
+        in-flight 3 agent(s) across this machine · reported 5% → effective 8%
 
-3 dispatch(es) in flight from this machine — effective figures include them
+3 dispatch(es) in flight across this machine — effective figures include them
 ```
 
 Reservations carry a pid and a lease, so a crashed run cannot hold headroom
@@ -450,13 +469,13 @@ over the file, which is useful for a one-off or in CI.
 
 Now `cmo limits` is a fleet view:
 
-```
+```text
 codex   ok        plan=pro
         Wkly   █·········   6% resets 2026-08-28 07:35Z
         in-flight 2 agent(s) across the fleet · reported 6% → effective 8%
 
 2 dispatch(es) in flight across the fleet — effective figures include them
-  codex: vps-alpha:checkout-flow×1  vps-beta:termroam×1
+  codex: host-alpha:checkout-flow×1  host-beta:billing-api×1
 ```
 
 - **A box is a machine.** `hostname()` by default, override with `CMO_NODE_ID`.
@@ -465,9 +484,10 @@ codex   ok        plan=pro
 - **Projects need no registration.** The project label is derived from each
   dispatch's working directory, so a directory created five minutes from now
   appears in the fleet view with no configuration.
-- **One coordinator per account pair, not per company.** Boxes logged into
-  *different* Codex or Claude accounts are not contending for the same windows,
-  and sharing a coordinator would make them throttle each other over nothing.
+- **One coordinator per account set, not per company.** Boxes logged into
+  *different* Codex, Claude or Antigravity accounts are not contending for the
+  same windows, and sharing a coordinator would make them throttle each other
+  over nothing.
 - **Liveness is a lease, not a pid.** One machine cannot ask another whether a
   process is alive, so each reservation carries its own expiry, set from the
   dispatch's timeout. A box that dies mid-run releases its headroom when the
@@ -486,8 +506,9 @@ codex   ok        plan=pro
 
 ## Using it from a Claude Code workflow
 
-Workflow scripts have no shell, so a Codex subagent is reached through a shim
-agent that does — `agentType: 'codex-runner'`, installed by `cmo install`.
+Workflow scripts have no shell, so a Codex or Antigravity subagent is reached
+through a shim agent that does — `agentType: 'codex-runner'`, installed by
+`cmo install`.
 
 **Write the task to a file and give the shim only the path.**
 
@@ -517,9 +538,10 @@ the shim against 557k on plain `agent()` calls; Codex ended at 10% consumed,
 Claude at 96%.
 
 Keep a plain `agent()` only when the task needs something none of the CLIs can
-reach: an MCP server wired into the Claude session, the harness's browser, or
-an agent you plan to resume. Ordinary file work is not on that list. Web
-research goes in the dispatch file as `web: true` and lands on a healthy Grok.
+reach: an MCP server wired into the Claude session, the harness's browser or an
+agent you plan to resume. Ordinary file work is not on that list. Web research
+goes in the dispatch file as `web: true` (or `role: research`) and lands on
+Antigravity or Claude rather than sandboxed Codex.
 
 The shim costs ~10–15k Haiku tokens per dispatch, mostly its own prompt —
 trivial against a real agent, absurd against a five-second one.
@@ -537,7 +559,7 @@ touch files a running agent owns waits behind it.
 For a run of notes, say **Start Feedback Batch**, send screenshots and notes one
 at a time (each gets a one-line receipt and nothing else), then **End Feedback
 Batch**. The orchestrator reads the whole batch back, groups the items by the
-files they touch, asks once about anything that blocks, and sends one work
+files they touch, asks once about anything that blocks and sends one work
 package per group to subagents in parallel, each item with a check that proves
 it done. As packages land, a reviewer on another vendor checks every item and
 you get a per-item report. Batches are kept on disk under
@@ -548,31 +570,35 @@ reset.
 
 Ask for a feature or a fix against a spec and the orchestrator runs it as
 **plan-driven development**: a written plan of small tasks, each built
-test-first by one dispatch, gated on its commit and command output, reviewed
-by a dispatch on a vendor that did not write it, fixed in at most three
-rounds, then a whole-branch review against the spec. Implementers return a
-typed report and reviewers a typed verdict
+test-first by one dispatch, gated on its commit, test names and command output,
+reviewed by a dispatch on a vendor that did not write it, recorded with
+`cmo outcome`, fixed in at most three rounds, then a whole-branch review against
+the spec. Implementers return a typed report and reviewers a typed verdict
 (`skill/references/schemas/`), so a run branches on fields, not prose. The
 pattern is in `skill/references/plan-driven-development.md`, with templates
 beside it.
 
 ## What's portable and what isn't
 
-| | Claude Code | Codex / Kilo / OpenCode |
+| | Claude Code | Antigravity / Codex (full access) / Kilo / OpenCode |
 | --- | :-: | :-: |
-| `cmo limits` / `plan` / `run` | ✅ | ✅ |
-| Subagents billed across both subscriptions | ✅ | ✅ |
+| `cmo limits` / `plan` / `run` / `outcome` / `report` | ✅ | ✅ |
+| Orchestration via `cmo run --dispatch` units | ✅ | ✅ |
+| Subagents billed across all active subscriptions | ✅ | ✅ |
 | Cross-model adversarial review | ✅ | ✅ |
 | `pipeline()` / `parallel()` barrier semantics | ✅ | ❌ |
 | `(prompt, options)` resume cache | ✅ | ❌ |
-| `codex-runner` shim | ✅ | ❌ |
+| `codex-runner` shim and `SendMessage` steering | ✅ | ❌ |
 
-The **dispatcher** is a plain CLI — anything with a shell gets the full
-cross-provider behaviour. The **orchestration** is Claude Code-native, because
-`pipeline()`, `parallel()` and the resume cache are harness primitives and the
-cache is what lets a nine-hour run survive an interruption. The skill installs
-everywhere and tells non-Claude hosts to drive `cmo run` directly rather than
-improvise a fan-out they can't checkpoint.
+The **dispatcher** is a plain CLI — any host with a shell and network access
+gets the full cross-provider behavior. `cmo install` links the skill into
+Claude Code, Codex, `~/.agents`, Kilo, OpenCode and Antigravity
+(`~/.gemini/config/skills`, skipped when `~/.gemini` is absent), so every host
+can call `/cross-model-orchestrate` and drive bounded `cmo run` units directly.
+A **Codex** session acting as orchestrator must run with full access (network
+enabled), because Codex's default `workspace-write` sandbox blocks network calls
+and writes outside the workspace. `Workflow` fan-out primitives (`pipeline()`,
+`parallel()` and the resume cache) remain Claude Code-specific.
 
 ---
 
@@ -582,17 +608,18 @@ Everything in `cmo run` is there because of something that actually went wrong:
 
 | | |
 | --- | --- |
-| **watchdog** | Progress-aware, `SIGTERM` then `SIGKILL`. Within its `--timeout` budget (default 30 min) nothing is stopped; past it, an agent still producing output keeps going, and only `--idle-timeout` of silence (default 15 min, never more than the budget) or the `--max-runtime` ceiling (default 4 h) stops it. Claude runs with `stream-json` so its progress shows. One agent waiting on an interactive confirmation once held a `parallel()` barrier for 91 minutes while two hundred finished agents idled behind it; a slow agent that is working is not that, and cutting it off wastes the whole run. Configurable as `watchdog: { idleMinutes, maxMinutes }`. |
-| **stdin prompts** | Prompts go down stdin, never argv. Long prompts blow argv limits and shell quoting corrupts them silently. |
-| **no interactive path** | Codex gets `--sandbox` + `--skip-git-repo-check`; Claude gets `--dangerously-skip-permissions`. There's nobody there to press `y`. |
-| **classified retries** | A rate limit switches vendor instead of sleeping. A deterministic error (bad flag, malformed prompt) isn't retried — that just burns quota three times and fails anyway. |
-| **schema enforcement** | Codex gets `--output-schema`; Claude gets the same contract in the prompt. Either way an unparseable answer is a *failure*, not prose handed to a script about to branch on it. |
-| **key scrubbing** | `ANTHROPIC_API_KEY` / `CLAUDE_API_KEY` / `OPENAI_API_KEY` are stripped from the child env — with a key present the CLI bills the API account instead of the subscription this whole tool exists to balance. |
+| **watchdog** | Progress-aware, `SIGTERM` then `SIGKILL`. Within its `--timeout` budget (default 30 min) nothing is stopped; past it, an agent still producing output keeps going, and only `--idle-timeout` of silence (default 15 min, never more than the budget) or the `--max-runtime` ceiling (default 4 h) stops it. Claude runs with `stream-json` so its progress shows; Antigravity also sets `--print-timeout`. One agent waiting on an interactive confirmation once held a `parallel()` barrier for 91 minutes while two hundred finished agents idled behind it; a slow agent that is working is not that, and cutting it off wastes the whole run. Configurable as `watchdog: { idleMinutes, maxMinutes }`. |
+| **prompt channels** | Codex and Claude read prompts over stdin. Antigravity passes short prompts with `-p` and switches prompts over 100 KB to `--input-format stream-json` and `--output-format stream-json` over stdin so large briefs never hit argv limits. |
+| **no interactive path** | Codex gets `--sandbox` + `--skip-git-repo-check`; Claude gets `--dangerously-skip-permissions`; Antigravity gets `--disable-slash-commands`, `--print-timeout` and (for writing roles only) `--dangerously-skip-permissions`. There is nobody there to press `y`. |
+| **classified retries** | A rate limit switches vendor instead of sleeping. A deterministic error (bad flag, malformed prompt, non-Gemini slug on Antigravity) is not retried — that just burns quota three times and fails anyway. |
+| **schema enforcement** | Codex gets `--output-schema`; Antigravity gets `--json-schema` (`structured_output` with text-JSON recovery as fallback); Claude gets the schema contract in the prompt. Either way an unparseable answer is a *failure*, not prose handed to a script about to branch on it. |
+| **key scrubbing** | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY` and xAI API key variables are stripped from the child env — with a key present a CLI can bill an API account instead of the subscription this tool exists to balance. |
 
-`cmo run` passes `--dangerously-skip-permissions` to Claude and can pass
-`--dangerously-bypass-approvals-and-sandbox` to Codex under `--full-access`.
-That is the price of unattended execution. Run it on a box you're willing to let
-an agent write to; Codex defaults to `workspace-write`, not full access.
+`cmo run` passes `--dangerously-skip-permissions` to Claude (and to Antigravity
+for writing roles) and can pass `--dangerously-bypass-approvals-and-sandbox` to
+Codex under `--full-access`. That is the price of unattended execution. Run it
+on a box you are willing to let an agent write to; Codex defaults to
+`workspace-write`, not full access.
 
 Exit codes: `0` success · `1` the agent failed · `2` bad usage · `3` deferred, no
 provider had the headroom.
@@ -602,9 +629,9 @@ provider had the headroom.
 ## Tests
 
 ```bash
-npm test        # 237 offline tests: no network, no spawn, nothing spent
-cmo selftest    # the decision table, printed
-cmo doctor      # the live half: CLIs, auth, model IDs, headroom
+npm test          # offline test suite: fake binaries and injected probes, nothing spent
+npm run selftest  # the decision table, printed
+cmo doctor        # the live half: CLIs, auth, model IDs, headroom
 ```
 
 Everything that decides where quota goes is a pure function, and the runner takes
@@ -612,66 +639,69 @@ an injectable spawn, so the policy is fully testable without spending anything.
 
 ---
 
-## The soak loop
+## The soak loop and quality evaluation
 
 Run it as your daily driver, then read the log back. `cmo report` turns the
-dispatch receipts into findings, and each finding names what was measured so you
-can argue with it rather than just obey it.
+dispatch receipts into operational findings, and each finding names what was
+measured so you can argue with it rather than just obey it.
 
-```
+```text
 $ cmo report --since 7d
 
 cross-model-orchestrate — last 7d
 ────────────────────────────────────────────────────────────
-412 dispatches · 7 failed · codex share 71%
+412 dispatches · 7 failed · share codex 52% / claude 19% / antigravity 29%
 
-  codex    291   gpt-5.6-terra x203  gpt-5.6-luna x74  gpt-5.6-sol x14
-  claude   121   sonnet x98  opus x23
+  codex        214   gpt-5.6-terra x151  gpt-5.6-luna x51  gpt-5.6-sol x12
+  antigravity  120   gemini-4-carbon x82  gemini-4-hydrogen x28  gemini-4-neon x10
+  claude        78   sonnet x64  opus x14
 
   by role: implement x186  research x94  judge x71  mechanical x61
   timing:  fast p50 9s/p95 14s   balanced p50 41s/p95 96s   frontier p50 88s/p95 240s
   failures: timeout x5  transient x2
   reviews: 64 cross-vendor, 7 same-vendor
-
-────────────────────────────────────────────────────────────
-2 finding(s)
-
-  [medium] 7 of 71 reviews ran same-vendor (10%)
-          → Those verdicts are provisional — the grader shared the producer's
-            blind spots. Re-grade them when the other window reopens, and start
-            fan-outs earlier in the window.
-
-  [low] measured cost is 0.19 points per agent against a 1 default
-          → The default is being carried by the floor. Reservations are
-            over-reserving, which makes concurrent fan-outs defer earlier than
-            they need to.
 ```
 
-`--json` gives the same thing structured, which is the point: paste it to the
-agent that runs your orchestration and it can act on the findings — adjust the
-tier map, change a role's complexity, re-grade the provisional verdicts — rather
-than you reading counts and guessing.
+`--json` gives the same thing structured, so the orchestrating agent can act on
+the findings — adjust the tier map, change a role's complexity or re-grade
+provisional verdicts — rather than you reading counts and guessing.
 
-What it looks for, in order: a **dark meter** first — a provider whose headroom
-can no longer be read, which invalidates everything below it — then failure rate
-and its commonest kind, retries as wasted spend, whether the fan-out actually
-reached Codex, how many reviews degraded to same-vendor, tiers whose p95 says the
-work never needed them, and a reservation cost that has drifted from what agents
-really consume.
+### Evaluating where each model is strongest
 
-It changes nothing on its own. Same posture as `doctor`: measure, recommend,
-let a person decide.
+Operational receipts show whether a dispatch finished; `cmo outcome` records
+whether the work was actually good. After every implementation gate and every
+review or judge check, log the verdict against the receipt's `dispatchId`:
+
+```bash
+cmo outcome d-8f3a1c9e02b4 --verdict approved --rounds 1
+cmo outcome d-41c09ab77e12 --verdict confirmed --note "caught missing boundary check"
+cmo report --quality --since 7d          # or add --json
+```
+
+Supported `--verdict` values are `approved`, `fixed`, `rejected` and `blocked`
+for implementers (with `--rounds <N>` when fixes took multiple rounds), and
+`confirmed`, `false-positive` and `missed` for reviewers and judges. Outcomes
+append to `~/.cache/cross-model-orchestrate/outcomes.jsonl`; an unknown
+`dispatchId` is refused unless `--force`, and forced orphans are counted
+separately so imported history never inflates a provider's stats.
+`cmo report --quality` joins outcomes to local receipts and summarizes `n`,
+first-round approvals, mean rounds, blocked runs and reviewer `confirmed`,
+`false-positive` and `missed` counts for each `provider / role / model`.
+
+Neither report changes config on its own. Same posture as `doctor`: measure,
+recommend, let a person decide.
 
 ## Keeping the CLIs current
 
 `doctor` never changes anything — it is a diagnostic, and `codex` and `claude`
 are not our packages. `cmo update` does, explicitly:
 
-```
+```text
 $ cmo update
 would run:
   plan   codex                    npm install -g @openai/codex@latest
   plan   claude                   claude update
+  plan   cross-model-orchestrate  npm install -g cross-model-orchestrate@latest
 
 Nothing has changed. Re-run with --yes to execute.
 ```
@@ -682,14 +712,14 @@ Four guards make it safe to hand to a fleet:
   binary mid-run can change model ids underneath agents that already resolved
   them. `--force` if you know what those agents are doing.
 - **Only runs a command it detected.** npm global tree → npm; Homebrew cellar →
-  brew; Claude → its own updater. An install it does not recognise is skipped
+  brew; Claude → its own updater. An install it does not recognize is skipped
   with the path, not guessed at — sending a Homebrew user to `npm install -g`
   leaves two copies and a PATH puzzle.
 - **Prints the plan and stops.** Nothing executes without `--yes`.
 - **Reports before → after**, so "updated" means a version changed rather than
   that a command exited 0.
 
-`--self` includes cross-model-orchestrate itself.
+`--clis-only` upgrades only the vendor CLIs, leaving this package alone.
 
 ## Auditing a fan-out
 
@@ -699,13 +729,13 @@ dispatcher and answered from their own weights instead. A self-written answer
 looks exactly like a dispatched one, so the only reliable check is counting
 receipts:
 
-```
+```text
 $ cmo audit --since 30 --expected 12 --human
 dispatches in the last 30 min: 8
-  codex     5   gpt-5.6-terra x5
-  claude    3   sonnet x3
+  codex         5   gpt-5.6-terra x5
+  antigravity   3   gemini-4-carbon x3
 
-codex share: 62%
+share: codex 63% · claude 0% · antigravity 38%
 reviews: 3 cross-vendor, 0 same-vendor
 
 WARNING: 4 of 12 subagents left NO receipt —
@@ -722,7 +752,7 @@ and receipts on record is the number that never ran.
 [`COMMERCIALIZATION_GATE.md`](COMMERCIALIZATION_GATE.md) is the checklist to come
 back to before this goes to people who will run it unattended on their own
 machines and their own subscriptions. It holds the eight validation phases, which
-version each last passed against, and what has drifted since.
+version each last passed against and what has drifted since.
 
 Its gate is one sentence, and it is currently unmet: *every phase passed against
 the version you are actually publishing, not an earlier one.*
@@ -731,7 +761,7 @@ the version you are actually publishing, not an earlier one.*
 
 Published via npm [Trusted Publishing](https://docs.npmjs.com/trusted-publishers)
 from `.github/workflows/release.yml` — GitHub mints a short-lived OIDC token at
-run time, so no npm credential exists in this repo, in Actions secrets, or on
+run time, so no npm credential exists in this repo, in Actions secrets or on
 any machine.
 
 ```bash
@@ -746,7 +776,7 @@ the tag and `package.json` disagree.
 
 MIT.
 
-## Acknowledgements
+## Acknowledgments
 
 The plan-driven pattern (the plan format, the per-task implement and review
 loop, red-green test evidence, "no evidence, no done" and how review findings

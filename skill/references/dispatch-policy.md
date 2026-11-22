@@ -1,12 +1,14 @@
 # Dispatch policy
 
 The full rubric behind `cmo plan`. Read this when a decision surprises you, when
-you want to argue with one, or before pinning a model by hand. Implementation
+you want to argue with one or before pinning a model by hand. Implementation
 and tests live in the cross-model-orchestrate package.
 
 ## The decision, in two halves
 
-**Three factors set the tier.** Live subscription headroom sets the provider.
+**Three factors set the tier.** Live subscription headroom sets the provider
+across `activeProviders()` (`codex`, `claude` and `antigravity` by default;
+legacy `grok` stays dormant unless listed in config `providers`).
 
 | factor | weight | flag | what it measures |
 | --- | --- | --- | --- |
@@ -14,7 +16,7 @@ and tests live in the cross-model-orchestrate package.
 | length | 30% | `--length xs\|s\|m\|l\|xl` | how much work and output it produces |
 | role | 25% | `--role <role>` | what kind of work it is |
 
-```
+```text
 weight = 0.45·((complexity−1)/4) + 0.30·length + 0.25·role
 
 weight < 0.30 → fast
@@ -22,11 +24,20 @@ weight < 0.62 → balanced
 otherwise     → frontier
 ```
 
-The tier→model map is configuration, not code — a different Codex plan or Claude
-account exposes a different model list. `cmo doctor` prints the resolved map and
-flags any model ID your account does not actually have. Override it in
+The tier→model map is configuration, not code — a different Codex plan, Claude
+account or Antigravity account exposes a different model list. `cmo doctor`
+prints the resolved map for active vendors and flags any Codex model ID your
+account does not actually have. Override it in
 `~/.config/cross-model-orchestrate/config.json`, or per-tier with
-`CMO_CODEX_FRONTIER` / `CMO_CLAUDE_BALANCED` / … environment variables.
+`CMO_CODEX_FRONTIER` / `CMO_CLAUDE_BALANCED` / `CMO_ANTIGRAVITY_FAST` / …
+environment variables.
+
+Antigravity models must match `^gemini-[a-z0-9.-]+$`. Its default tier map
+(frontier `gemini-4-neon` effort `xhigh`, balanced `gemini-4-carbon` effort
+`high`, fast `gemini-4-hydrogen` effort `low`) is marked provisional until
+`cmo report --quality` confirms the ordering in practice. Non-Gemini slugs
+(`claude-*`, `gpt-oss-*` or an empty model) are refused before spawning so
+Antigravity remains an independent model family.
 
 Role weights, cheapest first:
 
@@ -49,20 +60,22 @@ via `--pin claude --model fable`, and only when you can say why.
 Strict precedence:
 
 1. **`--pin`** — you forced it.
-2. **`--independent-of <vendor>`** — cross-model review. Only the other vendors
-   are candidates, ranked against each other as usual. If none of them can run
-   (spent, not installed, Grok not signed in) the call **degrades** to a fresh agent on
-   the producer's vendor, marks the result `independence: same-vendor`, raises a
-   tier, and warns the agent that it shares the producer's priors. That is
-   strictly better than no review — a same-vendor independent grader rejected 38
-   of 57 candidates on the run this tool came from. The hazard was never that a
-   same-vendor verdict is weak; it is that an *unlabelled* one is
-   indistinguishable from a real cross-vendor verdict. `--strict-independence`
-   restores the refuse-instead behaviour.
+2. **`--independent-of <vendor>`** — cross-model review. Only the other active
+   vendors are candidates, ranked against each other as usual. If none of them
+   can run (spent, not installed or not signed in) the call **degrades** to a
+   fresh agent on the producer's vendor, marks the result
+   `independence: same-vendor`, raises a tier and warns the agent that it shares
+   the producer's priors. That is strictly better than no review — a same-vendor
+   independent grader rejected 38 of 57 candidates on the run this tool came
+   from. The hazard was never that a same-vendor verdict is weak; it is that an
+   *unlabeled* one is indistinguishable from a real cross-vendor verdict.
+   `--strict-independence` restores the refuse-instead behavior.
 3. **Can it run** — a provider at ≥95% used, or flagged `rate_limit_reached`, is
-   not a candidate; nor is one whose CLI is missing; nor Grok unless its CLI
-   reports a subscription (OAuth) sign-in; nor Codex for `--web` work, because
-   its sandbox has no network.
+   not a candidate; nor is one whose CLI is missing; nor Antigravity unless its
+   `agy -p /usage` meter confirms a subscription session; nor Claude when its
+   CLI reported itself signed out; nor Codex for `research` or `--web` work
+   unless `--full-access` is set, because Codex's default sandbox has no
+   network.
 4. **Least-used wins.** Among providers that can run, pressure (below) is the
    dominant score:
 
@@ -73,23 +86,23 @@ Strict precedence:
    A provider whose pressure is at least `powerGap` points (default 20) below
    every other provider that is actually competing gets `powerBonus` (default
    25). The reason names the gap, for example
-   `power-use: grok is 61 points less used than codex`. State penalties still
-   apply on top: tight −15, critical −40.
+   `power-use: antigravity is 61 points less used than codex`. State penalties
+   still apply on top: tight −15, critical −40.
 5. **Orchestrator reserve.** `orchestrator.vendor` (default `claude`) is the
-   vendor driving the run, so every dispatch costs it `penalty` points
-   (default 30). At or above `reserveAt` pressure (default 60) it is placed
-   below every usable alternative — still above anyone who cannot run — and
-   the reason says
+   vendor driving the run, so every dispatch costs it `penalty` points (default
+   30). At or above `reserveAt` pressure (default 60) it is placed below every
+   usable alternative — still above anyone who cannot run — and the reason says
    `claude reserved for the orchestrator (pressure 62% ≥ 60%)`. It is not a
-   power-use competitor in that state. It is still chosen when nothing else
-   can run, including a cross-vendor review only it can serve. Set `vendor`
-   to `null` when a cron job or a shell script is the driver and no Claude
-   session needs the window kept.
-6. **Affinity** — Grok gets 25 points for `research` and for `--web` work: it
-   searches and fetches live URLs. That wins those roles while Grok is healthy
-   and no other subscription is differentially idle (a power-use gap, or a
-   tight window of Grok's own, still takes the work away). Configurable as
-   `affinity.grok` (`roles`, `web`, `points`).
+   power-use competitor in that state. It is still chosen when nothing else can
+   run, including a cross-vendor review only it can serve. Set `vendor` to
+   `null` when a cron job or a shell script is the driver and no Claude session
+   needs the window kept.
+6. **Network capability and affinity** — `research` (even without `--web`) and
+   `--web` require network access, leaving Antigravity and Claude in the default
+   roster unless Codex runs with `--full-access`. Because Claude carries the
+   orchestrator penalty and reserve, a healthy Antigravity wins web and research
+   work without pinning. Optional `affinity.<provider>` entries (`roles`, `web`,
+   `points`) add extra score for configured roles or web work.
 7. **Tie-break** — `preference.first`, Codex by default, worth
    `preference.weightPoints / 10` score points (default 2.5). It decides a
    near-tie and nothing wider. `CMO_PREFER=claude` flips which side of the tie
@@ -106,11 +119,9 @@ Strict precedence:
    ```
 
    It stays on the failover ladder; a pin wins; the reserved orchestrator is
-   never promoted past it (the note then says to raise the timeout). Grok is
-   three to four times slower than Codex at the same tier, so this is what
-   keeps a Codex-sized timeout from being spent on a Grok run that cannot
-   finish. Configurable as `durationFit` (`enabled`, `quantile`, `margin`,
-   `minSamples`, `windowDays`).
+   never promoted past it (the note then says to raise the timeout).
+   Configurable as `durationFit` (`enabled`, `quantile`, `margin`, `minSamples`,
+   `windowDays`).
 
 ### Pressure: usage weighed against time to reset
 
@@ -138,12 +149,13 @@ raw ≥ 95                                  never adjusted
 | 5-hour | 97% | 2 minutes | — | 97% | exhausted |
 
 A provider's pressure is that of its most-pressured window, so the 5-hour and
-weekly windows of both vendors are balanced together. Three consequences worth
-knowing:
+weekly windows of every active vendor are balanced together. Three consequences
+worth knowing:
 
 - **A weekly squeeze outranks a 5-hour blip.** Raw percentages called "codex 80%
   weekly, five days left" and "claude 70% of five hours, twenty minutes left"
-  the same thing. Pressure sends the work to Claude and stretches Codex's week.
+  the same thing. Pressure sends the work to Claude or Antigravity and stretches
+  Codex's week.
 - **Pace alone never exhausts a provider.** The cap at 94 keeps a rationed
   window in the candidate list on a cheaper tier, because budget that exists
   can still be spent on what only that vendor can do — a cross-vendor review.
@@ -155,7 +167,7 @@ knowing:
   percentage.
 
 Pace is computed at decision time from the window's reset time, never cached. A
-window whose reset time is missing, already in the past (a stale reading), or
+window whose reset time is missing, already in the past (a stale reading) or
 further away than the window is long (clock skew, or a reset paired with the
 previous window's usage) falls back to its raw percentage: inconsistent data
 must not be turned into scarcity. `cmo limits --human` prints the pace line per
@@ -169,16 +181,16 @@ Bands of pressure, as defined above.
 | band | pressure | effect |
 | --- | --- | --- |
 | ok | <65% | normal |
-| tight | ≥65% | deprioritised by 15 points, on top of the headroom term |
+| tight | ≥65% | deprioritized by 15 points, on top of the headroom term |
 | critical | ≥85% | model downgraded one tier to stretch the window |
 | exhausted | ≥95% or hard-blocked | not a candidate at all |
-| unknown | probe failed | treated as usable — a broken meter never stops a run |
+| unknown | probe failed | treated as usable for Codex and Claude; Antigravity requires subscription verification |
 
-A meter that errors without saying the vendor is signed out (xAI's usage query
-answers "Internal error" now and then) stands on its last good reading, marked
-`stale`, for up to `freshness.lastGood` (30 minutes), never across a window
-reset and never published to a fleet coordinator. The fresh reading's sign-in
-verdict always wins, so an old reading never vouches for Grok's subscription.
+A meter that errors transiently without saying the vendor is signed out stands
+on its last good reading, marked `stale`, for up to `freshness.lastGood` (30
+minutes), never across a window reset and never published to a fleet
+coordinator. The fresh reading's `auth` verdict always wins, so an old reading
+never vouches for Antigravity's subscription.
 
 ## Token-efficiency corrections
 
@@ -194,32 +206,27 @@ Applied after the weighted tier. Each one appears in the decision's `notes`.
 
 ## Worked examples
 
+```text
+mechanical · 1 · xs                                          → codex gpt-5.6-luna           (even headroom: tie-break)
+implement  · 3 · m  · --write                                → codex gpt-5.6-terra          (even headroom: tie-break)
+implement  · antigravity 6% · codex 67% · claude 60%         → antigravity, power-use; claude reserved
+implement  · codex 10% · claude 30% · antigravity 50%        → codex, power-use
+implement  · codex 40% · antigravity 45% · claude 5%         → claude (the gap beats the penalty)
+implement  · codex 40% · antigravity 45% · claude 70%        → codex, never claude
+implement  · codex and antigravity exhausted, claude 72%     → claude, last resort
+architecture · 5 · l                                         → codex gpt-5.6-sol
+judge      · 1 · xs                                          → codex gpt-5.6-terra          (never fast)
+research   · 2 · s  · antigravity verified                   → antigravity gemini-4-hydrogen (never sandboxed codex)
+research   · 1 · xs · --web, antigravity signed out          → claude haiku                 (never codex: no network)
+review     · 3 · s  · --independent-of codex, antigravity 12%, claude 75% → antigravity, never claude
+review     · 3 · s  · --independent-of antigravity, codex 99%, claude 5%  → claude, cross-vendor
+review     · 3 · s  · --independent-of codex, claude 99%, antigravity signed out → codex, DEGRADED
 ```
-mechanical · 1 · xs                          → codex gpt-5.6-luna     (even headroom: tie-break)
-research   · 2 · l  · 180k context           → codex gpt-5.6-terra    (grok not signed in)
-implement  · 3 · m  · --write                → codex gpt-5.6-terra    (even headroom: tie-break)
-implement  · grok 6% · codex 67% · claude 60% → grok, power-use; claude reserved
-implement  · codex 10% · grok 50% · claude 30% → codex, power-use
-implement  · codex 40% · grok 45% · claude 5%  → claude (the gap beats the penalty)
-implement  · codex 40% · grok 45% · claude 70% → codex, never claude
-implement  · codex and grok exhausted, claude 72% → claude, last resort
-judge      · 4 · s  · --independent-of codex → claude sonnet, medium  (grok not signed in)
-architecture · 5 · l                         → codex gpt-5.6-sol
-judge      · 1 · xs                          → codex gpt-5.6-terra  (never fast)
-implement  · 3 · m  · codex at 99%           → claude sonnet (grok fallback if signed in)
-research   · 2 · s  · grok signed in, windows level → grok grok-4.7, low
-research   · grok healthy, codex 15%, claude 20%, grok 25% → grok, on affinity
-research   · 1 · xs · --web, grok signed out  → claude haiku   (never codex: no network)
-review     · 3 · s  · --independent-of codex, grok healthy, claude ≥60% → grok, never claude
-review     · 3 · s  · --independent-of codex, claude at 99%, grok signed out → codex, DEGRADED
-```
-
-Grok maps every tier to `grok-4.7` and varies only `--reasoning-effort`
-(low / medium / high). `grok-4.7-build-fast` is not a cheap tier — the CLI lists
-it as "2x the price" — so it is reachable only through `--model`.
 
 Print the whole table any time with `cmo selftest` — it uses your configured
-model IDs, so it doubles as a check that an override landed.
+model IDs, so it doubles as a check that an override landed. Record task
+outcomes with `cmo outcome` and inspect `cmo report --quality` to tune tier
+mappings from real runs.
 
 ## Where the headroom numbers come from
 
@@ -242,37 +249,32 @@ reader falls back to the CLI: one minimal `claude -p --output-format stream-json
 turn, whose `rate_limit_event` carries the same two windows. About a thousand
 input tokens, reused for two minutes.
 
-**grok** — two JSON-RPC calls to a short-lived `grok agent --no-leader stdio`,
-the same account queries the TUI's `/usage` panel makes. No session, no model
-call:
+**antigravity** — `agy -p /usage --output-format json` (slash commands stay
+enabled for `/usage`; dispatches pass `--disable-slash-commands`). Zero tokens
+and no model call:
 
-- `_x.ai/billing` → `creditUsagePercent` and `currentPeriod` (type
-  `USAGE_PERIOD_TYPE_WEEKLY`, start, end). One weekly window, resetting at the
-  period end. `isUnifiedBillingUser: true` means the allowance is shared with
-  the Grok apps.
-- `_x.ai/auth/check_subscription` → `authenticated`, `auth_mode` (`Oidc` for a
-  `grok login` session), `subscription_tier`. This is the billing gate: only an
-  OIDC/OAuth sign-in with a tier is routable. A signed-out reading is re-checked
-  every 15 seconds, a good one every 60.
-
-The probe and every grok dispatch run with `XAI_API_KEY` and
-`GROK_CODE_XAI_API_KEY` removed and `GROK_DISABLE_API_KEY_AUTH=1` set, so the
-CLI has no key to fall back to and would refuse one anyway. A dispatch's own
-stream then names its auth source (`apiKeySource`) on its first line; anything
-but `oauth` is killed there and marks Grok unroutable machine-wide.
+- Reads `command.data.groups` for the group named `"Gemini Models"` and maps
+  buckets `gemini-5h` and `gemini-weekly` (`percentUsed = (1 - remaining_fraction) * 100`,
+  `reset_time`). Ignores third-party model buckets and epoch-1970 placeholder
+  resets.
+- Subscription gate: with a `GEMINI_API_KEY` login `/usage` exits 2 because an
+  API key has no subscription quota. `cmo` marks Antigravity unauthenticated and
+  not routable, and every child process runs with `GEMINI_API_KEY` and
+  `GOOGLE_API_KEY` deleted from its environment. Cached for 60 seconds
+  (`freshness.antigravity`).
 
 ### Contention
 
-Both readings live in one machine-wide file, `~/.cache/cross-model-orchestrate/state.json`,
+All readings live in one machine-wide file, `~/.cache/cross-model-orchestrate/state.json`,
 locked and written atomically so concurrent orchestrators cannot clobber each
-other. Freshness windows are deliberately short — 10s codex, 45s claude — and
-single-flighted: a hundred simultaneous dispatches produce one probe, not a
-hundred. `--refresh` forces one.
+other. Freshness windows are deliberately short — 10s codex, 45s claude, 60s
+antigravity — and single-flighted: a hundred simultaneous dispatches produce one
+probe, not a hundred. `--refresh` forces one.
 
 Short freshness is still not enough on its own, because **the vendor's number is
 a lagging indicator**. It describes spend that has already been billed and says
 nothing about agents other orchestrators launched moments ago. Two runs both
-read 80%, both see room, and both sail through the limit.
+read 80%, both see room and both sail through the limit.
 
 So every dispatch **reserves** against its provider for the duration of the call
 and releases afterwards. Effective headroom is what the vendor reported plus what
@@ -289,26 +291,31 @@ cached; underestimating gets it killed mid-flight. Prefer the former.
 
 ## Verifying the live path
 
-The test suite is entirely offline. The two real CLIs need a hand check after
-a codex or Claude Code upgrade, because their flags are the part that drifts:
+The test suite is entirely offline. The real CLIs need a hand check after a
+Codex, Claude Code or Antigravity upgrade, because their flags and envelopes are
+the part that drifts:
 
 ```bash
 cmo doctor                                  # CLIs, auth, model IDs, install
 
-printf '{"type":"object","required":["answer"],"properties":{"answer":{"type":"string"}}}' > /tmp/s.json
+printf '{"type":"object","additionalProperties":false,"required":["answer"],"properties":{"answer":{"type":"string"}}}' > /tmp/s.json
 echo "What is 17 * 23? answer field only." \
   | cmo run --role mechanical --complexity 1 --length xs \
       --pin codex --schema /tmp/s.json --timeout 240
 echo "Reply with the single word: pong" \
   | cmo run --role mechanical --complexity 1 --length xs \
       --pin claude --timeout 240 --no-failover
+echo "What is 17 * 23? answer field only." \
+  | cmo run --role mechanical --complexity 1 --length xs \
+      --pin antigravity --schema /tmp/s.json --timeout 240 --no-failover
 ```
 
-Both must return `"ok": true` with a populated `usage` block. A failure here is
-almost always a renamed flag, not a broken policy.
+All three must return `"ok": true` with a populated `usage` block (and
+`resultJson` where `--schema` was passed). A failure here is almost always a
+renamed flag or envelope change, not a broken policy.
 
 One more that only a live run can prove — a stopped dispatcher must take its
-vendor process with it, or a cancelled run carries on billing:
+vendor process with it, or a canceled run carries on billing:
 
 ```bash
 cmo run --dispatch /tmp/slow-task.md &    # something that takes a while

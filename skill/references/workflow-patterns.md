@@ -51,8 +51,8 @@ const results = await pipeline(
 )
 ```
 
-`independent-of: codex` sends the judge to Claude even though the shim is
-`codex-runner` — the shim dispatches, the policy decides.
+`independent-of: codex` sends the judge to Antigravity or Claude even though the
+shim is `codex-runner` — the shim dispatches, the policy decides.
 
 Note that **every** stage here goes through the shim, including the generators.
 That is the default, not a flourish: a workflow that reaches for a plain
@@ -80,13 +80,14 @@ Not a barrier: "I need to flatten the array first." Do that inside a stage.
 ## Adversarial verification, across vendors
 
 Redundancy catches noise; *diversity* catches blind spots. Give each verifier a
-distinct lens, and put at least one on the other vendor.
+distinct lens, and spread them across the vendors (`codex`, `claude` and
+`antigravity`).
 
 ```js
 const LENSES = [
   { lens: 'correctness', independentOf: 'codex' },
-  { lens: 'security',    independentOf: 'codex' },
-  { lens: 'does it reproduce', independentOf: 'claude' },
+  { lens: 'security',    independentOf: 'claude' },
+  { lens: 'does it reproduce', independentOf: 'antigravity' },
 ]
 
 const votes = await parallel(LENSES.map((l) => () => agent(
@@ -108,8 +109,8 @@ orchestrator, and pass the numbers in as `args` — workflow scripts have no she
 and cannot run `cmo` themselves.
 
 ```js
-// args = { codexPercent: 12, claudePercent: 27 }
-const headroom = 100 - Math.min(args.codexPercent, args.claudePercent)
+// args = { codexPercent: 12, claudePercent: 27, antigravityPercent: 9 }
+const headroom = 100 - Math.min(args.codexPercent, args.claudePercent, args.antigravityPercent)
 const WIDTH = headroom > 60 ? 3 : headroom > 30 ? 2 : 1   // takes per slot
 log(`generating ${WIDTH} candidate(s) per slot — ${headroom}% headroom`)
 ```
@@ -142,7 +143,7 @@ while (dry < 2) {
 **A barrier around a stalled agent.** One subagent waiting on an interactive
 confirmation held a `parallel()` barrier for 91 minutes while two hundred
 finished agents idled behind it. Same stall in a `pipeline()` costs one item.
-Pass the non-interactive flag, pre-answer the prompt, or do not give it the
+Pass the non-interactive flag, pre-answer the prompt or do not give it the
 tool — `cmo run` does all three, and stops an agent that falls silent past its
 budget without cutting off one that is still working.
 

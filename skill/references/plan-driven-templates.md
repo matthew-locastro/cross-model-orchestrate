@@ -56,10 +56,15 @@ Global constraints:
 <the plan's list, verbatim>
 
 Rules:
-1. Red first. Write the test, run `<red command>`, and keep the failing output.
+1. Red first. Write the test, run `<red command>` and keep the failing output.
    It must fail for the reason the task names; if it passes, the test is wrong.
+   Never delete or rename existing tests unless the task explicitly owns doing
+   so; the gate compares test names before and after.
 2. Write the smallest code that makes it pass. Run `<test command>`.
-3. Run every verify command.
+3. Run every verify command. If a suite cannot run inside your sandbox because
+   it spawns processes or writes outside the working tree, report the exact
+   error verbatim; the orchestrator re-checks red and runs the full suite
+   outside the sandbox at the gate.
 4. Touch only: <owned files>. Commit "<message>" when you can. If the
    implementer cannot commit, for example because a sandbox refuses writes to
    `.git` inside or outside its writable working tree, leave the changes in the
@@ -70,7 +75,7 @@ Rules:
    with the reason rather than a partial or faked result.
 6. Do not save notes, run graph or index tools or do other repository
    housekeeping. The orchestrator owns it, whatever the repo instructions say.
-Return the report object. Paste command output verbatim; never summarise a
+Return the report object. Paste command output verbatim; never summarize a
 failure as a pass.
 ```
 
@@ -95,11 +100,12 @@ Read, in this order:
 
 1. Spec compliance: everything the task asked for, nothing it did not. Extra
    scope is a finding.
-2. Quality: correctness, tests that would catch a regression, the global
-   constraints, the codebase's conventions.
+2. Quality: correctness, tests that would catch a regression, no existing test
+   names deleted, the global constraints and the codebase's conventions.
 3. Evidence: confirm the commit exists and is the diff's head; list any file
    changed outside <owned files>; re-run `<verify commands>` and record each
-   exit code.
+   exit code. When the task integrates against a vendor CLI and this review runs
+   unsandboxed, also run one tiny live CLI call as specified in the brief.
 Do not save notes, run graph or index tools or do other repository
 housekeeping. The orchestrator owns it, whatever the repo instructions say.
 Do not edit, stage, commit or delete anything. Run `git status --porcelain`
@@ -127,7 +133,7 @@ finding below against the code; fix exactly these, nothing else.
 Findings:
 <confirmed findings, verbatim, numbered>
 
-Same rules as the task: a failing test first where a finding is a behaviour
+Same rules as the task: a failing test first where a finding is a behavior
 bug, owned files only, one commit "fix(T<n>): round <n> review findings",
 verbatim command output in the report. Do not do repository housekeeping; the
 orchestrator owns it.
@@ -138,7 +144,8 @@ orchestrator owns it.
 The review file again, with `independent-of` set from the fix envelope's
 provider, and the diff narrowed to the fix commit. Tell the reviewer which
 findings the fix claims to address and ask it to check each one, plus anything
-the fix broke.
+the fix broke. Record `cmo outcome <dispatchId> --verdict ...` after every gate
+and every review.
 
 ## Final review (dispatch file)
 

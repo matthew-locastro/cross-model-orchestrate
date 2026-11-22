@@ -96,3 +96,77 @@ test('nothing from one user\'s projects leaks into the public references', () =>
     assert.doesNotMatch(REF(name), /\b(SYH|syhclub|yacht|superyacht)\b/i, name);
   }
 });
+
+const README = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+const PKG = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+
+test('package.json names antigravity instead of grok and keeps repository URLs', () => {
+  assert.match(PKG.description, /Antigravity/);
+  assert.doesNotMatch(PKG.description, /\bgrok\b/i);
+  assert.ok(PKG.keywords.includes('antigravity'));
+  assert.ok(!PKG.keywords.includes('grok'));
+  assert.equal(PKG.repository?.url, 'git+https://github.com/matthew-locastro/cross-model-orchestrate.git');
+  assert.equal(PKG.homepage, 'https://github.com/matthew-locastro/cross-model-orchestrate#readme');
+  assert.equal(PKG.bugs?.url, 'https://github.com/matthew-locastro/cross-model-orchestrate/issues');
+});
+
+test('the skill replaces Grok guidance with Antigravity Gemini-only subscription rules', () => {
+  assert.doesNotMatch(SKILL, /grok login/i);
+  assert.doesNotMatch(SKILL, /When Grok is the right vendor/);
+  assert.doesNotMatch(SKILL, /XAI_API_KEY/);
+  assert.match(SKILL, /### When Antigravity is the right vendor/);
+  assert.match(SKILL, /\^gemini-/);
+  assert.match(SKILL, /GEMINI_API_KEY/);
+  assert.match(SKILL, /agy -p \/usage --output-format json/);
+  assert.match(SKILL, /--sandbox/);
+  assert.match(SKILL, /HEADROOM: codex .* claude .* antigravity/);
+});
+
+test('who can run this covers Antigravity and Codex full-access requirements', () => {
+  const who = SKILL.split('## Who can run this')[1]?.split('\n## ')[0] ?? '';
+  assert.match(who, /Antigravity/);
+  assert.match(who, /~\/\.gemini\/config\/skills/);
+  assert.match(who, /Codex/);
+  assert.match(who, /full access/i);
+});
+
+test('outcomes are recorded after gates and reviews and read back in quality reports', () => {
+  assert.match(SKILL, /cmo outcome/);
+  assert.match(SKILL, /cmo report --quality/);
+  const afterRun = SKILL.split('### After a run')[1]?.split('\n### ')[0] ?? '';
+  assert.match(afterRun, /cmo report --quality/);
+
+  const pattern = REF('plan-driven-development.md');
+  assert.match(pattern, /cmo outcome/);
+  assert.match(pattern, /cmo report --quality/);
+  assert.match(pattern, /test names/i);
+  assert.match(pattern, /outside the sandbox/i);
+  assert.match(pattern, /double-wrapped/);
+});
+
+test('README and references describe the three-vendor roster without project leaks', () => {
+  assert.doesNotMatch(README, /Optional: Grok as a third vendor/);
+  assert.doesNotMatch(README, /grok login/i);
+  assert.match(README, /Antigravity/);
+  assert.match(README, /GEMINI_API_KEY/);
+  assert.match(README, /cmo outcome/);
+  assert.match(README, /cmo report --quality/);
+
+  const policy = REF('dispatch-policy.md');
+  assert.doesNotMatch(policy, /grok login/i);
+  assert.match(policy, /agy -p \/usage --output-format json/);
+
+  const workflows = REF('workflow-patterns.md');
+  assert.match(workflows, /antigravity/i);
+
+  for (const [label, text] of [
+    ['SKILL.md', SKILL],
+    ['README.md', README],
+    ['dispatch-policy.md', policy],
+    ['workflow-patterns.md', workflows],
+    ['plan-driven-development.md', REF('plan-driven-development.md')],
+    ['plan-driven-templates.md', REF('plan-driven-templates.md')],
+  ]) {
+    assert.doesNotMatch(text, /\b(SYH|syhclub|yacht|superyacht)\b/i, label);
+  }
+});
