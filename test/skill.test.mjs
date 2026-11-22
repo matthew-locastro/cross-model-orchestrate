@@ -5,7 +5,16 @@
 import './isolate.mjs'; // MUST be first — see the file
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import {
+  assertNoPrivateWords,
+  loadPrivateWordsGuard,
+  resolvePrivateWordsPath,
+} from './private-words.mjs';
 
 const SKILL = readFileSync(new URL('../skill/SKILL.md', import.meta.url), 'utf8');
 const frontmatter = SKILL.split('---')[1];
@@ -33,11 +42,25 @@ test('a feedback batch collects until End, then packages by file and checks ever
   assert.match(SKILL, /- Never act on a feedback-batch item before End Feedback Batch\./);
 });
 
-test('nothing from one user\'s projects leaks into the public skill', () => {
-  assert.doesNotMatch(SKILL, /\b(SYH|syhclub|yacht|superyacht)\b/i);
+test('nothing from one user\'s projects leaks into the public skill', (t) => {
+  assertNoPrivateWords(t, { 'skill/SKILL.md': SKILL });
 });
 
+const REFS_DIR = fileURLToPath(new URL('../skill/references', import.meta.url));
 const REF = (name) => readFileSync(new URL(`../skill/references/${name}`, import.meta.url), 'utf8');
+
+function listReferenceFiles(dir = REFS_DIR, prefix = '') {
+  const files = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      files.push(...listReferenceFiles(join(dir, entry.name), rel));
+    } else if (entry.isFile()) {
+      files.push(rel);
+    }
+  }
+  return files.sort();
+}
 
 test('plan-driven development is reachable from the skill and keeps every review cross-vendor', () => {
   assert.match(SKILL, /### Plan-driven development/);
@@ -91,14 +114,26 @@ test('the report and verdict schemas are strict objects the script can branch on
   assert.ok(verdict.properties.evidence.properties.tree_clean_after_review);
 });
 
-test('nothing from one user\'s projects leaks into the public references', () => {
-  for (const name of ['plan-driven-development.md', 'plan-driven-templates.md', 'schemas/implementer-report.json', 'schemas/task-verdict.json']) {
-    assert.doesNotMatch(REF(name), /\b(SYH|syhclub|yacht|superyacht)\b/i, name);
-  }
+test('nothing from one user\'s projects leaks into the public references', (t) => {
+  const names = listReferenceFiles();
+  assert.ok(names.includes('dispatch-policy.md'));
+  assert.ok(names.includes('plan-driven-development.md'));
+  assert.ok(names.includes('plan-driven-templates.md'));
+  assert.ok(names.includes('schemas/implementer-report.json'));
+  assert.ok(names.includes('schemas/task-verdict.json'));
+  assert.ok(names.includes('workflow-patterns.md'));
+  assertNoPrivateWords(
+    t,
+    Object.fromEntries(names.map((name) => [name, REF(name)])),
+  );
 });
 
 const README = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
 const PKG = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+
+test('nothing from one user\'s projects leaks into the public README', (t) => {
+  assertNoPrivateWords(t, { 'README.md': README });
+});
 
 test('package.json names antigravity instead of grok and keeps repository URLs', () => {
   assert.match(PKG.description, /Antigravity/);
@@ -158,5 +193,145 @@ test('README and references describe the three-vendor roster without project lea
 
   const workflows = REF('workflow-patterns.md');
   assert.match(workflows, /antigravity/i);
+});
 
+function withTempDir(fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'cmo-private-words-'));
+  try {
+    return fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const neverSkip = {
+  skip(msg) {
+    assert.fail(`expected guard to run, not skip: ${msg}`);
+  },
+};
+
+test('private-words guard flags a temp text containing a synthetic word case-insensitively and whole-word only', () => {
+  withTempDir((dir) => {
+    const wordsFile = join(dir, 'words.txt');
+    const textFile = join(dir, 'sample.md');
+    writeFileSync(wordsFile, 'zzexampleword\n', 'utf8');
+    writeFileSync(textFile, 'A line mentioning ZZExampleWord in a temp text.\n', 'utf8');
+    const sample = readFileSync(textFile, 'utf8');
+
+    const prev = process.env.CMO_PRIVATE_WORDS_FILE;
+    process.env.CMO_PRIVATE_WORDS_FILE = wordsFile;
+    try {
+      assert.throws(
+        () => assertNoPrivateWords(neverSkip, { 'sample.md': sample }),
+        { name: 'AssertionError', message: /sample\.md/ },
+      );
+      assertNoPrivateWords(neverSkip, {
+        'substrings.md': 'ozzexampleword and zzexamplewords are substrings, not whole words',
+      });
+      const refs = Object.fromEntries(listReferenceFiles().map((name) => [name, REF(name)]));
+      assertNoPrivateWords(neverSkip, { 'skill/SKILL.md': SKILL, 'README.md': README, ...refs });
+    } finally {
+      if (prev === undefined) delete process.env.CMO_PRIVATE_WORDS_FILE;
+      else process.env.CMO_PRIVATE_WORDS_FILE = prev;
+    }
+  });
+});
+
+test('private-words guard ignores comments and blanks and escapes regex metacharacters', () => {
+  withTempDir((dir) => {
+    const wordsFile = join(dir, 'words.txt');
+    writeFileSync(
+      wordsFile,
+      [
+        '# leading comment with zzcommentword',
+        '  # indented comment with zzindentedcomment',
+        '',
+        '   ',
+        'zz.meta+word?',
+        'zz[box](1)*',
+        'zzpipe|zzalt',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    const opts = { env: { CMO_PRIVATE_WORDS_FILE: wordsFile } };
+
+    // Blank lines must not create an empty alternation, comments are ignored,
+    // and unescaped regex meanings (wildcard '.', character class, pipe) do not fire.
+    assertNoPrivateWords(
+      neverSkip,
+      {
+        'clean.md': 'ordinary text with zzcommentword, zzindentedcomment, zzXmeta+word, zzbox1 and zzpipe alone',
+      },
+      opts,
+    );
+
+    for (const leaked of ['zz.meta+word?', 'ZZ[BOX](1)*', 'zzpipe|zzalt']) {
+      assert.throws(
+        () => assertNoPrivateWords(neverSkip, { 'leaked.md': `contains ${leaked} inline` }, opts),
+        { name: 'AssertionError' },
+        leaked,
+      );
+    }
+  });
+});
+
+test('private-words guard skips with a clear message when the words file is missing or empty', () => {
+  withTempDir((dir) => {
+    const missing = join(dir, 'does-not-exist.txt');
+    const skippedMissing = [];
+    assertNoPrivateWords(
+      { skip: (msg) => skippedMissing.push(msg) },
+      { 'sample.md': 'zzexampleword' },
+      { env: { CMO_PRIVATE_WORDS_FILE: missing } },
+    );
+    assert.equal(skippedMissing.length, 1);
+    assert.match(skippedMissing[0], /not found/i);
+    assert.ok(skippedMissing[0].includes(missing));
+
+    const emptyFile = join(dir, 'empty.txt');
+    writeFileSync(emptyFile, '\n  \n# comment only\n', 'utf8');
+    const skippedEmpty = [];
+    const guard = assertNoPrivateWords(
+      { skip: (msg) => skippedEmpty.push(msg) },
+      { 'sample.md': 'zzexampleword' },
+      { env: { CMO_PRIVATE_WORDS_FILE: emptyFile } },
+    );
+    assert.equal(guard.regex, null);
+    assert.equal(skippedEmpty.length, 1);
+    assert.match(skippedEmpty[0], /empty/i);
+  });
+});
+
+test('private-words guard resolves ~ with os.homedir() and ignores redirected CMO_CONFIG_DIR', () => {
+  assert.equal(
+    resolvePrivateWordsPath({ env: { CMO_CONFIG_DIR: '/tmp/redirected-cmo-config' } }),
+    join(homedir(), '.config', 'cross-model-orchestrate-private-words.txt'),
+  );
+
+  withTempDir((fakeHome) => {
+    assert.equal(
+      resolvePrivateWordsPath({ env: { CMO_PRIVATE_WORDS_FILE: '~/my-words.txt' }, home: fakeHome }),
+      join(fakeHome, 'my-words.txt'),
+    );
+
+    const defaultFile = join(fakeHome, '.config', 'cross-model-orchestrate-private-words.txt');
+    mkdirSync(join(fakeHome, '.config'), { recursive: true });
+    writeFileSync(defaultFile, 'zzdefaultword\n', 'utf8');
+
+    const guard = loadPrivateWordsGuard({
+      env: { CMO_CONFIG_DIR: '/tmp/redirected-cmo-config' },
+      home: fakeHome,
+    });
+    assert.equal(guard.path, defaultFile);
+    assert.ok(guard.regex instanceof RegExp);
+    assert.throws(
+      () => assertNoPrivateWords(
+        neverSkip,
+        { 'doc.md': 'leaked zzdefaultword here' },
+        { env: { CMO_CONFIG_DIR: '/tmp/redirected-cmo-config' }, home: fakeHome },
+      ),
+      { name: 'AssertionError' },
+    );
+  });
 });
