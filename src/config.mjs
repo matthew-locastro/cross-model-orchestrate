@@ -179,7 +179,6 @@ export const DEFAULT_ORCHESTRATOR = {
  * A tight window or a power-use gap on someone else still takes the work away.
  */
 export const DEFAULT_AFFINITY = {
-  antigravity: { roles: ['research'], web: true, points: 25 },
   grok: { roles: ['research'], web: true, points: 25 },
 };
 
@@ -334,7 +333,7 @@ export function activeProviders(config = loadConfig()) {
   const configured = Array.isArray(config?.providers)
     ? config.providers
     : DEFAULT_ACTIVE_PROVIDERS;
-  return configured.filter((provider) => PROVIDERS.includes(provider));
+  return [...new Set(configured.filter((provider) => PROVIDERS.includes(provider)))];
 }
 
 export function resetConfigCache() {

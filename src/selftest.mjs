@@ -42,6 +42,9 @@ const ANTIGRAVITY_SIGNED_OUT = {
   windows: [],
   auth: { ok: false, method: 'none', reason: 'not signed in with a subscription' },
 };
+const ANTIGRAVITY_API_KEY = {
+  ...atPercent(5), provider: 'antigravity', auth: { ok: false, method: 'api-key' },
+};
 const CLAUDE_SIGNED_OUT = { available: false, provider: 'claude', windows: [], auth: { ok: false, method: 'none', reason: 'the claude CLI is signed out' } };
 const CLAUDE_AUTH_RESULT = JSON.stringify({
   type: 'result', subtype: 'success', is_error: true, total_cost_usd: 0,
@@ -117,6 +120,12 @@ const CASES = [
     task: { role: 'research', complexity: 2, length: 's', needsWeb: true },
     limits: { codex: SPENT, claude: SPENT, antigravity: ANTIGRAVITY_SIGNED_OUT },
     expect: (d) => d.ok === false && d.defer === true,
+  },
+  {
+    name: 'a pinned antigravity API key never bypasses the subscription gate',
+    task: { role: 'research', complexity: 2, length: 's', pin: 'antigravity' },
+    limits: { codex: HEALTHY, claude: HEALTHY, antigravity: ANTIGRAVITY_API_KEY },
+    expect: (d) => d.ok === false,
   },
   {
     name: 'research goes to antigravity when its subscription meter is verified',
@@ -211,10 +220,10 @@ const CASES = [
       && !d.fallbacks.some((f) => f.provider === 'codex'),
   },
   {
-    name: 'research still goes to a healthy antigravity on affinity',
+    name: 'research uses antigravity web capability when no other web vendor can run',
     task: { role: 'research', complexity: 2, length: 's' },
-    limits: { codex: atPercent(15), claude: atPercent(20), antigravity: antigravityAt(25) },
-    expect: (d) => d.provider === 'antigravity' && /preferred for research/.test(d.reason)
+    limits: { codex: atPercent(15), claude: SPENT, antigravity: antigravityAt(25) },
+    expect: (d) => d.provider === 'antigravity'
       && !d.fallbacks.some((f) => f.provider === 'codex'),
   },
 ];

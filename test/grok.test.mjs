@@ -287,11 +287,13 @@ test('an unverified grok is unauthenticated, whatever its meter says', () => {
 });
 
 test('an unverified grok is never a candidate or a fallback', () => {
-  const d = decide({ role: 'implement', complexity: 3, length: 'm' }, { codex: healthy(), claude: healthy() });
-  assert.equal(d.provider, 'codex');
-  assert.deepEqual(d.fallbacks.map((f) => f.provider), ['claude']);
-  const pinned = decide({ role: 'research', pin: 'grok' }, { codex: healthy(), claude: healthy(), grok: grokReading({ ok: false, reason: 'not signed in' }) });
-  assert.equal(pinned.ok, false, 'a pin does not override the billing gate');
+  withGrok(() => {
+    const d = decide({ role: 'implement', complexity: 3, length: 'm' }, { codex: healthy(), claude: healthy() });
+    assert.equal(d.provider, 'codex');
+    assert.deepEqual(d.fallbacks.map((f) => f.provider), ['claude']);
+    const pinned = decide({ role: 'research', pin: 'grok' }, { codex: healthy(), claude: healthy(), grok: grokReading({ ok: false, reason: 'not signed in' }) });
+    assert.equal(pinned.ok, false, 'a pin does not override the billing gate');
+  });
 });
 
 test('research and web work lean to a signed-in grok', () => {
@@ -319,6 +321,9 @@ test('web work never lands on a sandboxed codex, pinned or not', () => {
   const pinned = decide({ role: 'research', needsWeb: true, pin: 'codex' }, { codex: healthy(), claude: healthy() });
   assert.equal(pinned.ok, false, 'a pin does not give the sandbox a network');
   assert.match(pinned.reason, /without --full-access/);
+  const researchPin = decide({ role: 'research', pin: 'codex' }, { codex: healthy(), claude: healthy() });
+  assert.equal(researchPin.ok, false);
+  assert.match(researchPin.reason, /research or web work without --full-access/);
   // --full-access is codex with a network: then it can.
   const open = decide({ role: 'research', needsWeb: true, pin: 'codex', fullAccess: true }, { codex: healthy(), claude: healthy() });
   assert.equal(open.provider, 'codex');

@@ -59,7 +59,7 @@ test('the default active roster is codex, claude and antigravity', () => {
 
 test('an explicit providers config can opt grok into the active roster', () => {
   withConfig({ providers: ['grok', 'claude', 'unknown', 'grok'] }, (config) => {
-    assert.deepEqual(activeProviders(config), ['grok', 'claude', 'grok']);
+    assert.deepEqual(activeProviders(config), ['grok', 'claude']);
   });
 });
 

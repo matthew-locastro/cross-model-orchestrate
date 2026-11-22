@@ -667,8 +667,9 @@ export function decide(task = {}, limits = {}, opts = {}) {
       reason: normalized.pin
         ? (normalized.independentOf === normalized.pin && normalized.strictIndependence
           ? `the review is pinned to ${normalized.pin}, the producer, and --strict-independence forbids that`
-          : `the pinned provider ${normalized.pin} cannot run${normalized.needsWeb && normalized.pin === 'codex'
-            ? ' web work without --full-access' : ''}`)
+          : `the pinned provider ${normalized.pin} cannot run${normalized.pin === 'codex'
+            && (normalized.needsWeb || normalized.role === 'research')
+            ? ' research or web work without --full-access' : ''}`)
         : normalized.independentOf
         ? (normalized.strictIndependence
           ? 'no provider allowed for this cross-model review can run, and --strict-independence forbids degrading to the producer\'s vendor'
