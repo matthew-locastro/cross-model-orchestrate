@@ -305,6 +305,31 @@ All bands below are bands of **pressure**:
   blocks work on Codex or Claude; Antigravity fails closed until its
   subscription meter answers. `cmo doctor` explains why a probe failed.
 
+### Redeemable resets and burn mode
+
+Subscriptions such as Codex may carry redeemable full resets (`resets.<provider>`
+in `config.json`, managed with `cmo resets list`, `cmo resets add <provider> <expiry>`
+and `cmo resets used <provider> [<expiry>]`; ISO 8601 dates or datetimes, where a
+bare date means `00:00 UTC`). `cmo limits --human` marks any unexpired reset
+expiring before the provider's next natural weekly reset as `use or lose` and
+prints `N <provider> resets expire before the weekly reset; run \`cmo burn <provider>\` to use them.`
+Surface that line to the user — never start burn mode unless requested, and
+never plan to spend paid credits.
+
+When the user asks to burn a provider (`cmo burn <provider> [--until <ISO datetime or duration such as 36h>]`,
+`cmo burn --off` to stop, `cmo burn` for status), state in the cache directory
+makes every `cmo` process strongly prefer `<provider>` for all tasks it can do
+(respecting capability rules like network access), ignoring its pressure bands
+until its binding window is exhausted (raw ≥95%), while keeping `--independent-of`
+cross-vendor reviews and Claude's orchestrator reserve unchanged. When the burn
+provider is exhausted and resets remain, `cmo limits --human` and the `notes` of
+every `cmo run` envelope say
+`<provider> exhausted; N resets left (earliest expires <date>): redeem one in the app to keep burning`,
+and routing falls back to the other vendors. Tell the user to redeem one in the
+vendor's app (`cmo` cannot redeem resets itself) and record it with
+`cmo resets used <provider>`; once usage drops again, burning resumes
+automatically until `--until` or `--off`.
+
 ## 1 — Shape: a fan, or a queue?
 
 A dynamic workflow earns its cost when you can name **the fan**: the independent

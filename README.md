@@ -313,7 +313,8 @@ flags any Codex model ID your account does not actually have.
   "routing": { "headroomWeight": 40, "powerGap": 20, "powerBonus": 25 },
   "orchestrator": { "vendor": "claude", "penalty": 30, "reserveAt": 60 },
   "durationFit": { "enabled": true, "quantile": 0.75, "margin": 0.9, "minSamples": 3, "windowDays": 14 },
-  "pressure": { "tight": 65, "critical": 85, "exhausted": 95 }
+  "pressure": { "tight": 65, "critical": 85, "exhausted": 95 },
+  "resets": { "codex": ["2026-12-01", "2026-12-10T12:00:00Z"] }
 }
 ```
 
@@ -350,6 +351,51 @@ same full user access that Claude and Antigravity already have under `cmo`.
 Claude Fable is deliberately outside the tier map (Anthropic documents it as
 substantially more consumption-intensive than Sonnet); reach it with
 `--pin claude --model fable`.
+
+### Redeemable resets and burn mode
+
+Some subscriptions (such as Codex) include redeemable "full resets" that each
+restore the weekly limit and expire on fixed dates. Any reset that expires
+before the provider's next natural weekly reset is "use or lose": unless the
+current weekly window is spent first and a reset is redeemed in the vendor's
+app, that reset expires unused. `cmo` cannot redeem resets on your behalf, and
+never plans to spend paid credits.
+
+Track your reset inventory in `config.json` under `resets.<provider>` (ISO 8601
+dates or datetimes; a bare `YYYY-MM-DD` date means `00:00 UTC` of that date,
+deliberately conservative) or with the CLI:
+
+```bash
+cmo resets list
+cmo resets add codex 2026-12-01
+cmo resets used codex                 # removes the earliest, or pass <expiry>
+```
+
+`cmo limits --human` lists configured resets under each provider, marks each
+unexpired entry that expires before that provider's next natural weekly reset as
+`(use or lose)` and prints a one-line suggestion:
+`N <provider> resets expire before the weekly reset; run \`cmo burn <provider>\` to use them.`
+
+Burn mode starts only when requested and shares its state across every `cmo`
+process via `~/.cache/cross-model-orchestrate/burn.json` (or `CMO_CACHE_DIR`),
+ending at `--until` or `--off`:
+
+```bash
+cmo burn codex --until 36h            # ISO datetime/date or duration (s/m/h/d/w)
+cmo burn                              # status
+cmo burn --off                        # stop burning
+```
+
+While active, routing strongly prefers the burn provider for every task it is
+able to run (still respecting network/sandbox capability rules, `--independent-of`
+cross-vendor review and Claude's orchestrator reserve) and ignores its `tight`
+and `critical` pressure bands until its binding window is exhausted (raw ≥95% or
+hard-blocked). Once exhausted with resets remaining, `cmo limits --human` and
+the `notes` of every `cmo run` envelope report
+`<provider> exhausted; N resets left (earliest expires <date>): redeem one in the app to keep burning`
+while routing falls back to the other vendors as usual. After you redeem a reset
+in the vendor's app and usage drops, burning resumes automatically; run
+`cmo resets used <provider>` to remove the redeemed entry.
 
 ---
 

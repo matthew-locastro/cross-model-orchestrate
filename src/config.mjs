@@ -188,6 +188,72 @@ function envBoolean(value) {
   return undefined;
 }
 
+const ISO_DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const ISO_DATETIME_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/i;
+
+function validCalendarDate(year, month, day) {
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const d = new Date(Date.UTC(year, month - 1, day));
+  return d.getUTCFullYear() === year && d.getUTCMonth() === month - 1 && d.getUTCDate() === day;
+}
+
+/**
+ * Parse an ISO 8601 expiry date or datetime into a canonical UTC ISO string.
+ * A bare YYYY-MM-DD date means 00:00 UTC of that date (deliberately conservative).
+ */
+export function parseResetExpiry(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  const dateOnly = trimmed.match(ISO_DATE_ONLY_RE);
+  if (dateOnly) {
+    const [, y, m, d] = dateOnly.map(Number);
+    if (!validCalendarDate(y, m, d)) return null;
+    return new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0)).toISOString();
+  }
+  const dt = trimmed.match(ISO_DATETIME_RE);
+  if (!dt) return null;
+  const year = Number(dt[1]);
+  const month = Number(dt[2]);
+  const day = Number(dt[3]);
+  const hour = Number(dt[4]);
+  const minute = Number(dt[5]);
+  const second = dt[6] !== undefined ? Number(dt[6]) : 0;
+  if (!validCalendarDate(year, month, day) || hour > 23 || minute > 59 || second > 59) return null;
+  const tz = dt[7];
+  const normalizedStr = /^[+-]\d{4}$/.test(tz)
+    ? `${trimmed.slice(0, -5)}${tz.slice(0, 3)}:${tz.slice(3)}`
+    : trimmed;
+  const ms = Date.parse(normalizedStr);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+/** Validate and normalize `config.resets.<provider>` lists, sorted earliest first. */
+export function parseResetsConfig(raw, sourceLabel = 'config.json') {
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(`${sourceLabel}: "resets" must be an object mapping provider names to expiry arrays`);
+  }
+  const out = {};
+  for (const [provider, entries] of Object.entries(raw)) {
+    if (!PROVIDERS.includes(provider)) {
+      throw new Error(`${sourceLabel}: unknown provider "${provider}" in resets`);
+    }
+    if (!Array.isArray(entries)) {
+      throw new Error(`${sourceLabel}: resets.${provider} must be an array of ISO 8601 dates or datetimes`);
+    }
+    const parsed = entries.map((entry) => {
+      const iso = parseResetExpiry(entry);
+      if (!iso) {
+        throw new Error(`${sourceLabel}: invalid ISO 8601 reset expiry "${entry}" in resets.${provider}`);
+      }
+      return iso;
+    });
+    parsed.sort((a, b) => Date.parse(a) - Date.parse(b));
+    if (parsed.length > 0) out[provider] = parsed;
+  }
+  return out;
+}
+
 /**
  * What a vendor is better placed to do than the others, in points of score.
  *
@@ -308,6 +374,7 @@ export function loadConfig({ file = CONFIG_FILE, reload = false } = {}) {
       fullAccess: envBoolean(process.env.CMO_CODEX_FULL_ACCESS)
         ?? (fromFile.codex?.fullAccess === true),
     },
+    resets: parseResetsConfig(fromFile.resets, file),
     /**
      * Fleet coordination. Set `url` + `token` and every box points at one
      * coordinator, so a run here can see the forty agents box B just launched.

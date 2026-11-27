@@ -59,6 +59,7 @@
 import { activeProviders, codexFullAccess, loadConfig, PROVIDERS, TIERS } from './config.mjs';
 import { expectedDuration, formatElapsed } from './durations.mjs';
 import { providerPressure } from './pace.mjs';
+import { activeBurn, BURN_BANDS, burnExhaustedNote, classifyResets } from './resets.mjs';
 
 export { PROVIDERS, TIERS };
 
@@ -275,7 +276,13 @@ function formatPoints(n) {
  * It is not a power-use peer in that state: it is not competing, and the
  * bonus is about the gap to the subscriptions that are.
  */
-export function rankProviders(task, states, preference = loadConfig().preference, affinity = loadConfig().affinity) {
+export function rankProviders(
+  task,
+  states,
+  preference = loadConfig().preference,
+  affinity = loadConfig().affinity,
+  { burnProvider = null } = {},
+) {
   const config = loadConfig();
   const providers = activeProviders(config);
   const routing = config.routing;
@@ -356,6 +363,13 @@ export function rankProviders(task, states, preference = loadConfig().preference
       why.push(`${id} loses ${reservePenalty} to keep orchestrator headroom`);
     }
 
+    // Burn mode: strongly prefer the requested burn provider on every task it can do,
+    // except when the task must be independent of it.
+    if (burnProvider && id === burnProvider && task.independentOf !== burnProvider && !incapable && !UNUSABLE.has(s.state)) {
+      score += 200;
+      why.push(`burn mode: preferring ${id}`);
+    }
+
     return {
       provider: id,
       score,
@@ -381,9 +395,14 @@ export function rankProviders(task, states, preference = loadConfig().preference
   // is not a competitor the gap has to clear. A usable provider with unknown
   // pressure still is: the bonus waits until every competitor has a finite
   // pressure, so an unread meter cannot be skipped and then lose to the bonus.
+  const burnTakingWork = Boolean(
+    burnProvider
+    && task.independentOf !== burnProvider
+    && scored.some((c) => c.provider === burnProvider && isUsable(c) && !reserved(c)),
+  );
   const competitors = scored.filter((c) => isUsable(c) && !reserved(c));
   const peers = competitors.filter((c) => Number.isFinite(c.percent));
-  if (peers.length === competitors.length && peers.length >= 2 && Number.isFinite(powerGap) && powerBonus) {
+  if (!burnTakingWork && peers.length === competitors.length && peers.length >= 2 && Number.isFinite(powerGap) && powerBonus) {
     let winner = null;
     let nearest = null;
     let nearestGap = Infinity;
@@ -440,17 +459,19 @@ export function rankProviders(task, states, preference = loadConfig().preference
  * whether the orchestrator's vendor is being held back.
  */
 export function formatRoutingLine(ranked) {
-  const power = ranked.find((c) => c.why.some((w) => w.startsWith('power-use:')));
-  const lead = power ?? ranked.find((c) => isUsable(c)) ?? null;
+  const burn = ranked.find((c) => isUsable(c) && c.why.some((w) => w.startsWith('burn mode:')));
+  const power = burn ? null : ranked.find((c) => c.why.some((w) => w.startsWith('power-use:')));
+  const lead = burn ?? power ?? ranked.find((c) => isUsable(c)) ?? null;
   const piece = (c, asLead) => {
     const held = c.why.some((w) => w.includes('reserved for the orchestrator'));
     // A reserved vendor that is also the only usable one is who would run, so
     // name it as least-used. Otherwise the reserve is the whole status line.
-    if (held && !(asLead && !power)) return `${c.provider} reserved for orchestrator`;
+    if (held && !(asLead && !power && !burn)) return `${c.provider} reserved for orchestrator`;
     if (!isUsable(c)) return `${c.provider} ${c.state}`;
     const pct = Number.isFinite(c.percent) ? `${c.percent}%` : 'unknown';
     // No numeric lead means no least-used comparison happened. Name the
     // tie-break vendor in parentheses so the line still says who would run.
+    if (asLead && burn) return `burn ${c.provider} (${pct})`;
     if (asLead && !Number.isFinite(c.percent)) return `headroom unknown (${c.provider})`;
     if (asLead && power) return `power-use ${c.provider} (${pct})`;
     if (asLead) return `least-used ${c.provider} (${pct})`;
@@ -466,12 +487,17 @@ export function formatRoutingLine(ranked) {
 }
 
 /** Routing line for a limits reading, using the same ranker `decide()` uses. */
-export function routingLine(limits, now = Date.now()) {
+export function routingLine(limits, now = Date.now(), { cacheDir } = {}) {
   const bands = pressure();
+  const burn = activeBurn({ ...(cacheDir ? { cacheDir } : {}), now });
+  const burnProvider = burn?.provider ?? null;
   const states = Object.fromEntries(
-    activeProviders().map((id) => [id, providerState(limits?.[id], bands, now, id)]),
+    activeProviders().map((id) => [
+      id,
+      providerState(limits?.[id], id === burnProvider ? BURN_BANDS : bands, now, id),
+    ]),
   );
-  return formatRoutingLine(rankProviders({ role: 'implement' }, states));
+  return formatRoutingLine(rankProviders({ role: 'implement' }, states, undefined, undefined, { burnProvider }));
 }
 
 /**
@@ -587,14 +613,33 @@ export function decide(task = {}, limits = {}, opts = {}) {
   }
 
   const bands = config.pressure;
+  const burn = opts.burn !== undefined
+    ? opts.burn
+    : activeBurn({ ...(opts.cacheDir ? { cacheDir: opts.cacheDir } : {}), now });
+  const burnProvider = burn?.provider ?? null;
   const states = Object.fromEntries(
-    providers.map((id) => [id, providerState(limits[id], bands, now, id)]),
+    providers.map((id) => [
+      id,
+      providerState(limits[id], id === burnProvider ? BURN_BANDS : bands, now, id),
+    ]),
   );
 
-  let ranked = rankProviders(normalized, states);
+  let ranked = rankProviders(normalized, states, undefined, undefined, { burnProvider });
   for (const candidate of ranked) {
     for (const line of candidate.why) {
-      if (line.startsWith('power-use:') || line.includes('reserved for the orchestrator')) notes.push(line);
+      if (line.startsWith('burn mode:') || line.startsWith('power-use:') || line.includes('reserved for the orchestrator')) {
+        notes.push(line);
+      }
+    }
+  }
+
+  if (burnProvider) {
+    const burnState = states[burnProvider]
+      ?? providerState(limits[burnProvider], BURN_BANDS, now, burnProvider);
+    if (burnState.state === 'exhausted') {
+      const classified = classifyResets(burnProvider, limits[burnProvider], config.resets?.[burnProvider] ?? [], now);
+      const redeemNote = burnExhaustedNote(burnProvider, classified.remaining);
+      if (redeemNote) notes.push(redeemNote);
     }
   }
 

@@ -60,6 +60,8 @@ import {
   antigravityInput, antigravitySoftDenyWarning, classifyAntigravityFailure, isAntigravityModel,
   isJsonObject, isLongAgyPrompt, parseAntigravityStdout,
 } from './antigravity.mjs';
+import { activeBurn, BURN_BANDS, burnExhaustedNote, classifyResets } from './resets.mjs';
+import { providerState } from './policy.mjs';
 
 // The time budget. Thirty minutes, not twenty: Grok's reviews and balanced
 // implementations run 15–18 minutes at p50, and a budget they fit inside is
@@ -920,16 +922,43 @@ export async function runAgent(decision, prompt, opts = {}) {
     if (replayed) return replayed;
   }
 
-  const decisionSummary = (
+  const hasDecisionSummary = (
     decision.weight !== undefined || decision.reason !== undefined || Array.isArray(decision.notes)
-  )
-    ? {
-      weight: decision.weight,
-      tier: decision.tier,
-      reason: decision.reason,
-      notes: decision.notes,
+  );
+  const baseNotes = Array.isArray(decision.notes) ? [...decision.notes] : null;
+  const observedReadings = {};
+  const resolveEnvelopeNotes = () => {
+    const currentNow = now();
+    const out = baseNotes ? [...baseNotes] : [];
+    const burn = activeBurn({ cacheDir, now: currentNow });
+    if (burn) {
+      const hitRateLimit = attempts.some((a) => a.provider === burn.provider && a.failure === 'rate-limit');
+      const freshReading = observedReadings[burn.provider];
+      const freshExhausted = freshReading
+        ? providerState(freshReading, BURN_BANDS, currentNow, burn.provider).state === 'exhausted'
+        : false;
+      if (hitRateLimit || freshExhausted) {
+        const classified = classifyResets(
+          burn.provider,
+          freshReading ?? null,
+          loadConfig().resets?.[burn.provider] ?? [],
+          currentNow,
+        );
+        const redeemNote = burnExhaustedNote(burn.provider, classified.remaining);
+        if (redeemNote && !out.includes(redeemNote)) out.push(redeemNote);
+      }
     }
-    : undefined;
+    const notes = (baseNotes !== null || out.length > 0) ? out : undefined;
+    const summary = hasDecisionSummary
+      ? {
+        weight: decision.weight,
+        tier: decision.tier,
+        reason: decision.reason,
+        notes: notes ?? decision.notes,
+      }
+      : (notes ? { notes } : undefined);
+    return { notes, summary };
+  };
 
   // Every clock finite, positive and inside the longest lease a reservation
   // can hold: an infinite ceiling would never stop a run that keeps talking.
@@ -1124,6 +1153,7 @@ export async function runAgent(decision, prompt, opts = {}) {
           const after = stream.rateLimits
             ? await recordCodexRateLimits(stream.rateLimits).catch(() => null)
             : await refreshCodexLimits().catch(() => null);
+          if (after?.available) observedReadings.codex = after;
           // A free measurement of what one agent actually costs.
           if (after && typeof before === 'number' && typeof after.worstPercent === 'number') {
             await recordSample('codex', after.worstPercent - before).catch(() => {});
@@ -1176,6 +1206,7 @@ export async function runAgent(decision, prompt, opts = {}) {
             };
           }
           const after = await refreshGrokLimits({ minAgeMs: GROK_SAMPLE_MIN_AGE_MS }).catch(() => null);
+          if (after?.available) observedReadings.grok = after;
           if (after?.available && typeof before === 'number' && typeof after.worstPercent === 'number') {
             await recordSample('grok', after.worstPercent - before).catch(() => {});
           }
@@ -1199,6 +1230,7 @@ export async function runAgent(decision, prompt, opts = {}) {
           // all along. Costs one HTTP GET, and only after the work is done.
           const after = await refreshClaudeLimits({ minAgeMs: CLAUDE_SAMPLE_MIN_AGE_MS })
             .catch(() => null);
+          if (after?.available) observedReadings.claude = after;
           if (after && typeof before === 'number' && typeof after.worstPercent === 'number') {
             await recordSample('claude', after.worstPercent - before).catch(() => {});
           }
@@ -1255,6 +1287,7 @@ export async function runAgent(decision, prompt, opts = {}) {
           }
           const durationMs = now() - startedAt;
           const warnings = attempts.map((a) => a.warning).filter(Boolean);
+          const { notes: envelopeNotes, summary: decisionSummary } = resolveEnvelopeNotes();
           const envelope = {
             ok: true,
             dispatchId,
@@ -1277,6 +1310,7 @@ export async function runAgent(decision, prompt, opts = {}) {
             result: text,
             resultJson,
             ...(warnings.length ? { warnings } : {}),
+            ...(envelopeNotes ? { notes: envelopeNotes } : {}),
             ...(decisionSummary ? { decision: decisionSummary } : {}),
           };
           await saveDispatchArtifacts(
@@ -1368,6 +1402,7 @@ export async function runAgent(decision, prompt, opts = {}) {
 
     const failedOver = attempts.some((attempt) => attempt.provider !== decision.provider);
     const durationMs = now() - startedAt;
+    const { notes: envelopeNotes, summary: decisionSummary } = resolveEnvelopeNotes();
     const envelope = {
       ok: false,
       dispatchId,
@@ -1377,6 +1412,7 @@ export async function runAgent(decision, prompt, opts = {}) {
       attempts,
       durationMs,
       error: lastError ?? 'all providers failed',
+      ...(envelopeNotes ? { notes: envelopeNotes } : {}),
       ...(decisionSummary ? { decision: decisionSummary } : {}),
     };
     await saveDispatchArtifacts(

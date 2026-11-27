@@ -325,7 +325,7 @@ export function selftest() {
   let failures = 0;
   process.stdout.write('decision table\n');
   for (const c of CASES) {
-    const d = decide(c.task, c.limits);
+    const d = decide(c.task, c.limits, { burn: null });
     const pass = c.expect(d);
     if (!pass) failures += 1;
     const got = d.ok ? `${d.provider} ${d.model} (${d.tier})` : `defer → ${d.resumeAfter ?? 'unknown'}`;

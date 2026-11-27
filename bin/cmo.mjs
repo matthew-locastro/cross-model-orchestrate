@@ -32,9 +32,13 @@ import {
 } from '../src/audit.mjs';
 import { readOutcomes, recordOutcome, VERDICTS } from '../src/outcomes.mjs';
 import { durationProfile, parseSinceMinutes } from '../src/durations.mjs';
-import { activeProviders, CACHE_DIR, loadConfig } from '../src/config.mjs';
-import { MAX_LEASE_MS, perAgentCost } from '../src/ledger.mjs';
+import { activeProviders, CACHE_DIR, loadConfig, PROVIDERS } from '../src/config.mjs';
+import { MAX_LEASE_MS, perAgentCost, snapshot } from '../src/ledger.mjs';
 import { update } from '../src/update.mjs';
+import {
+  activeBurn, addReset, BURN_BANDS, burnExhaustedNote, classifyResets, clearBurn,
+  formatResetExpiry, markResetUsed, parseBurnUntil, readBurnState, setBurn, useOrLoseSuggestion,
+} from '../src/resets.mjs';
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -111,15 +115,20 @@ function bar(percent) {
   return `${'█'.repeat(filled)}${'·'.repeat(10 - filled)} ${String(percent).padStart(3)}%`;
 }
 
-export function renderLimits(limits, now = Date.now()) {
+export function renderLimits(limits, now = Date.now(), { cacheDir } = {}) {
   const lines = [];
+  const cfg = loadConfig();
   const bandsNow = pressure();
-  const providers = activeProviders();
+  const burn = activeBurn({ ...(cacheDir ? { cacheDir } : {}), now });
+  const burnProvider = burn?.provider ?? null;
+  const providers = activeProviders(cfg);
+  const suggestions = [];
   for (const provider of providers) {
     const p = limits[provider];
     if (!p) continue;
-    const s = providerState(p, bandsNow, now, provider);
-    const pp = providerPressure(p, { now, exhausted: bandsNow.exhausted });
+    const effectiveBands = provider === burnProvider ? BURN_BANDS : bandsNow;
+    const s = providerState(p, effectiveBands, now, provider);
+    const pp = providerPressure(p, { now, exhausted: effectiveBands.exhausted });
     const paced = new Map(pp.windows.map((w) => [w.key, w]));
     const headline = pp.paceAware && typeof s.percent === 'number'
       ? `pressure ${s.percent}%${s.window ? ` (${s.window})` : ''} `
@@ -150,6 +159,19 @@ export function renderLimits(limits, now = Date.now()) {
           + ` = ${rate(pw.leftPerDay)}%/${unit} vs ${rate(pw.evenPerDay)}%/${unit} even → pressure ${pw.pressure}%`);
       } else if (pw?.stale) {
         lines.push('               pace: reset time has passed — this reading is stale');
+      }
+    }
+    const configuredResets = cfg.resets?.[provider] ?? [];
+    if (configuredResets.length > 0) {
+      const classified = classifyResets(provider, p, configuredResets, now);
+      const renderedResets = classified.entries.map((entry) => (
+        entry.useOrLose ? `${entry.display} (use or lose)`
+          : entry.expired ? `${entry.display} (expired)`
+            : entry.display
+      ));
+      lines.push(`        ${'resets'.padEnd(6)} ${renderedResets.join(', ')}`);
+      if (classified.useOrLose.length > 0 && burnProvider !== provider) {
+        suggestions.push(useOrLoseSuggestion(provider, classified.useOrLose.length));
       }
     }
     // What the vendor reported vs what this machine has already committed.
@@ -183,7 +205,19 @@ export function renderLimits(limits, now = Date.now()) {
     lines.push('WARNING: a fleet coordinator is configured but unreachable — '
       + 'this decision sees only the local machine.');
   }
-  lines.push(routingLine(limits, now));
+  for (const suggestion of suggestions) lines.push(suggestion);
+  if (burnProvider) {
+    const burnState = providerState(limits[burnProvider], BURN_BANDS, now, burnProvider);
+    if (burnState.state === 'exhausted') {
+      const classified = classifyResets(burnProvider, limits[burnProvider], cfg.resets?.[burnProvider] ?? [], now);
+      const redeem = burnExhaustedNote(burnProvider, classified.remaining);
+      if (redeem) lines.push(redeem);
+      else lines.push(`burn: ${burnProvider} exhausted (no resets left)`);
+    } else {
+      lines.push(`burn: ${burnProvider} active${burn.until ? ` until ${formatResetExpiry(burn.until)}` : ''}`);
+    }
+  }
+  lines.push(routingLine(limits, now, { cacheDir }));
   return lines.join('\n');
 }
 
@@ -210,6 +244,8 @@ dispatch
   report      read the soak log back: reliability, balance, quality, and what to change
   outcome     record a quality judgement for a dispatch receipt
   limits      report remaining subscription headroom for codex, claude and antigravity
+  resets      track redeemable full resets (list, add <provider> <expiry>, used <provider> [<expiry>])
+  burn        drain a subscription before reset expiry (<provider> [--until <time>], --off, or status)
   plan        show which provider/model/effort a task would get, and why
   run         plan, then execute the subagent and print a JSON envelope
   selftest    offline checks of the decision table
@@ -309,10 +345,16 @@ function processOutput(text, stream = 'stdout') {
 }
 
 /** Shell status for `limits`, separated from rendering and I/O for callers. */
-export function limitsExitStatus(limits, roster = activeProviders(), now = Date.now()) {
+export function limitsExitStatus(limits, roster = activeProviders(), now = Date.now(), { cacheDir } = {}) {
   const bands = pressure();
+  const burn = activeBurn({ ...(cacheDir ? { cacheDir } : {}), now });
   const usable = roster.some((provider) => isUsable({
-    state: providerState(limits?.[provider], bands, now, provider).state,
+    state: providerState(
+      limits?.[provider],
+      burn?.provider === provider ? BURN_BANDS : bands,
+      now,
+      provider,
+    ).state,
   }));
   return usable ? 0 : 3;
 }
@@ -359,12 +401,19 @@ export async function main(
   argv = process.argv.slice(2),
   {
     cacheDir = process.env.CMO_CACHE_DIR || CACHE_DIR,
+    configFile,
+    now: injectedNow,
     outputSink = processOutput,
     limits: injectedLimits,
     readLimits: readLimitsFn = readLimits,
     spawnImpl,
   } = {},
 ) {
+  const nowMs = Number.isFinite(injectedNow) ? injectedNow : Date.now();
+  if (configFile && loadConfig().configFile !== configFile) {
+    loadConfig({ file: configFile, reload: true });
+  }
+  const cfgFile = configFile ?? loadConfig().configFile;
   const args = parseArgs(argv);
   const command = args._[0];
 
@@ -568,17 +617,144 @@ export async function main(
     return 0;
   }
 
+  if (command === 'resets') {
+    const sub = args._[1] ?? 'list';
+    if (sub === 'list' && args._.length <= 2) {
+      const cfg = loadConfig({ file: cfgFile, reload: true });
+      if (args.json) {
+        outputSink(`${JSON.stringify({ resets: cfg.resets }, null, 2)}\n`, 'stdout');
+        return 0;
+      }
+      const entries = Object.entries(cfg.resets ?? {}).filter(([, list]) => list.length > 0);
+      if (entries.length === 0) {
+        outputSink('no redeemable resets configured.\n', 'stdout');
+        return 0;
+      }
+      for (const [provider, list] of entries) {
+        const classified = classifyResets(provider, null, list, nowMs);
+        const items = classified.entries.map((e) => (e.expired ? `${e.display} (expired)` : e.display));
+        outputSink(`${provider}: ${items.join(', ')}\n`, 'stdout');
+      }
+      return 0;
+    }
+    if (sub === 'add') {
+      const provider = args._[2];
+      const expiry = args._[3];
+      if (!provider || !expiry || args._.length > 4 || !PROVIDERS.includes(provider)) {
+        outputSink('cmo resets add: usage: cmo resets add <provider> <ISO-date-or-datetime>\n', 'stderr');
+        return 2;
+      }
+      try {
+        const { added, list } = await addReset(provider, expiry, { configFile: cfgFile });
+        outputSink(
+          args.json
+            ? `${JSON.stringify({ provider, added, resets: list })}\n`
+            : `added ${provider} reset expiring ${formatResetExpiry(added)} (${list.length} total)\n`,
+          'stdout',
+        );
+        return 0;
+      } catch (err) {
+        outputSink(`cmo resets add: ${err.message}\n`, 'stderr');
+        return 2;
+      }
+    }
+    if (sub === 'used') {
+      const provider = args._[2];
+      const expiry = args._[3];
+      if (!provider || args._.length > 4 || !PROVIDERS.includes(provider)) {
+        outputSink('cmo resets used: usage: cmo resets used <provider> [<ISO-date-or-datetime>]\n', 'stderr');
+        return 2;
+      }
+      let result;
+      try {
+        result = await markResetUsed(provider, expiry, { configFile: cfgFile });
+      } catch (err) {
+        outputSink(`cmo resets used: ${err.message}\n`, 'stderr');
+        return 2;
+      }
+      if (!result.ok) {
+        outputSink(`cmo resets used: ${result.error}\n`, 'stderr');
+        return 1;
+      }
+      outputSink(
+        args.json
+          ? `${JSON.stringify({ provider, removed: result.removed, remaining: result.remaining })}\n`
+          : `marked ${provider} reset ${formatResetExpiry(result.removed)} as used (${result.remaining.length} remaining)\n`,
+        'stdout',
+      );
+      return 0;
+    }
+    outputSink('cmo resets: expected `list`, `add <provider> <expiry>`, or `used <provider> [<expiry>]`\n', 'stderr');
+    return 2;
+  }
+
+  if (command === 'burn') {
+    const provider = args._[1];
+    if (args.off) {
+      if (provider || args.until !== undefined || args._.length > 1) {
+        outputSink('cmo burn: `--off` takes no provider or --until\n', 'stderr');
+        return 2;
+      }
+      await clearBurn({ cacheDir });
+      outputSink(args.json ? `${JSON.stringify({ active: false })}\n` : 'burn: off\n', 'stdout');
+      return 0;
+    }
+    if (!provider) {
+      if (args.until !== undefined) {
+        outputSink('cmo burn: specify a provider with --until\n', 'stderr');
+        return 2;
+      }
+      const status = readBurnState({ cacheDir, now: nowMs });
+      if (args.json) {
+        outputSink(
+          `${JSON.stringify(status.active ? { active: true, ...status.state } : { active: false })}\n`,
+          'stdout',
+        );
+        return 0;
+      }
+      if (status.active) {
+        const untilText = status.state.until ? ` until ${formatResetExpiry(status.state.until)}` : ' (until --off)';
+        outputSink(`burn: ${status.state.provider} active${untilText}\n`, 'stdout');
+      } else if (status.expired && status.state?.until) {
+        outputSink(`burn: off (expired ${formatResetExpiry(status.state.until)})\n`, 'stdout');
+      } else {
+        outputSink('burn: off\n', 'stdout');
+      }
+      return 0;
+    }
+    if (args._.length > 2 || !PROVIDERS.includes(provider)) {
+      outputSink('cmo burn: usage: cmo burn <provider> [--until <ISO-datetime-or-duration>] | cmo burn --off | cmo burn\n', 'stderr');
+      return 2;
+    }
+    let until = null;
+    if (args.until !== undefined) {
+      until = parseBurnUntil(args.until, nowMs);
+      if (!until) {
+        outputSink(`cmo burn: --until must be an ISO 8601 date/datetime or duration (e.g. 36h), got "${args.until}"\n`, 'stderr');
+        return 2;
+      }
+    }
+    const state = await setBurn(provider, { until, cacheDir, now: nowMs });
+    outputSink(
+      args.json
+        ? `${JSON.stringify({ active: true, ...state })}\n`
+        : `burn: ${provider} active${until ? ` until ${formatResetExpiry(until)}` : ' (until --off)'}\n`,
+      'stdout',
+    );
+    return 0;
+  }
+
   if (command === 'limits') {
     const limits = injectedLimits !== undefined
       ? injectedLimits
-      : await readLimitsFn({ refresh: Boolean(args.refresh) });
+      : await readLimitsFn({ refresh: Boolean(args.refresh), now: nowMs });
     if (args.human) {
-      outputSink(`${renderLimits(limits)}\n`, 'stdout');
+      outputSink(`${renderLimits(limits, nowMs, { cacheDir })}\n`, 'stdout');
     } else {
       outputSink(`${JSON.stringify(limits, null, 2)}\n`, 'stdout');
     }
     // Non-zero when no provider can take work, so a shell caller can branch.
-    return limitsExitStatus(limits);
+    return limitsExitStatus(limits, activeProviders(), nowMs, { cacheDir });
   }
 
   if (command === 'plan') {
@@ -595,8 +771,12 @@ export async function main(
     }
     const limits = injectedLimits !== undefined
       ? injectedLimits
-      : await readLimitsFn({ refresh: Boolean(planArgs.refresh) });
-    const decision = decide(taskFromArgs(planArgs), limits, await timing(planArgs, cacheDir));
+      : await readLimitsFn({ refresh: Boolean(planArgs.refresh), now: nowMs });
+    const decision = decide(taskFromArgs(planArgs), limits, {
+      ...(await timing(planArgs, cacheDir)),
+      now: nowMs,
+      cacheDir,
+    });
     if (args.human) {
       if (!decision.ok) {
         outputSink(
@@ -677,15 +857,35 @@ export async function main(
     if (idempotencyKey) {
       const replayed = await findIdempotentReplay(idempotencyKey, { cacheDir });
       if (replayed) {
+        const burn = activeBurn({ cacheDir, now: nowMs });
+        if (burn) {
+          let burnLimits = injectedLimits?.[burn.provider];
+          if (!burnLimits) {
+            const local = await snapshot({ local: true, now: () => nowMs }).catch(() => null);
+            burnLimits = local?.probes?.[burn.provider]?.value;
+          }
+          if (burnLimits && providerState(burnLimits, BURN_BANDS, nowMs, burn.provider).state === 'exhausted') {
+            const classified = classifyResets(burn.provider, burnLimits, loadConfig().resets?.[burn.provider] ?? [], nowMs);
+            const redeemNote = burnExhaustedNote(burn.provider, classified.remaining);
+            if (redeemNote) {
+              const nextNotes = [...(Array.isArray(replayed.notes) ? replayed.notes : (replayed.decision?.notes ?? []))];
+              if (!nextNotes.includes(redeemNote)) nextNotes.push(redeemNote);
+              replayed.notes = nextNotes;
+              if (replayed.decision && typeof replayed.decision === 'object') {
+                replayed.decision = { ...replayed.decision, notes: nextNotes };
+              }
+            }
+          }
+        }
         outputSink(`${JSON.stringify(replayed, null, 2)}\n`, 'stdout');
         return 0;
       }
     }
     const limits = injectedLimits !== undefined
       ? injectedLimits
-      : await readLimitsFn({ refresh: Boolean(runArgs.refresh) });
+      : await readLimitsFn({ refresh: Boolean(runArgs.refresh), now: nowMs });
     const { timeoutMs, durations } = await timing(runArgs, cacheDir);
-    const decision = decide(taskFromArgs(runArgs), limits, { timeoutMs, durations });
+    const decision = decide(taskFromArgs(runArgs), limits, { timeoutMs, durations, now: nowMs, cacheDir });
     if (!decision.ok) {
       outputSink(`${JSON.stringify({ ok: false, deferred: true, ...decision }, null, 2)}\n`, 'stdout');
       return 3;
@@ -707,6 +907,7 @@ export async function main(
       sandbox: runArgs.sandbox ? String(runArgs.sandbox) : 'workspace-write',
       idempotencyKey,
       cacheDir,
+      ...(injectedNow !== undefined ? { now: () => injectedNow } : {}),
       ...(spawnImpl ? { spawnImpl } : {}),
     });
 
