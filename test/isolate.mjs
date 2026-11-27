@@ -66,6 +66,7 @@ process.env.CMO_GROK_PROBE = '0';
 // and fake binaries, so no test may reach the real account.
 process.env.CMO_AGY_PROBE = '0';
 
-// And any fleet settings inherited from the shell, for the same reason.
+// And any fleet or machine-level Codex sandbox overrides inherited from the shell.
 delete process.env.CMO_FLEET_URL;
 delete process.env.CMO_FLEET_TOKEN;
+delete process.env.CMO_CODEX_FULL_ACCESS;

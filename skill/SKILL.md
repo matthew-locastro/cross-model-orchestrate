@@ -364,8 +364,16 @@ The factors you are analyzing, and what each one means:
 - **web** — `--web` (or `web: true` in a dispatch file) when the agent must open
   live URLs: link checks, citations, "is this still true", vendor docs. Both
   `--web` and the `research` role require network access, so Codex's default
-  sandbox is excluded unless `--full-access` is set, and the work routes to
-  Antigravity or Claude.
+  sandbox is excluded unless effective full access is on (`--full-access` /
+  `full-access: true` on the dispatch, or machine-wide `"codex": { "fullAccess": true }`
+  in `~/.config/cross-model-orchestrate/config.json` / `CMO_CODEX_FULL_ACCESS=1`,
+  overridable off with `CMO_CODEX_FULL_ACCESS=0`). When effective full access is
+  on, `cmo plan` and `cmo run` treat Codex as network-capable for `research` and
+  `--web` and launch Codex with `--dangerously-bypass-approvals-and-sandbox`
+  (shown in `cmo plan --human` notes and `cmo doctor`). Trade-off: Codex then
+  runs without its sandbox and has the same full user access that Claude and
+  Antigravity already have under `cmo`; otherwise `codex.fullAccess` defaults to
+  `false` and web/research work routes to Antigravity or Claude.
 
 The tool combines them into a tier (fast / balanced / frontier), maps that to a
 model and an effort level per vendor and picks the vendor from live headroom
@@ -578,7 +586,9 @@ a plain `agent()` only for work none of those CLIs can do:
 
 Ordinary file work is not on that list — Codex and Antigravity read, write and
 grep fine. Neither is web research: put `web: true` (or `role: research`) in the
-dispatch file and it routes to Antigravity or Claude, off sandboxed Codex.
+dispatch file and it routes to Antigravity or Claude (and to Codex as well on
+machines with `codex.fullAccess` / `CMO_CODEX_FULL_ACCESS=1` or per-dispatch
+`full-access: true`), never to sandboxed Codex.
 
 The shim costs roughly 10–15k Haiku tokens per dispatch, mostly its own prompt.
 Trivial against a substantial agent, absurd against a trivial one: batch small
@@ -667,7 +677,7 @@ not.
   what the dispatcher got wrong, and say it in the plan.
 - Never run a review on the vendor that produced the work.
 - Never send research, link checking or citation checking to a sandboxed Codex
-  dispatch: it cannot reach the network.
+  dispatch (effective full access `false`): it cannot reach the network.
 - Antigravity runs on a verified subscription sign-in and an allowlisted Gemini
   model (`^gemini-`) or not at all. Never pass a non-Gemini model to `agy`, and
   never set or suggest `GEMINI_API_KEY` or `GOOGLE_API_KEY`.

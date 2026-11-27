@@ -48,7 +48,7 @@ import {
   markClaudeSignedOut, markExhausted, markGrokUnverified, readGrokLimits, recordCodexRateLimits,
   refreshClaudeLimits, refreshCodexLimits, refreshGrokLimits,
 } from './limits.mjs';
-import { CACHE_DIR, loadConfig } from './config.mjs';
+import { CACHE_DIR, codexFullAccess, loadConfig } from './config.mjs';
 import { formatElapsed } from './durations.mjs';
 import {
   GROK_KEY_VARS, grokSessionActivity, lockGrokEnv, offSubscriptionReason, parseGrokStream, startedOffSubscription,
@@ -248,7 +248,7 @@ export function buildCommand(decision, opts) {
       args.push('-c', `model_reasoning_effort=${decision.reasoning}`);
     }
     if (schemaFile) args.push('--output-schema', schemaFile);
-    if (fullAccess) {
+    if (codexFullAccess(fullAccess || decision?.factors?.fullAccess)) {
       args.push('--dangerously-bypass-approvals-and-sandbox');
     } else {
       args.push('--sandbox', sandbox);
@@ -910,6 +910,7 @@ export async function runAgent(decision, prompt, opts = {}) {
     idempotencyKey: rawIdempotencyKey = null,
     cacheDir = CACHE_DIR,
   } = opts;
+  const effectiveFullAccess = codexFullAccess(fullAccess || decision?.factors?.fullAccess);
 
   const idempotencyKey = typeof rawIdempotencyKey === 'string' && rawIdempotencyKey.trim()
     ? rawIdempotencyKey.trim()
@@ -1041,7 +1042,7 @@ export async function runAgent(decision, prompt, opts = {}) {
           schemaFile: target.provider === 'codex'
             ? codexSchemaFile
             : target.provider === 'antigravity' ? antigravitySchemaFile : null,
-          fullAccess,
+          fullAccess: effectiveFullAccess,
           sandbox,
           allowedTools,
           prompt: targetPrompt,

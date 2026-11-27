@@ -195,8 +195,8 @@ test('README and references describe the three-vendor roster without project lea
   assert.match(workflows, /antigravity/i);
 });
 
-test('README and SKILL document idempotency-key and saved per-dispatch cache files, and version is 0.1.32', () => {
-  assert.equal(PKG.version, '0.1.32');
+test('README and SKILL document idempotency-key, saved per-dispatch cache files, codex.fullAccess and version 0.1.33', () => {
+  assert.equal(PKG.version, '0.1.33');
   for (const [label, doc] of [['README.md', README], ['skill/SKILL.md', SKILL]]) {
     assert.match(doc, /idempotency-key/, label);
     assert.match(doc, /--idempotency-key/, label);
@@ -204,6 +204,10 @@ test('README and SKILL document idempotency-key and saved per-dispatch cache fil
     assert.match(doc, /envelope\.json/, label);
     assert.match(doc, /stdout\.log/, label);
     assert.match(doc, /stderr\.log/, label);
+    assert.match(doc, /codex\.fullAccess|"fullAccess"/, label);
+    assert.match(doc, /CMO_CODEX_FULL_ACCESS/, label);
+    assert.match(doc, /--dangerously-bypass-approvals-and-sandbox/, label);
+    assert.match(doc, /same full user access/i, label);
   }
 });
 

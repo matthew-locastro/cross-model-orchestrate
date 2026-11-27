@@ -32,7 +32,9 @@ import {
 } from '../src/audit.mjs';
 import { readOutcomes, recordOutcome, VERDICTS } from '../src/outcomes.mjs';
 import { durationProfile, parseSinceMinutes } from '../src/durations.mjs';
-import { activeProviders, CACHE_DIR, loadConfig } from '../src/config.mjs';
+import {
+  activeProviders, CACHE_DIR, codexFullAccess, isExplicitFullAccess, loadConfig,
+} from '../src/config.mjs';
 import { MAX_LEASE_MS, perAgentCost } from '../src/ledger.mjs';
 import { update } from '../src/update.mjs';
 
@@ -65,7 +67,7 @@ function taskFromArgs(args) {
     needsSchema: Boolean(args.schema),
     needsRepoWrite: Boolean(args.write),
     needsWeb: Boolean(args.web),
-    fullAccess: Boolean(args['full-access']),
+    fullAccess: isExplicitFullAccess(args['full-access']),
     independentOf: args['independent-of'] || null,
     strictIndependence: Boolean(args['strict-independence']),
     pin: args.pin || null,
@@ -245,7 +247,7 @@ task options (plan, run)
   --write           the agent edits files in the working tree
   --web             the agent must open live URLs (research, link checks). Web
                     and research work goes to an active vendor with network
-                    access; never codex without --full-access.
+                    access; never codex without --full-access or codex.fullAccess.
   --independent-of  codex|claude|antigravity — run on a vendor OTHER than this one
                     (adversarial review). If none of the others can run it
                     degrades to a fresh agent on the producer's own vendor and
@@ -279,7 +281,7 @@ run options
   --cwd             working directory for the subagent  (default: cwd)
   --attempts        max attempts per provider           (default: 3)
   --no-failover     do not try the other vendor
-  --full-access     codex only: bypass the sandbox (use inside an isolated box)
+  --full-access     codex only: bypass the sandbox (or set codex.fullAccess / CMO_CODEX_FULL_ACCESS=1)
   --sandbox         codex sandbox: read-only|workspace-write|danger-full-access
 
 report options
@@ -590,7 +592,7 @@ export async function main(
       secondsFlag(planArgs, 'timeout');
     } catch (err) {
       if (!(err instanceof UsageError)) throw err;
-      process.stderr.write(`cmo plan: ${err.message}\n`);
+      outputSink(`cmo plan: ${err.message}\n`, 'stderr');
       return 2;
     }
     const limits = injectedLimits !== undefined
@@ -599,7 +601,12 @@ export async function main(
     const decision = decide(taskFromArgs(planArgs), limits, await timing(planArgs, cacheDir));
     if (args.human) {
       if (!decision.ok) {
-        process.stdout.write(`DEFER — ${decision.reason}\nresume after ${decision.resumeAfter ?? 'unknown'}\n`);
+        outputSink(
+          `DEFER — ${decision.reason}\n`
+          + (decision.notes?.length ? `notes:\n${decision.notes.map((n) => `  - ${n}`).join('\n')}\n` : '')
+          + `resume after ${decision.resumeAfter ?? 'unknown'}\n`,
+          'stdout',
+        );
         return 3;
       }
       const eff = decision.effort ? ` effort=${decision.effort}` : '';
@@ -607,7 +614,7 @@ export async function main(
       const indep = decision.independence
         ? `independence: ${decision.independence}${decision.degradedReview ? '  ← DEGRADED, verdict is not cross-vendor' : ''}\n`
         : '';
-      process.stdout.write(
+      outputSink(
         `${decision.provider} ${decision.model}${eff}${reasoning} (tier ${decision.tier}, weight ${decision.weight})\n`
         + indep
         + `why: ${decision.reason}\n`
@@ -615,10 +622,11 @@ export async function main(
         + (decision.fallbacks?.length
           ? `fallback: ${decision.fallbacks.map((f) => `${f.provider} ${f.model}`).join(' → ')}\n`
           : ''),
+        'stdout',
       );
       return 0;
     }
-    process.stdout.write(`${JSON.stringify(decision, null, 2)}\n`);
+    outputSink(`${JSON.stringify(decision, null, 2)}\n`, 'stdout');
     return decision.ok ? 0 : 3;
   }
 
@@ -697,7 +705,7 @@ export async function main(
       maxAttempts: runArgs.attempts ? Number(runArgs.attempts) : 3,
       schema,
       failover: !runArgs['no-failover'],
-      fullAccess: Boolean(runArgs['full-access']),
+      fullAccess: codexFullAccess(runArgs['full-access']),
       sandbox: runArgs.sandbox ? String(runArgs.sandbox) : 'workspace-write',
       idempotencyKey,
       cacheDir,

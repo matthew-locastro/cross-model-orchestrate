@@ -1639,3 +1639,144 @@ test('CLI flag parsing stays spaced and does not treat generic --flag=value as a
   assert.equal(receipts.length, 1);
   assert.equal(receipts[0].idempotencyKey, undefined);
 }));
+
+test('codex.fullAccess and CMO_CODEX_FULL_ACCESS drive routing, codex launch args and plan --human notes', async () => withEmptyPath(async () => {
+  const { rm } = await import('node:fs/promises');
+  const configPath = join(CONFIG_DIR, 'config.json');
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-codex-full-access-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'cmo-codex-full-access-files-'));
+  const limits = { codex: healthy(5), claude: healthy(20) };
+
+  const codexSuccessSpawn = () => {
+    const calls = [];
+    const impl = async (invocation) => {
+      calls.push(invocation);
+      const messageIndex = invocation.args.indexOf('--output-last-message');
+      if (messageIndex !== -1) {
+        await writeFile(invocation.args[messageIndex + 1], 'codex web answer', 'utf8');
+      }
+      return {
+        code: 0,
+        signal: null,
+        timedOut: false,
+        stdout: `${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 4 } })}\n`,
+        stderr: '',
+      };
+    };
+    impl.calls = calls;
+    return impl;
+  };
+
+  try {
+    // 1. Default (false): plan --human notes show false, and research cannot use codex.
+    resetConfigCache();
+    const defaultPlanOut = captureOutput();
+    assert.equal(await cmoMain(['plan', '--role', 'implement', '--human'], {
+      cacheDir,
+      outputSink: defaultPlanOut.sink,
+      limits,
+    }), 0);
+    assert.match(defaultPlanOut.text('stdout'), /notes:[\s\S]*codex full access:\s*false/i);
+
+    // 2. Config codex.fullAccess = true: plan and run route research and --web to codex and bypass sandbox.
+    await writeFile(configPath, JSON.stringify({ codex: { fullAccess: true } }), 'utf8');
+    resetConfigCache();
+
+    const cfgPlanOut = captureOutput();
+    assert.equal(await cmoMain(['plan', '--role', 'research', '--complexity', '2', '--length', 's', '--human'], {
+      cacheDir,
+      outputSink: cfgPlanOut.sink,
+      limits,
+    }), 0);
+    assert.match(cfgPlanOut.text('stdout'), /^codex /m);
+    assert.match(cfgPlanOut.text('stdout'), /notes:[\s\S]*codex full access:\s*true \(codex\.fullAccess/i);
+
+    const cfgCmd = buildCommand(
+      { provider: 'codex', model: 'gpt-5.6-luna' },
+      { cwd: '/repo', lastMessageFile: '/tmp/last.txt' },
+    );
+    assert.ok(cfgCmd.args.includes('--dangerously-bypass-approvals-and-sandbox'));
+    assert.ok(!cfgCmd.args.includes('--sandbox'));
+
+    const cfgSpawn = codexSuccessSpawn();
+    const cfgRunOut = captureOutput();
+    assert.equal(await cmoMain(
+      ['run', '--role', 'research', '--web', '--complexity', '2', '--length', 's', '--prompt', 'verify live url'],
+      { cacheDir, outputSink: cfgRunOut.sink, limits, spawnImpl: cfgSpawn },
+    ), 0);
+    assert.equal(cfgSpawn.calls.length, 1);
+    assert.equal(cfgSpawn.calls[0].binary, 'codex');
+    assert.ok(cfgSpawn.calls[0].args.includes('--dangerously-bypass-approvals-and-sandbox'));
+    assert.ok(!cfgSpawn.calls[0].args.includes('--sandbox'));
+
+    // 3. CMO_CODEX_FULL_ACCESS=0 overrides codex.fullAccess=true back to sandboxed, unless dispatch sets full-access.
+    process.env.CMO_CODEX_FULL_ACCESS = '0';
+    resetConfigCache();
+
+    const envOffDecision = decide({ role: 'research', pin: 'codex' }, limits);
+    assert.equal(envOffDecision.ok, false);
+    const envOffPlanOut = captureOutput();
+    assert.equal(await cmoMain(['plan', '--role', 'implement', '--human'], {
+      cacheDir,
+      outputSink: envOffPlanOut.sink,
+      limits,
+    }), 0);
+    assert.match(envOffPlanOut.text('stdout'), /notes:[\s\S]*codex full access:\s*false \(CMO_CODEX_FULL_ACCESS/i);
+
+    const envOffSpawn = codexSuccessSpawn();
+    const envOffRunOut = captureOutput();
+    assert.equal(await cmoMain(
+      ['run', '--role', 'implement', '--complexity', '2', '--length', 's', '--prompt', 'sandboxed edit'],
+      { cacheDir, outputSink: envOffRunOut.sink, limits, spawnImpl: envOffSpawn },
+    ), 0);
+    assert.equal(envOffSpawn.calls[0].binary, 'codex');
+    assert.ok(envOffSpawn.calls[0].args.includes('--sandbox'));
+    assert.ok(!envOffSpawn.calls[0].args.includes('--dangerously-bypass-approvals-and-sandbox'));
+
+    // Dispatch file full-access: true still enables full access when the setting is off.
+    const dispatchPath = join(workDir, 'web-codex.md');
+    writeFileSync(dispatchPath, [
+      'DISPATCH',
+      'role: research',
+      'web: true',
+      'pin: codex',
+      'full-access: true',
+      'TASK',
+      'check the docs',
+    ].join('\n'), 'utf8');
+
+    const dispatchPlanOut = captureOutput();
+    assert.equal(await cmoMain(['plan', '--dispatch', dispatchPath, '--human'], {
+      cacheDir,
+      outputSink: dispatchPlanOut.sink,
+      limits,
+    }), 0);
+    assert.match(dispatchPlanOut.text('stdout'), /^codex /m);
+    assert.match(dispatchPlanOut.text('stdout'), /notes:[\s\S]*codex full access:\s*true \(--full-access/i);
+
+    const dispatchSpawn = codexSuccessSpawn();
+    const dispatchRunOut = captureOutput();
+    assert.equal(await cmoMain(['run', '--dispatch', dispatchPath], {
+      cacheDir, outputSink: dispatchRunOut.sink, limits, spawnImpl: dispatchSpawn,
+    }), 0);
+    assert.ok(dispatchSpawn.calls[0].args.includes('--dangerously-bypass-approvals-and-sandbox'));
+
+    // 4. CMO_CODEX_FULL_ACCESS=1 overrides codex.fullAccess=false to full access.
+    await writeFile(configPath, JSON.stringify({ codex: { fullAccess: false } }), 'utf8');
+    process.env.CMO_CODEX_FULL_ACCESS = '1';
+    resetConfigCache();
+
+    const envOnSpawn = codexSuccessSpawn();
+    const envOnRunOut = captureOutput();
+    assert.equal(await cmoMain(
+      ['run', '--role', 'implement', '--web', '--prompt', 'check live endpoint'],
+      { cacheDir, outputSink: envOnRunOut.sink, limits, spawnImpl: envOnSpawn },
+    ), 0);
+    assert.equal(envOnSpawn.calls[0].binary, 'codex');
+    assert.ok(envOnSpawn.calls[0].args.includes('--dangerously-bypass-approvals-and-sandbox'));
+  } finally {
+    delete process.env.CMO_CODEX_FULL_ACCESS;
+    await rm(configPath, { force: true });
+    resetConfigCache();
+  }
+}));

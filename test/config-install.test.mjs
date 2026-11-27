@@ -115,6 +115,36 @@ test('env vars beat the config file', () => {
   }
 });
 
+test('codex.fullAccess defaults to false and CMO_CODEX_FULL_ACCESS=1 or 0 overrides config', () => {
+  const prev = process.env.CMO_CODEX_FULL_ACCESS;
+  delete process.env.CMO_CODEX_FULL_ACCESS;
+  try {
+    withConfig((config) => {
+      assert.deepEqual(config.codex, { fullAccess: false });
+    });
+    withConfig((config) => {
+      assert.equal(config.codex.fullAccess, true);
+    }, { codex: { fullAccess: true } });
+
+    process.env.CMO_CODEX_FULL_ACCESS = '0';
+    withConfig((config) => {
+      assert.equal(config.codex.fullAccess, false);
+    }, { codex: { fullAccess: true } });
+
+    process.env.CMO_CODEX_FULL_ACCESS = '1';
+    withConfig((config) => {
+      assert.equal(config.codex.fullAccess, true);
+    }, { codex: { fullAccess: false } });
+    withConfig((config) => {
+      assert.equal(config.codex.fullAccess, true);
+    });
+  } finally {
+    if (prev === undefined) delete process.env.CMO_CODEX_FULL_ACCESS;
+    else process.env.CMO_CODEX_FULL_ACCESS = prev;
+    resetConfigCache();
+  }
+});
+
 // ── install ───────────────────────────────────────────────────────────────
 
 function fakeHome(body) {
@@ -150,7 +180,7 @@ function runInstall(home, args = []) {
   );
 }
 
-function runDoctor(home, { config, stubs = [], agyProbe = false, agyResponse, agyExit = 0 } = {}) {
+function runDoctor(home, { config, stubs = [], agyProbe = false, agyResponse, agyExit = 0, envOverrides = {} } = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), 'cmo-doctor-state-'));
   const configDir = mkdtempSync(join(tmpdir(), 'cmo-doctor-config-'));
   const binDir = mkdtempSync(join(tmpdir(), 'cmo-doctor-bin-'));
@@ -171,6 +201,7 @@ function runDoctor(home, { config, stubs = [], agyProbe = false, agyResponse, ag
     for (const key of [
       'CMO_AGY_BIN', 'CMO_GROK_BIN', 'CMO_FLEET_URL', 'CMO_FLEET_TOKEN',
       'CMO_CLAUDE_CREDENTIALS', 'CMO_CODEX_SESSIONS', 'XAI_API_KEY', 'GROK_CODE_XAI_API_KEY',
+      'CMO_CODEX_FULL_ACCESS',
     ]) {
       delete env[key];
     }
@@ -182,6 +213,7 @@ function runDoctor(home, { config, stubs = [], agyProbe = false, agyResponse, ag
       CMO_CLAUDE_CLI_PROBE: '0',
       CMO_GROK_PROBE: '0',
       CMO_AGY_PROBE: agyProbe ? '1' : '0',
+      ...envOverrides,
     });
     const stdout = execFileSync(
       process.execPath,
@@ -314,6 +346,37 @@ test('doctor gives an installed but unsigned agy a sign-in todo', () => {
     assert.equal(out.code, 1);
     assert.match(out.stdout, /^\s+FAIL\s+antigravity sign-in\s+an API-key login has no subscription quota/m);
     assert.match(out.stdout, /agy\s+# sign in to a subscription account — antigravity dispatches are not routable/);
+  });
+});
+
+test('doctor shows the effective codex fullAccess setting and env override', () => {
+  fakeHome((home) => {
+    const byDefault = runDoctor(home, { config: { providers: ['codex'] }, stubs: ['codex'] });
+    assert.equal(byDefault.code, 0);
+    assert.match(byDefault.stdout, /^\s+ok\s+codex full access\s+false\b/m);
+
+    const fromConfig = runDoctor(home, {
+      config: { providers: ['codex'], codex: { fullAccess: true } },
+      stubs: ['codex'],
+    });
+    assert.equal(fromConfig.code, 0);
+    assert.match(fromConfig.stdout, /^\s+ok\s+codex full access\s+true\b/m);
+
+    const disabledByEnv = runDoctor(home, {
+      config: { providers: ['codex'], codex: { fullAccess: true } },
+      stubs: ['codex'],
+      envOverrides: { CMO_CODEX_FULL_ACCESS: '0' },
+    });
+    assert.equal(disabledByEnv.code, 0);
+    assert.match(disabledByEnv.stdout, /^\s+ok\s+codex full access\s+false\b/m);
+
+    const enabledByEnv = runDoctor(home, {
+      config: { providers: ['codex'], codex: { fullAccess: false } },
+      stubs: ['codex'],
+      envOverrides: { CMO_CODEX_FULL_ACCESS: '1' },
+    });
+    assert.equal(enabledByEnv.code, 0);
+    assert.match(enabledByEnv.stdout, /^\s+ok\s+codex full access\s+true\b/m);
   });
 });
 

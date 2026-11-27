@@ -106,10 +106,12 @@ two places:
 
 What goes to Antigravity: `research`-role dispatches (with or without `--web`)
 and anything dispatched with `--web` (`web: true` in a dispatch file) exclude
-Codex's networkless sandbox unless `--full-access` is set, so Antigravity and
-Claude serve them — with Antigravity ahead while Claude pays the orchestrator
-penalty and reserve. Antigravity also joins the cross-vendor reviewer pool and
-takes ordinary implementation work whenever its window is least used.
+Codex's networkless sandbox unless full access is on (`--full-access`,
+`codex.fullAccess: true`, or `CMO_CODEX_FULL_ACCESS=1`), so Antigravity and
+Claude serve them by default — with Antigravity ahead while Claude pays the
+orchestrator penalty and reserve. Antigravity also joins the cross-vendor
+reviewer pool and takes ordinary implementation work whenever its window is
+least used.
 
 For permissions, `cmo` passes `--dangerously-skip-permissions` to `agy` only on
 writing roles (`implement` and `mechanical` with `--write`) and omits it on
@@ -211,7 +213,7 @@ Vendor selection filters first across `activeProviders()` (`codex`, `claude` and
 3. Can it run — a provider ≥95% used, or flagged `rate_limit_reached`, is not a
    candidate. Neither is a missing CLI, an unverified Antigravity subscription,
    a signed-out Claude CLI or sandboxed Codex on `research` or `--web` work
-   (without `--full-access`).
+   (without `--full-access` or `codex.fullAccess`).
 4. **Least-used wins.** The dominant term is headroom:
    `headroomWeight` (default 40) × (100 − pressure) / 100. When one competing
    provider's pressure is at least `powerGap` points (default 20) below every
@@ -225,7 +227,8 @@ Vendor selection filters first across `activeProviders()` (`codex`, `claude` and
    `claude reserved for the orchestrator (pressure 62% ≥ 60%)`.
    `vendor: null` turns the reserve off.
 6. **Network capability and affinity** — `research` and `--web` require network
-   access, excluding Codex unless `--full-access` is passed; optional `affinity`
+   access, excluding Codex unless full access is on (`--full-access`,
+   `codex.fullAccess: true`, or `CMO_CODEX_FULL_ACCESS=1`); optional `affinity`
    entries in config can add role or web points for a specific vendor.
 7. **Tie-break** — `preference.first` (default `codex`), worth
    `weightPoints / 10` score points (default 2.5). It settles a near-tie and
@@ -306,6 +309,7 @@ flags any Codex model ID your account does not actually have.
                      "fast":     { "model": "gemini-4-hydrogen", "effort": "low" } }
   },
   "preference": { "first": "codex", "weightPoints": 25 },
+  "codex": { "fullAccess": false },
   "routing": { "headroomWeight": 40, "powerGap": 20, "powerBonus": 25 },
   "orchestrator": { "vendor": "claude", "penalty": 30, "reserveAt": 60 },
   "durationFit": { "enabled": true, "quantile": 0.75, "margin": 0.9, "minSamples": 3, "windowDays": 14 },
@@ -323,10 +327,25 @@ Or per-tier via the environment: `CMO_CODEX_FRONTIER`, `CMO_CLAUDE_BALANCED`,
 `CMO_ANTIGRAVITY_FAST`, … (Antigravity overrides must still match `^gemini-`);
 `CMO_AGY_BIN` names the `agy` binary if it is neither on `PATH` nor in
 `~/.local/bin/agy`; `CMO_AGY_PROBE=0` disables the Antigravity meter (and with
-it, Antigravity routing); and `CMO_PREFER=claude` flips the near-tie only. If
+it, Antigravity routing); `CMO_CODEX_FULL_ACCESS=1` or `0` overrides
+`codex.fullAccess` per shell or process; and `CMO_PREFER=claude` flips the
+near-tie only. If
 you drive this from a shell script or cron, set
 `"orchestrator": { "vendor": null }` — the default assumes the process doing the
 dispatching is itself a Claude session.
+
+**`codex.fullAccess` (default `false`).** By default Codex dispatches run in
+Codex's `workspace-write` sandbox (no network). Setting
+`"codex": { "fullAccess": true }` in `config.json` (or
+`CMO_CODEX_FULL_ACCESS=1`; `CMO_CODEX_FULL_ACCESS=0` forces the setting off)
+makes full access the machine default: effective full access for a dispatch is
+`true` when `--full-access` or `full-access: true` is set on the dispatch, and
+otherwise uses the setting. When on, `cmo run` launches Codex with
+`--dangerously-bypass-approvals-and-sandbox` and both `cmo plan` and `cmo run`
+treat Codex as network-capable for `research` and `--web` work. `cmo plan --human`
+shows the effective value in `notes` and `cmo doctor` prints the machine
+setting. The trade-off is plain: Codex then runs without its sandbox and has the
+same full user access that Claude and Antigravity already have under `cmo`.
 
 Claude Fable is deliberately outside the tier map (Anthropic documents it as
 substantially more consumption-intensive than Sonnet); reach it with
@@ -626,10 +645,12 @@ Everything in `cmo run` is there because of something that actually went wrong:
 | **key scrubbing** | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY` and xAI API key variables are stripped from the child env — with a key present a CLI can bill an API account instead of the subscription this tool exists to balance. |
 
 `cmo run` passes `--dangerously-skip-permissions` to Claude (and to Antigravity
-for writing roles) and can pass `--dangerously-bypass-approvals-and-sandbox` to
-Codex under `--full-access`. That is the price of unattended execution. Run it
-on a box you are willing to let an agent write to; Codex defaults to
-`workspace-write`, not full access.
+for writing roles) and passes `--dangerously-bypass-approvals-and-sandbox` to
+Codex under `--full-access`, `codex.fullAccess: true`, or
+`CMO_CODEX_FULL_ACCESS=1`. That is the price of unattended execution. Run it on
+a box you are willing to let an agent write to; Codex defaults to
+`workspace-write`, and enabling full access gives Codex the same full user
+access that Claude and Antigravity already have under `cmo`.
 
 Exit codes: `0` success · `1` the agent failed · `2` bad usage · `3` deferred, no
 provider had the headroom.

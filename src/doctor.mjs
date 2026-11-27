@@ -11,7 +11,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
-import { activeProviders, loadConfig, TIERS } from './config.mjs';
+import { activeProviders, codexFullAccessInfo, loadConfig, TIERS } from './config.mjs';
 import { GROK_KEY_VARS, lockGrokEnv, parseGrokModels } from './grok.mjs';
 import {
   readAntigravityLimits, readClaudeLimits, readCodexLimits, readGrokLimits, readLimits,
@@ -211,6 +211,14 @@ export async function doctor({ skillName = 'cross-model-orchestrate', log = (l) 
     line(codexVersion ? OK : WARN, 'codex',
       codexVersion ?? `not on PATH — ${INSTALL_COMMAND.codex}`);
     if (!codexVersion) todo.push([INSTALL_COMMAND.codex, 'an active vendor is unavailable']);
+    const codexAccess = codexFullAccessInfo(false, config);
+    line(
+      OK,
+      'codex full access',
+      codexAccess.fullAccess
+        ? `true (${codexAccess.source} — --dangerously-bypass-approvals-and-sandbox, network enabled)`
+        : `false (${codexAccess.source === 'default' ? 'sandbox: workspace-write, no network' : `${codexAccess.source} — sandbox: workspace-write, no network`})`,
+    );
   }
   if (active.has('claude')) {
     line(claudeVersion ? OK : WARN, 'claude',

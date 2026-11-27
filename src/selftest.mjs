@@ -6,6 +6,7 @@
 // than read it. The model names in the output come from your config, so this
 // doubles as a check that an override landed.
 
+import { loadConfig } from './config.mjs';
 import { decide } from './policy.mjs';
 import { buildCommand, childEnv, classifyFailure, extractJson, parseClaudeStdout } from './run.mjs';
 import { parseClaudeAuthFailure } from './limits.mjs';
@@ -128,17 +129,20 @@ const CASES = [
     expect: (d) => d.ok === false,
   },
   {
-    name: 'research goes to antigravity when its subscription meter is verified',
+    name: 'research goes to antigravity when its subscription meter is verified (unless codex.fullAccess)',
     task: { role: 'research', complexity: 2, length: 's' },
     limits: { codex: HEALTHY, claude: HEALTHY, antigravity: ANTIGRAVITY_OK },
-    expect: (d) => d.provider === 'antigravity'
-      && !d.fallbacks.some((f) => f.provider === 'codex'),
+    expect: (d) => (loadConfig().codex?.fullAccess
+      ? d.provider === 'codex' && d.fallbacks.some((f) => f.provider === 'antigravity')
+      : d.provider === 'antigravity' && !d.fallbacks.some((f) => f.provider === 'codex')),
   },
   {
-    name: 'web work never goes to codex',
+    name: 'web work never goes to sandboxed codex (routes to codex when codex.fullAccess is on)',
     task: { role: 'implement', complexity: 3, length: 'm', needsWeb: true },
     limits: { codex: HEALTHY, claude: HEALTHY, antigravity: ANTIGRAVITY_SIGNED_OUT },
-    expect: (d) => d.provider === 'claude' && !d.fallbacks.some((f) => f.provider === 'codex'),
+    expect: (d) => (loadConfig().codex?.fullAccess
+      ? d.provider === 'codex'
+      : d.provider === 'claude' && !d.fallbacks.some((f) => f.provider === 'codex')),
   },
   {
     name: 'even headroom tie-breaks to codex and keeps claude in reserve',
@@ -223,8 +227,9 @@ const CASES = [
     name: 'research uses antigravity web capability when no other web vendor can run',
     task: { role: 'research', complexity: 2, length: 's' },
     limits: { codex: atPercent(15), claude: SPENT, antigravity: antigravityAt(25) },
-    expect: (d) => d.provider === 'antigravity'
-      && !d.fallbacks.some((f) => f.provider === 'codex'),
+    expect: (d) => (loadConfig().codex?.fullAccess
+      ? d.provider === 'codex'
+      : d.provider === 'antigravity' && !d.fallbacks.some((f) => f.provider === 'codex')),
   },
 ];
 
