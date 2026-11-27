@@ -12,7 +12,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, readFileSync, exist
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { DEFAULT_MODELS, loadConfig, resetConfigCache } from '../src/config.mjs';
+import * as configExports from '../src/config.mjs';
+import { codexFullAccess, DEFAULT_MODELS, loadConfig, resetConfigCache } from '../src/config.mjs';
 import { decide } from '../src/policy.mjs';
 import { nextSteps } from '../src/banner.mjs';
 import { install, uninstall, packageIsEphemeral, PACKAGE_ROOT } from '../src/install.mjs';
@@ -138,6 +139,21 @@ test('codex.fullAccess defaults to false and CMO_CODEX_FULL_ACCESS=1 or 0 overri
     withConfig((config) => {
       assert.equal(config.codex.fullAccess, true);
     });
+
+    delete process.env.CMO_CODEX_FULL_ACCESS;
+    withConfig((config) => {
+      // Env changes after loadConfig must not be re-read behind the cached config.
+      process.env.CMO_CODEX_FULL_ACCESS = '1';
+      assert.equal(codexFullAccess(false, config), false);
+      assert.equal(codexFullAccess(true, config), true);
+      assert.equal(codexFullAccess('true', config), false);
+      const d = decide({ role: 'implement', complexity: 2, length: 's' }, { codex: healthy(5), claude: healthy(20) });
+      assert.equal(d.factors.fullAccess, false);
+      assert.ok(d.notes.every((n) => !n.includes('CMO_CODEX_FULL_ACCESS')));
+    }, { codex: { fullAccess: false } });
+
+    assert.equal('isExplicitFullAccess' in configExports, false);
+    assert.equal('codexFullAccessInfo' in configExports, false);
   } finally {
     if (prev === undefined) delete process.env.CMO_CODEX_FULL_ACCESS;
     else process.env.CMO_CODEX_FULL_ACCESS = prev;

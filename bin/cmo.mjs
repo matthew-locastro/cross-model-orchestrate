@@ -32,9 +32,7 @@ import {
 } from '../src/audit.mjs';
 import { readOutcomes, recordOutcome, VERDICTS } from '../src/outcomes.mjs';
 import { durationProfile, parseSinceMinutes } from '../src/durations.mjs';
-import {
-  activeProviders, CACHE_DIR, codexFullAccess, isExplicitFullAccess, loadConfig,
-} from '../src/config.mjs';
+import { activeProviders, CACHE_DIR, loadConfig } from '../src/config.mjs';
 import { MAX_LEASE_MS, perAgentCost } from '../src/ledger.mjs';
 import { update } from '../src/update.mjs';
 
@@ -67,7 +65,7 @@ function taskFromArgs(args) {
     needsSchema: Boolean(args.schema),
     needsRepoWrite: Boolean(args.write),
     needsWeb: Boolean(args.web),
-    fullAccess: isExplicitFullAccess(args['full-access']),
+    fullAccess: args['full-access'] === true,
     independentOf: args['independent-of'] || null,
     strictIndependence: Boolean(args['strict-independence']),
     pin: args.pin || null,
@@ -705,7 +703,7 @@ export async function main(
       maxAttempts: runArgs.attempts ? Number(runArgs.attempts) : 3,
       schema,
       failover: !runArgs['no-failover'],
-      fullAccess: codexFullAccess(runArgs['full-access']),
+      fullAccess: runArgs['full-access'] === true,
       sandbox: runArgs.sandbox ? String(runArgs.sandbox) : 'workspace-write',
       idempotencyKey,
       cacheDir,

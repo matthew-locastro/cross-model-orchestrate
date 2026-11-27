@@ -56,7 +56,7 @@
 // after the tier is set (see `applyEfficiency`). Bulk reading is cheap work on
 // an expensive model, and that is the most common way a fan-out wastes quota.
 
-import { activeProviders, codexFullAccess, codexFullAccessInfo, loadConfig, PROVIDERS, TIERS } from './config.mjs';
+import { activeProviders, codexFullAccess, loadConfig, PROVIDERS, TIERS } from './config.mjs';
 import { expectedDuration, formatElapsed } from './durations.mjs';
 import { providerPressure } from './pace.mjs';
 
@@ -278,7 +278,6 @@ function formatPoints(n) {
 export function rankProviders(task, states, preference = loadConfig().preference, affinity = loadConfig().affinity) {
   const config = loadConfig();
   const providers = activeProviders(config);
-  const fullAccess = codexFullAccess(task?.fullAccess, config);
   const routing = config.routing;
   const orchestrator = config.orchestrator;
   const headroomWeight = Number(routing.headroomWeight) || 0;
@@ -320,7 +319,7 @@ export function rankProviders(task, states, preference = loadConfig().preference
     // Research and work that has to open live URLs cannot run in Codex's
     // networkless sandbox. Full access supplies a network for either case.
     const needsNetwork = task.needsWeb || task.role === 'research';
-    if (needsNetwork && CAPABILITIES[id]?.web === false && !(id === 'codex' && fullAccess)) {
+    if (needsNetwork && CAPABILITIES[id]?.web === false && !(id === 'codex' && task.fullAccess)) {
       incapable = true;
       score -= 1000;
       why.push(`${id} has no network in its sandbox, so it cannot do research or open and verify URLs`);
@@ -550,7 +549,6 @@ export function fitToTimeout(usable, { role, tier, timeoutMs, durations, fit = l
 export function decide(task = {}, limits = {}, opts = {}) {
   const now = Number.isFinite(opts.now) ? opts.now : Date.now();
   const config = loadConfig();
-  const codexAccess = codexFullAccessInfo(task.fullAccess, config);
   const normalized = {
     role: ROLES[task.role] != null ? task.role : 'implement',
     complexity: clampComplexity(task.complexity),
@@ -560,7 +558,7 @@ export function decide(task = {}, limits = {}, opts = {}) {
     needsRepoWrite: Boolean(task.needsRepoWrite),
     needsWeb: Boolean(task.needsWeb),
     // codex run with full access (--full-access or codex.fullAccess) has a network, so it can do web work.
-    fullAccess: codexAccess.fullAccess,
+    fullAccess: codexFullAccess(task.fullAccess, config),
     independentOf: isProvider(task.independentOf) ? task.independentOf : null,
     // Opt out of degrading: refuse rather than review on the producer's vendor.
     strictIndependence: Boolean(task.strictIndependence),
@@ -583,9 +581,9 @@ export function decide(task = {}, limits = {}, opts = {}) {
   const notes = [...efficiency.notes];
   const providers = activeProviders(config);
   if (providers.includes('codex') || normalized.pin === 'codex') {
-    notes.push(codexAccess.fullAccess
-      ? `codex full access: true (${codexAccess.source} — sandbox bypassed, network enabled)`
-      : `codex full access: false (${codexAccess.source === 'default' ? 'sandboxed, no network' : `${codexAccess.source} — sandboxed, no network`})`);
+    notes.push(normalized.fullAccess
+      ? 'codex full access: true (sandbox bypassed, network enabled)'
+      : 'codex full access: false (sandboxed, no network)');
   }
 
   const bands = config.pressure;

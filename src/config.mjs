@@ -359,27 +359,9 @@ export function activeProviders(config = loadConfig()) {
   return [...new Set(configured.filter((provider) => PROVIDERS.includes(provider)))];
 }
 
-/** True when a CLI flag or dispatch boolean value explicitly enables full access. */
-export function isExplicitFullAccess(explicit = false) {
-  return explicit === true
-    || (typeof explicit === 'string' && /^(1|true|yes|on)$/i.test(explicit.trim()));
-}
-
 /** Effective Codex full access: per-dispatch flag/header, else the machine setting. */
 export function codexFullAccess(explicit = false, config = loadConfig()) {
-  return isExplicitFullAccess(explicit) || Boolean(config?.codex?.fullAccess);
-}
-
-/** Effective Codex full access paired with the source that set it. */
-export function codexFullAccessInfo(explicit = false, config = loadConfig()) {
-  const perDispatch = isExplicitFullAccess(explicit);
-  const fullAccess = perDispatch || Boolean(config?.codex?.fullAccess);
-  const source = perDispatch
-    ? '--full-access'
-    : envBoolean(process.env.CMO_CODEX_FULL_ACCESS) !== undefined
-      ? 'CMO_CODEX_FULL_ACCESS'
-      : fullAccess ? 'codex.fullAccess' : 'default';
-  return { fullAccess, source };
+  return explicit === true || config?.codex?.fullAccess === true;
 }
 
 export function resetConfigCache() {

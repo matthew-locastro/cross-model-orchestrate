@@ -248,7 +248,7 @@ export function buildCommand(decision, opts) {
       args.push('-c', `model_reasoning_effort=${decision.reasoning}`);
     }
     if (schemaFile) args.push('--output-schema', schemaFile);
-    if (codexFullAccess(fullAccess || decision?.factors?.fullAccess)) {
+    if (fullAccess) {
       args.push('--dangerously-bypass-approvals-and-sandbox');
     } else {
       args.push('--sandbox', sandbox);
@@ -910,7 +910,7 @@ export async function runAgent(decision, prompt, opts = {}) {
     idempotencyKey: rawIdempotencyKey = null,
     cacheDir = CACHE_DIR,
   } = opts;
-  const effectiveFullAccess = codexFullAccess(fullAccess || decision?.factors?.fullAccess);
+  const effectiveFullAccess = codexFullAccess(fullAccess === true || decision?.factors?.fullAccess === true);
 
   const idempotencyKey = typeof rawIdempotencyKey === 'string' && rawIdempotencyKey.trim()
     ? rawIdempotencyKey.trim()

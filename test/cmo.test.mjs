@@ -19,8 +19,8 @@ import {
   windowKeyForMinutes,
   normalizeReset,
 } from '../src/limits.mjs';
-import { decide, providerState, tierFor, pressure } from '../src/policy.mjs';
-import { CACHE_DIR, CONFIG_DIR, DEFAULT_MODELS, loadConfig, resetConfigCache } from '../src/config.mjs';
+import { decide, providerState, rankProviders, tierFor, pressure } from '../src/policy.mjs';
+import { CACHE_DIR, codexFullAccess, CONFIG_DIR, DEFAULT_MODELS, loadConfig, resetConfigCache } from '../src/config.mjs';
 import { packageIsEphemeral } from '../src/install.mjs';
 import {
   backoffMs,
@@ -1689,14 +1689,40 @@ test('codex.fullAccess and CMO_CODEX_FULL_ACCESS drive routing, codex launch arg
       limits,
     }), 0);
     assert.match(cfgPlanOut.text('stdout'), /^codex /m);
-    assert.match(cfgPlanOut.text('stdout'), /notes:[\s\S]*codex full access:\s*true \(codex\.fullAccess/i);
+    assert.match(cfgPlanOut.text('stdout'), /notes:[\s\S]*codex full access:\s*true\b/i);
+
+    // Pure helpers respect the fullAccess argument they are given instead of re-reading global config.
+    const sandboxedCmd = buildCommand(
+      { provider: 'codex', model: 'gpt-5.6-luna', factors: { fullAccess: true } },
+      { cwd: '/repo', lastMessageFile: '/tmp/last.txt', fullAccess: false },
+    );
+    assert.ok(sandboxedCmd.args.includes('--sandbox'));
+    assert.ok(!sandboxedCmd.args.includes('--dangerously-bypass-approvals-and-sandbox'));
 
     const cfgCmd = buildCommand(
       { provider: 'codex', model: 'gpt-5.6-luna' },
-      { cwd: '/repo', lastMessageFile: '/tmp/last.txt' },
+      { cwd: '/repo', lastMessageFile: '/tmp/last.txt', fullAccess: codexFullAccess(false) },
     );
     assert.ok(cfgCmd.args.includes('--dangerously-bypass-approvals-and-sandbox'));
     assert.ok(!cfgCmd.args.includes('--sandbox'));
+
+    const states = {
+      codex: providerState(limits.codex),
+      claude: providerState(limits.claude),
+    };
+    const rankedSandboxed = rankProviders({ role: 'research', fullAccess: false }, states);
+    assert.equal(rankedSandboxed.find((c) => c.provider === 'codex')?.incapable, true);
+    const rankedFullAccess = rankProviders({ role: 'research', fullAccess: true }, states);
+    assert.equal(rankedFullAccess.find((c) => c.provider === 'codex')?.incapable, undefined);
+
+    const directRunSpawn = codexSuccessSpawn();
+    const directEnv = await runAgent(
+      { provider: 'codex', model: 'gpt-5.6-luna', tier: 'fast' },
+      'direct runAgent resolves codex.fullAccess once',
+      { spawnImpl: directRunSpawn, cacheDir },
+    );
+    assert.equal(directEnv.ok, true);
+    assert.ok(directRunSpawn.calls[0].args.includes('--dangerously-bypass-approvals-and-sandbox'));
 
     const cfgSpawn = codexSuccessSpawn();
     const cfgRunOut = captureOutput();
@@ -1721,7 +1747,7 @@ test('codex.fullAccess and CMO_CODEX_FULL_ACCESS drive routing, codex launch arg
       outputSink: envOffPlanOut.sink,
       limits,
     }), 0);
-    assert.match(envOffPlanOut.text('stdout'), /notes:[\s\S]*codex full access:\s*false \(CMO_CODEX_FULL_ACCESS/i);
+    assert.match(envOffPlanOut.text('stdout'), /notes:[\s\S]*codex full access:\s*false\b/i);
 
     const envOffSpawn = codexSuccessSpawn();
     const envOffRunOut = captureOutput();
@@ -1752,7 +1778,7 @@ test('codex.fullAccess and CMO_CODEX_FULL_ACCESS drive routing, codex launch arg
       limits,
     }), 0);
     assert.match(dispatchPlanOut.text('stdout'), /^codex /m);
-    assert.match(dispatchPlanOut.text('stdout'), /notes:[\s\S]*codex full access:\s*true \(--full-access/i);
+    assert.match(dispatchPlanOut.text('stdout'), /notes:[\s\S]*codex full access:\s*true\b/i);
 
     const dispatchSpawn = codexSuccessSpawn();
     const dispatchRunOut = captureOutput();
