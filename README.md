@@ -521,6 +521,16 @@ const verdict = await agent(
 )
 ```
 
+Every dispatch saves its final envelope and raw vendor streams under
+`~/.cache/cross-model-orchestrate/dispatch/<dispatchId>/` (`envelope.json`,
+`stdout.log` and `stderr.log`, or under `CMO_CACHE_DIR`). Add
+`idempotency-key: <key>` to the `DISPATCH` header (or pass
+`--idempotency-key <key>` to `cmo run`) so retried steps never pay twice: `cmo`
+records the key in the receipt and, before running a vendor, if an earlier
+receipt with the same key finished `ok` and its saved `envelope.json` exists,
+prints that envelope with `"replayed": true` and the original `dispatchId`,
+exits `0` and runs nothing. No locking is taken — callers own concurrency.
+
 This is the whole design, and it was learned the hard way. Earlier versions put
 the task in the shim's prompt and instructed it not to do the work. On measured
 runs a third, then two thirds, of agents ignored that and answered from their
@@ -744,8 +754,9 @@ they never called the dispatcher and answered by themselves.
 
 Every real dispatch writes one line to
 `~/.cache/cross-model-orchestrate/dispatches.jsonl` with a random id that also
-comes back in the envelope as `dispatchId`. The gap between agents you spawned
-and receipts on record is the number that never ran.
+comes back in the envelope as `dispatchId`. `--since` accepts plain minutes
+(`30`) or durations (`30m`, `2h`, `1d`), matching `cmo report --since`. The gap
+between agents you spawned and receipts on record is the number that never ran.
 
 ## Before a real release
 

@@ -15,7 +15,7 @@
 // Before this, answering "did the fan-out balance?" meant grepping session
 // rollout files on both vendors and guessing.
 
-import { appendFile, mkdir, open, readFile } from 'node:fs/promises';
+import { appendFile, mkdir, open, readFile, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
@@ -23,6 +23,7 @@ import { activeProviders, CACHE_DIR, PROVIDERS } from './config.mjs';
 import { REQUIRES_SUBSCRIPTION_CHECK } from './policy.mjs';
 
 export const AUDIT_FILE = join(CACHE_DIR, 'dispatches.jsonl');
+const SAFE_DISPATCH_ID_RE = /^[A-Za-z0-9._-]+$/;
 
 /** Keep the file bounded; nobody needs last month's dispatches. */
 const MAX_LINES = 5_000;
@@ -31,17 +32,80 @@ export function newDispatchId() {
   return `d-${randomUUID().slice(0, 12)}`;
 }
 
+const defaultCacheDir = () => process.env.CMO_CACHE_DIR || CACHE_DIR;
+
+export function dispatchDir(dispatchId, { cacheDir = defaultCacheDir() } = {}) {
+  if (
+    typeof dispatchId !== 'string'
+    || !dispatchId
+    || dispatchId === '.'
+    || dispatchId === '..'
+    || !SAFE_DISPATCH_ID_RE.test(dispatchId)
+  ) {
+    return null;
+  }
+  return join(cacheDir, 'dispatch', dispatchId);
+}
+
 /**
  * Append one receipt. Never throws: a dispatch must not fail because the audit
  * log is unwritable.
  */
-export async function record(entry) {
+export async function record(entry, { cacheDir = defaultCacheDir() } = {}) {
   try {
-    await mkdir(CACHE_DIR, { recursive: true });
-    await appendFile(AUDIT_FILE, `${JSON.stringify(entry)}\n`, 'utf8');
+    await mkdir(cacheDir, { recursive: true });
+    await appendFile(join(cacheDir, 'dispatches.jsonl'), `${JSON.stringify(entry)}\n`, 'utf8');
   } catch {
     /* observability is not worth failing a run over */
   }
+}
+
+/**
+ * Save the final envelope and raw vendor stdout/stderr under
+ * `<cacheDir>/dispatch/<dispatchId>/`. Never throws; callers own concurrency.
+ */
+export async function saveDispatchArtifacts(
+  dispatchId,
+  { envelope, stdout = '', stderr = '' },
+  { cacheDir = defaultCacheDir() } = {},
+) {
+  const dir = dispatchDir(dispatchId, { cacheDir });
+  if (!dir) return;
+  try {
+    await mkdir(dir, { recursive: true });
+    await Promise.all([
+      writeFile(join(dir, 'envelope.json'), `${JSON.stringify(envelope, null, 2)}\n`, 'utf8'),
+      writeFile(join(dir, 'stdout.log'), String(stdout ?? ''), 'utf8'),
+      writeFile(join(dir, 'stderr.log'), String(stderr ?? ''), 'utf8'),
+    ]);
+  } catch {
+    /* cache persistence must not fail a completed dispatch */
+  }
+}
+
+/**
+ * Look up the newest `ok: true` receipt matching `idempotencyKey` whose saved
+ * `envelope.json` still exists, and return that envelope with `replayed: true`
+ * and the original `dispatchId`. No locking: callers own concurrency.
+ */
+export async function findIdempotentReplay(idempotencyKey, { cacheDir = defaultCacheDir() } = {}) {
+  if (typeof idempotencyKey !== 'string' || !idempotencyKey) return null;
+  const rows = await readAudit({ cacheDir });
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i];
+    if (!row || row.idempotencyKey !== idempotencyKey || row.ok !== true) continue;
+    const dir = dispatchDir(row.id, { cacheDir });
+    if (!dir) continue;
+    try {
+      const saved = JSON.parse(await readFile(join(dir, 'envelope.json'), 'utf8'));
+      if (saved && typeof saved === 'object' && !Array.isArray(saved) && saved.ok === true) {
+        return { ...saved, dispatchId: row.id, replayed: true };
+      }
+    } catch {
+      /* missing or unreadable saved envelope: check older receipts or re-run */
+    }
+  }
+  return null;
 }
 
 /**
@@ -63,7 +127,7 @@ async function readTail(path, bytes) {
   }
 }
 
-export async function readAudit({ sinceMs = null, tailBytes = null, cacheDir = CACHE_DIR } = {}) {
+export async function readAudit({ sinceMs = null, tailBytes = null, cacheDir = defaultCacheDir() } = {}) {
   let text = '';
   try {
     const auditFile = join(cacheDir, 'dispatches.jsonl');
@@ -77,7 +141,12 @@ export async function readAudit({ sinceMs = null, tailBytes = null, cacheDir = C
     if (!line) continue;
     try {
       const row = JSON.parse(line);
-      if (sinceMs == null || (row.at ?? 0) >= sinceMs) rows.push(row);
+      const rowAt = typeof row.at === 'number'
+        ? row.at
+        : (typeof row.at === 'string' && row.at.trim()
+          ? (Number.isFinite(Number(row.at)) ? Number(row.at) : Date.parse(row.at))
+          : 0);
+      if (sinceMs == null || (Number.isFinite(rowAt) ? rowAt : 0) >= sinceMs) rows.push(row);
     } catch {
       /* a torn line is not worth failing the report over */
     }

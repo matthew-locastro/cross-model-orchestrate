@@ -20,7 +20,7 @@
 //   ...everything from here down is the prompt...
 
 const FLAGS = new Set([
-  'role', 'complexity', 'length', 'context-tokens', 'independent-of',
+  'role', 'complexity', 'length', 'context-tokens', 'independent-of', 'idempotency-key',
   'cwd', 'timeout', 'idle-timeout', 'max-runtime', 'schema', 'pin', 'model', 'sandbox', 'attempts',
 ]);
 const BOOLEANS = new Set(['write', 'web', 'strict-independence', 'no-failover', 'full-access', 'refresh']);

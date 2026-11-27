@@ -1315,3 +1315,240 @@ test('cmoMain injects limits or readLimits for report and limits without probing
     globalThis.fetch = oldFetch;
   }
 });
+
+async function withEmptyPath(fn) {
+  const emptyBin = mkdtempSync(join(tmpdir(), 'cmo-empty-path-'));
+  const prevPath = process.env.PATH;
+  process.env.PATH = emptyBin;
+  try {
+    return await fn();
+  } finally {
+    if (prevPath === undefined) delete process.env.PATH;
+    else process.env.PATH = prevPath;
+  }
+}
+
+test('every dispatch saves envelope.json, stdout.log and stderr.log under dispatch/<dispatchId>', async () => withEmptyPath(async () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-dispatch-artifacts-'));
+  const rawOut = `${claudeOut('artifact body')}\n`;
+  const rawErr = 'benign vendor warning on stderr\n';
+  const spawnImpl = fakeSpawn([{ code: 0, stdout: rawOut, stderr: rawErr }]);
+  const runOut = captureOutput();
+
+  const code = await cmoMain(
+    ['run', '--role', 'implement', '--complexity', '2', '--length', 's', '--prompt', 'build it'],
+    {
+      cacheDir,
+      outputSink: runOut.sink,
+      limits: { codex: spent(), claude: healthy(10) },
+      spawnImpl,
+    },
+  );
+  assert.equal(code, 0);
+  const printed = JSON.parse(runOut.text('stdout'));
+  assert.equal(printed.ok, true);
+  assert.equal(Object.hasOwn(printed, 'replayed'), false);
+
+  const dir = join(cacheDir, 'dispatch', printed.dispatchId);
+  const savedEnvelope = JSON.parse(await readFile(join(dir, 'envelope.json'), 'utf8'));
+  const savedStdout = await readFile(join(dir, 'stdout.log'), 'utf8');
+  const savedStderr = await readFile(join(dir, 'stderr.log'), 'utf8');
+  assert.deepEqual(savedEnvelope, printed);
+  assert.equal(savedStdout, rawOut);
+  assert.equal(savedStderr, rawErr);
+
+  // Failed dispatches also persist their envelope and raw logs.
+  const failSpawn = fakeSpawn([{ code: 2, stdout: 'bad flag stdout\n', stderr: 'fatal flag error\n' }]);
+  const failOut = captureOutput();
+  const failCode = await cmoMain(
+    ['run', '--role', 'implement', '--prompt', 'broken'],
+    {
+      cacheDir,
+      outputSink: failOut.sink,
+      limits: { codex: spent(), claude: healthy(10) },
+      spawnImpl: failSpawn,
+    },
+  );
+  assert.equal(failCode, 1);
+  const failedPrinted = JSON.parse(failOut.text('stdout'));
+  const failDir = join(cacheDir, 'dispatch', failedPrinted.dispatchId);
+  assert.deepEqual(JSON.parse(await readFile(join(failDir, 'envelope.json'), 'utf8')), failedPrinted);
+  assert.equal(await readFile(join(failDir, 'stdout.log'), 'utf8'), 'bad flag stdout\n');
+  assert.equal(await readFile(join(failDir, 'stderr.log'), 'utf8'), 'fatal flag error\n');
+}));
+
+test('cmo run --idempotency-key and dispatch file idempotency-key replay ok envelopes without running a vendor', async () => withEmptyPath(async () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-idempotency-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'cmo-idempotency-files-'));
+  const dispatchPath = join(workDir, 'task.md');
+  writeFileSync(dispatchPath, [
+    'DISPATCH',
+    'role: implement',
+    'complexity: 2',
+    'length: s',
+    'idempotency-key: unit-42',
+    'TASK',
+    'implement unit 42',
+  ].join('\n'), 'utf8');
+
+  const spawnImpl = fakeSpawn([{ code: 0, stdout: claudeOut('completed unit 42'), stderr: '' }]);
+  const firstOut = captureOutput();
+  const firstCode = await cmoMain(['run', '--dispatch', dispatchPath], {
+    cacheDir,
+    outputSink: firstOut.sink,
+    limits: { codex: spent(), claude: healthy(10) },
+    spawnImpl,
+  });
+  assert.equal(firstCode, 0);
+  assert.equal(spawnImpl.calls.length, 1);
+  const firstEnvelope = JSON.parse(firstOut.text('stdout'));
+  assert.equal(firstEnvelope.ok, true);
+  assert.equal(firstEnvelope.result, 'completed unit 42');
+  assert.equal(Object.hasOwn(firstEnvelope, 'replayed'), false);
+
+  const receiptsAfterFirst = await readAudit({ cacheDir });
+  assert.equal(receiptsAfterFirst.length, 1);
+  assert.equal(receiptsAfterFirst[0].idempotencyKey, 'unit-42');
+
+  // Second run with the same key: even with exhausted limits and a throwing readLimits/spawn,
+  // it prints the saved envelope with replayed: true and original dispatchId, exits 0, and runs nothing.
+  const replayOut = captureOutput();
+  const replayCode = await cmoMain(['run', '--dispatch', dispatchPath], {
+    cacheDir,
+    outputSink: replayOut.sink,
+    readLimits: async () => { throw new Error('replay must not probe meters'); },
+    spawnImpl: async () => { throw new Error('replay must not spawn a vendor'); },
+  });
+  assert.equal(replayCode, 0);
+  const replayEnvelope = JSON.parse(replayOut.text('stdout'));
+  assert.deepEqual(replayEnvelope, { ...firstEnvelope, replayed: true });
+  assert.equal(replayEnvelope.dispatchId, firstEnvelope.dispatchId);
+  assert.equal((await readAudit({ cacheDir })).length, 1, 'replay writes no duplicate receipt');
+
+  // CLI --idempotency-key overrides dispatch file key, so a new key runs fresh.
+  const overrideSpawn = fakeSpawn([{ code: 0, stdout: claudeOut('override result'), stderr: '' }]);
+  const overrideOut = captureOutput();
+  assert.equal(await cmoMain(['run', '--dispatch', dispatchPath, '--idempotency-key', 'unit-43'], {
+    cacheDir,
+    outputSink: overrideOut.sink,
+    limits: { codex: spent(), claude: healthy(10) },
+    spawnImpl: overrideSpawn,
+  }), 0);
+  assert.equal(overrideSpawn.calls.length, 1);
+  const overrideEnvelope = JSON.parse(overrideOut.text('stdout'));
+  assert.notEqual(overrideEnvelope.dispatchId, firstEnvelope.dispatchId);
+  assert.equal(Object.hasOwn(overrideEnvelope, 'replayed'), false);
+
+  // Replaying via CLI --idempotency-key also hits without a dispatch file.
+  const cliReplayOut = captureOutput();
+  assert.equal(await cmoMain(['run', '--idempotency-key', 'unit-43', '--prompt', 'anything'], {
+    cacheDir,
+    outputSink: cliReplayOut.sink,
+    readLimits: async () => { throw new Error('replay must not probe meters'); },
+    spawnImpl: async () => { throw new Error('replay must not spawn a vendor'); },
+  }), 0);
+  assert.deepEqual(JSON.parse(cliReplayOut.text('stdout')), { ...overrideEnvelope, replayed: true });
+
+  // Empty --idempotency-key is a usage error (exit 2).
+  const badKeyOut = captureOutput();
+  assert.equal(await cmoMain(['run', '--idempotency-key', '--prompt', 'anything'], {
+    cacheDir,
+    outputSink: badKeyOut.sink,
+  }), 2);
+  assert.match(badKeyOut.text('stderr'), /idempotency-key/);
+}));
+
+test('failed receipts or missing saved envelopes do not replay and re-run cleanly', async () => withEmptyPath(async () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-idempotency-retry-'));
+  const limits = { codex: spent(), claude: healthy(10) };
+
+  // 1. First run fails: records key on ok:false receipt, saves failed envelope, must NOT replay next time.
+  const failSpawn = fakeSpawn([{ code: 2, stdout: '', stderr: 'fatal error' }]);
+  const failOut = captureOutput();
+  assert.equal(await cmoMain(['run', '--idempotency-key', 'retry-key', '--prompt', 'try 1'], {
+    cacheDir, outputSink: failOut.sink, limits, spawnImpl: failSpawn,
+  }), 1);
+  const failReceipts = await readAudit({ cacheDir });
+  assert.equal(failReceipts.length, 1);
+  assert.equal(failReceipts[0].ok, false);
+  assert.equal(failReceipts[0].idempotencyKey, 'retry-key');
+
+  // 2. Second run with same key runs the vendor and succeeds.
+  const okSpawn = fakeSpawn([{ code: 0, stdout: claudeOut('fixed on try 2'), stderr: '' }]);
+  const okOut = captureOutput();
+  assert.equal(await cmoMain(['run', '--idempotency-key', 'retry-key', '--prompt', 'try 2'], {
+    cacheDir, outputSink: okOut.sink, limits, spawnImpl: okSpawn,
+  }), 0);
+  assert.equal(okSpawn.calls.length, 1);
+  const okEnvelope = JSON.parse(okOut.text('stdout'));
+  assert.equal(Object.hasOwn(okEnvelope, 'replayed'), false);
+
+  // 3. Delete the saved envelope.json: with no saved envelope, cmo must run again rather than fail or replay nothing.
+  const { rm } = await import('node:fs/promises');
+  await rm(join(cacheDir, 'dispatch', okEnvelope.dispatchId, 'envelope.json'));
+  const rerunSpawn = fakeSpawn([{ code: 0, stdout: claudeOut('rebuilt after cache eviction'), stderr: '' }]);
+  const rerunOut = captureOutput();
+  assert.equal(await cmoMain(['run', '--idempotency-key', 'retry-key', '--prompt', 'try 3'], {
+    cacheDir, outputSink: rerunOut.sink, limits, spawnImpl: rerunSpawn,
+  }), 0);
+  assert.equal(rerunSpawn.calls.length, 1);
+  const rerunEnvelope = JSON.parse(rerunOut.text('stdout'));
+  assert.notEqual(rerunEnvelope.dispatchId, okEnvelope.dispatchId);
+  assert.equal(rerunEnvelope.result, 'rebuilt after cache eviction');
+}));
+
+test('CLI subprocess cmo run replays idempotency-key with exit 0 and runs nothing on the second call', async () => {
+  const { execFile } = await import('node:child_process');
+  const { chmod } = await import('node:fs/promises');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+  const cmoBin = new URL('../bin/cmo.mjs', import.meta.url).pathname;
+
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-subproc-idem-cache-'));
+  const configDir = mkdtempSync(join(tmpdir(), 'cmo-subproc-idem-cfg-'));
+  const fakeBinDir = mkdtempSync(join(tmpdir(), 'cmo-subproc-idem-bin-'));
+  const emptyBinDir = mkdtempSync(join(tmpdir(), 'cmo-subproc-idem-empty-'));
+  const callsFile = join(cacheDir, 'fake-claude-calls.txt');
+  const fakeClaude = join(fakeBinDir, 'claude');
+
+  writeFileSync(fakeClaude, [
+    '#!/bin/sh',
+    `echo 1 >> "${callsFile}"`,
+    'cat >/dev/null',
+    'echo "fake stderr line" >&2',
+    'printf \'{"type":"result","result":"subproc-answer","usage":{"input_tokens":4,"output_tokens":2}}\\n\'',
+  ].join('\n'), 'utf8');
+  await chmod(fakeClaude, 0o755);
+
+  const baseEnv = {
+    ...process.env,
+    CMO_CACHE_DIR: cacheDir,
+    CMO_CONFIG_DIR: configDir,
+    CMO_CLAUDE_CLI_PROBE: '0',
+    CMO_AGY_PROBE: '0',
+    CMO_GROK_PROBE: '0',
+  };
+
+  const first = await execFileAsync(
+    process.execPath,
+    [cmoBin, 'run', '--pin', 'claude', '--idempotency-key', 'subproc-k1', '--prompt', 'hello'],
+    { env: { ...baseEnv, PATH: `${fakeBinDir}:/bin:/usr/bin` } },
+  );
+  const firstEnv = JSON.parse(first.stdout);
+  assert.equal(firstEnv.ok, true);
+  assert.equal(firstEnv.result, 'subproc-answer');
+  assert.equal(Object.hasOwn(firstEnv, 'replayed'), false);
+  assert.equal((await readFile(callsFile, 'utf8')).trim().split('\n').length, 1);
+  assert.equal(await readFile(join(cacheDir, 'dispatch', firstEnv.dispatchId, 'stderr.log'), 'utf8'), 'fake stderr line\n');
+
+  // Second subprocess has NO vendor CLI on PATH at all — proves zero vendor execution on replay.
+  const second = await execFileAsync(
+    process.execPath,
+    [cmoBin, 'run', '--pin', 'claude', '--idempotency-key', 'subproc-k1', '--prompt', 'hello'],
+    { env: { ...baseEnv, PATH: emptyBinDir } },
+  );
+  const secondEnv = JSON.parse(second.stdout);
+  assert.deepEqual(secondEnv, { ...firstEnv, replayed: true });
+  assert.equal(secondEnv.dispatchId, firstEnv.dispatchId);
+  assert.equal((await readFile(callsFile, 'utf8')).trim().split('\n').length, 1);
+});

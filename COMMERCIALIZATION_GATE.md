@@ -98,6 +98,7 @@ What landed after the phases were validated, and what it invalidates.
 | 0.1.19 | **the classifier no longer greps the agent's work product** | **01, 02** |
 | 0.1.20 | README, doctor, banner — no dispatch code | nothing; the soak's subject was byte-identical |
 | 0.1.21 | **F2, F3, F5, F8, F9 + `cmo update` covers everything** | **01–05: all of it lands in run/policy/ledger/server** |
+| 0.1.32 | `cmo run` idempotency keys + saved per-dispatch `envelope.json`/`stdout.log`/`stderr.log`; `cmo audit --since` duration parsing | 01, 04 (dispatch replay cache and audit CLI) |
 
 0.1.18 is the one to take seriously. It puts a **subprocess spawn inside the
 limits probe** — the probe that 00 gates on, that 01 depends on for every routing

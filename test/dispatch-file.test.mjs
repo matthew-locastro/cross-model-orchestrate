@@ -75,3 +75,16 @@ test('malformed lines are skipped rather than failing the dispatch', () => {
   assert.equal(meta.length, 's');
   assert.equal(task, 'x');
 });
+
+test('idempotency-key parses from DISPATCH header and explicit CLI flag wins', () => {
+  const parsed = parseDispatchFile('DISPATCH\nrole: implement\nidempotency-key: build-step-4\nTASK\nship it');
+  assert.deepEqual(parsed.unknown, []);
+  assert.equal(parsed.meta['idempotency-key'], 'build-step-4');
+  assert.equal(parsed.task, 'ship it');
+
+  const kept = mergeDispatch({}, parsed.meta);
+  assert.equal(kept['idempotency-key'], 'build-step-4');
+
+  const overridden = mergeDispatch({ 'idempotency-key': 'cli-override' }, parsed.meta);
+  assert.equal(overridden['idempotency-key'], 'cli-override');
+});

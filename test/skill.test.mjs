@@ -195,6 +195,18 @@ test('README and references describe the three-vendor roster without project lea
   assert.match(workflows, /antigravity/i);
 });
 
+test('README and SKILL document idempotency-key and saved per-dispatch cache files, and version is 0.1.32', () => {
+  assert.equal(PKG.version, '0.1.32');
+  for (const [label, doc] of [['README.md', README], ['skill/SKILL.md', SKILL]]) {
+    assert.match(doc, /idempotency-key/, label);
+    assert.match(doc, /--idempotency-key/, label);
+    assert.match(doc, /replayed/, label);
+    assert.match(doc, /envelope\.json/, label);
+    assert.match(doc, /stdout\.log/, label);
+    assert.match(doc, /stderr\.log/, label);
+  }
+});
+
 function withTempDir(fn) {
   const dir = mkdtempSync(join(tmpdir(), 'cmo-private-words-'));
   try {

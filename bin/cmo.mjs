@@ -27,9 +27,11 @@ import { install, uninstall } from '../src/install.mjs';
 import { createCoordinator, DEFAULT_PORT } from '../src/server.mjs';
 import { fleetConfig, health } from '../src/remote.mjs';
 import { mergeDispatch, parseDispatchFile } from '../src/dispatch-file.mjs';
-import { readAudit, summarise, findings, tierStats, failureTaxonomy, qualityReport } from '../src/audit.mjs';
+import {
+  findIdempotentReplay, readAudit, summarise, findings, tierStats, failureTaxonomy, qualityReport,
+} from '../src/audit.mjs';
 import { readOutcomes, recordOutcome, VERDICTS } from '../src/outcomes.mjs';
-import { durationProfile } from '../src/durations.mjs';
+import { durationProfile, parseSinceMinutes } from '../src/durations.mjs';
 import { activeProviders, CACHE_DIR, loadConfig } from '../src/config.mjs';
 import { MAX_LEASE_MS, perAgentCost } from '../src/ledger.mjs';
 import { update } from '../src/update.mjs';
@@ -40,6 +42,11 @@ function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith('--')) {
       out._.push(a);
+      continue;
+    }
+    const eq = a.indexOf('=');
+    if (eq !== -1) {
+      out[a.slice(2, eq)] = a.slice(eq + 1);
       continue;
     }
     const key = a.slice(2);
@@ -93,13 +100,13 @@ function secondsFlag(args, key) {
 class UsageError extends Error {}
 
 /** The timeout a run will use, and the receipts that say who fits inside it. */
-async function timing(args) {
+async function timing(args, cacheDir = CACHE_DIR) {
   const timeoutMs = secondsFlag(args, 'timeout') ?? DEFAULT_TIMEOUT_MS;
   const fit = loadConfig().durationFit;
   if (!fit?.enabled) return { timeoutMs };
   const windowDays = Number(fit.windowDays) > 0 ? Number(fit.windowDays) : 14;
   // 4 MB is ~10,000 receipts — more than readAudit keeps — read from the end.
-  const rows = await readAudit({ sinceMs: Date.now() - windowDays * 86_400_000, tailBytes: 4 << 20 }).catch(() => []);
+  const rows = await readAudit({ sinceMs: Date.now() - windowDays * 86_400_000, tailBytes: 4 << 20, cacheDir }).catch(() => []);
   return { timeoutMs, durations: durationProfile(rows, { windowDays }) };
 }
 
@@ -269,6 +276,9 @@ run options
   --dispatch        a file holding a DISPATCH header and a TASK body. Preferred:
                     the parameters travel WITH the task, so nothing has to be
                     retyped as flags and nothing can be dropped in the retyping.
+  --idempotency-key optional key recorded on the receipt; if an earlier ok
+                    receipt with this key still has its saved envelope, replay
+                    it with "replayed": true and run nothing
   --prompt-file     read the prompt from a file (else stdin, else --prompt)
   --schema          JSON Schema file; the result is validated and returned parsed
   --cwd             working directory for the subagent  (default: cwd)
@@ -278,7 +288,7 @@ run options
   --sandbox         codex sandbox: read-only|workspace-write|danger-full-access
 
 report options
-  --since           how far back: 90 (minutes), 24h, or 7d (default 24h)
+  --since           how far back: 90, 30m, 24h, or 7d (default 24h)
   --json            structured findings, for pasting to an agent to act on
   --quality         summarize recorded outcomes by provider, role, and model
 
@@ -290,7 +300,7 @@ outcome options
   --force           record an unknown dispatch ID as an orphan
 
 audit options
-  --since           minutes to look back (default 60)
+  --since           how far back: 30, 30m, 2h, or 1d (default 60)
   --expected        how many subagents you dispatched. The gap between that and
                     the receipts is the number that never ran — a shim answering
                     by itself looks identical to a real dispatch without this.
@@ -353,10 +363,11 @@ export async function outcomeCommand(argv, cacheDir = CACHE_DIR, outputSink = pr
 export async function main(
   argv = process.argv.slice(2),
   {
-    cacheDir = CACHE_DIR,
+    cacheDir = process.env.CMO_CACHE_DIR || CACHE_DIR,
     outputSink = processOutput,
     limits: injectedLimits,
     readLimits: readLimitsFn = readLimits,
+    spawnImpl,
   } = {},
 ) {
   const args = parseArgs(argv);
@@ -427,37 +438,50 @@ export async function main(
   }
 
   if (command === 'audit') {
-    const mins = args.since ? Number(args.since) : 60;
-    const rows = await readAudit({ sinceMs: Date.now() - mins * 60_000 });
-    const sum = summarise(rows, args.expected ? { expected: Number(args.expected) } : {});
+    const mins = parseSinceMinutes(args.since, 60);
+    if (mins == null) {
+      outputSink(`cmo audit: --since must be a positive duration (e.g. 30, 30m, 2h, 1d), got "${args.since}"\n`, 'stderr');
+      return 2;
+    }
+    let expected = null;
+    if (args.expected !== undefined) {
+      expected = Number(args.expected);
+      if (typeof args.expected === 'boolean' || !Number.isInteger(expected) || expected < 0) {
+        outputSink(`cmo audit: --expected must be a non-negative integer, got "${args.expected}"\n`, 'stderr');
+        return 2;
+      }
+    }
+    const rows = await readAudit({ sinceMs: Date.now() - mins * 60_000, cacheDir });
+    const sum = summarise(rows, expected != null ? { expected } : {});
     if (!args.human) {
-      process.stdout.write(`${JSON.stringify({ ...sum, rows }, null, 2)}\n`);
+      outputSink(`${JSON.stringify({ ...sum, rows }, null, 2)}\n`, 'stdout');
       return sum.undispatched ? 3 : 0;
     }
-    process.stdout.write(`dispatches in the last ${mins} min: ${sum.total}`
-      + (sum.failed ? `  (${sum.failed} failed)` : '') + '\n');
+    const displayMins = Math.round(mins * 100) / 100;
+    outputSink(`dispatches in the last ${displayMins} min: ${sum.total}`
+      + (sum.failed ? `  (${sum.failed} failed)` : '') + '\n', 'stdout');
     for (const [prov, info] of Object.entries(sum.byProvider)) {
       const models = Object.entries(info.models).map(([m, n]) => `${m}x${n}`).join(' ');
-      process.stdout.write(`  ${prov.padEnd(7)} ${String(info.count).padStart(3)}   ${models}\n`);
+      outputSink(`  ${prov.padEnd(7)} ${String(info.count).padStart(3)}   ${models}\n`, 'stdout');
     }
     if (sum.codexShare != null) {
-      process.stdout.write(`\nshare: ${activeProviders().map((p) => `${p} ${sum.shares?.[p] ?? 0}%`).join(' · ')}\n`);
+      outputSink(`\nshare: ${activeProviders().map((p) => `${p} ${sum.shares?.[p] ?? 0}%`).join(' · ')}\n`, 'stdout');
     }
     if (sum.grokAuth) {
-      process.stdout.write(`grok billing: ${sum.grokAuth.oauth} verified subscription (oauth)`
-        + (sum.grokAuth.unverified ? `, ${sum.grokAuth.unverified} NOT verified — see cmo report` : '') + '\n');
+      outputSink(`grok billing: ${sum.grokAuth.oauth} verified subscription (oauth)`
+        + (sum.grokAuth.unverified ? `, ${sum.grokAuth.unverified} NOT verified — see cmo report` : '') + '\n', 'stdout');
     }
-    if (sum.failedOver) process.stdout.write(`failovers: ${sum.failedOver}\n`);
+    if (sum.failedOver) outputSink(`failovers: ${sum.failedOver}\n`, 'stdout');
     const ind = sum.independence;
     if (ind['cross-vendor'] || ind['same-vendor']) {
-      process.stdout.write(`reviews: ${ind['cross-vendor']} cross-vendor, `
-        + `${ind['same-vendor']} same-vendor\n`);
+      outputSink(`reviews: ${ind['cross-vendor']} cross-vendor, `
+        + `${ind['same-vendor']} same-vendor\n`, 'stdout');
     }
     if (sum.undispatched != null) {
-      process.stdout.write(sum.undispatched === 0
+      outputSink(sum.undispatched === 0
         ? `\nall ${sum.expected} expected dispatches are on record.\n`
         : `\nWARNING: ${sum.undispatched} of ${sum.expected} subagents left NO receipt —\n`
-          + `they never called the dispatcher and answered by themselves.\n`);
+          + `they never called the dispatcher and answered by themselves.\n`, 'stdout');
     }
     return sum.undispatched ? 3 : 0;
   }
@@ -468,9 +492,11 @@ export async function main(
 
   if (command === 'report') {
     const spec = String(args.since ?? '24h');
-    const mins = /^\d+d$/.test(spec) ? parseInt(spec, 10) * 1440
-      : /^\d+h$/.test(spec) ? parseInt(spec, 10) * 60
-        : Number(spec) || 1440;
+    const mins = parseSinceMinutes(args.since, 1440);
+    if (mins == null) {
+      outputSink(`cmo report: --since must be a positive duration (e.g. 90, 30m, 24h, 7d), got "${args.since}"\n`, 'stderr');
+      return 2;
+    }
     const sinceMs = Date.now() - mins * 60_000;
     if (args.quality) {
       const [receipts, outcomes] = await Promise.all([
@@ -507,7 +533,8 @@ export async function main(
     }
 
     const hrs = Math.round(mins / 60);
-    outputSink(`\ncross-model-orchestrate — last ${hrs >= 24 ? `${Math.round(hrs / 24)}d` : `${hrs}h`}\n`, 'stdout');
+    const windowLabel = mins < 60 ? `${Math.round(mins)}m` : (hrs >= 24 ? `${Math.round(hrs / 24)}d` : `${hrs}h`);
+    outputSink(`\ncross-model-orchestrate — last ${windowLabel}\n`, 'stdout');
     outputSink(`${'─'.repeat(60)}\n`, 'stdout');
     if (!rows.length) {
       outputSink('no dispatches recorded in this window.\n', 'stdout');
@@ -574,7 +601,7 @@ export async function main(
     const limits = injectedLimits !== undefined
       ? injectedLimits
       : await readLimitsFn({ refresh: Boolean(planArgs.refresh) });
-    const decision = decide(taskFromArgs(planArgs), limits, await timing(planArgs));
+    const decision = decide(taskFromArgs(planArgs), limits, await timing(planArgs, cacheDir));
     if (args.human) {
       if (!decision.ok) {
         process.stdout.write(`DEFER — ${decision.reason}\nresume after ${decision.resumeAfter ?? 'unknown'}\n`);
@@ -611,18 +638,26 @@ export async function main(
       runArgs = mergeDispatch(args, parsed.meta);
       prompt = parsed.task;
       if (parsed.unknown.length) {
-        process.stderr.write(`cmo run: ignoring unknown dispatch keys: ${parsed.unknown.join(', ')}\n`);
+        outputSink(`cmo run: ignoring unknown dispatch keys: ${parsed.unknown.join(', ')}\n`, 'stderr');
       }
       if (!prompt) {
-        process.stderr.write(`cmo run: ${args.dispatch} has no TASK section\n`);
+        outputSink(`cmo run: ${args.dispatch} has no TASK section\n`, 'stderr');
         return 2;
       }
     } else {
       prompt = (await readPrompt(args)).trim();
     }
     if (!prompt) {
-      process.stderr.write('cmo run: no prompt (use --prompt-file, --prompt, or stdin)\n');
+      outputSink('cmo run: no prompt (use --prompt-file, --prompt, or stdin)\n', 'stderr');
       return 2;
+    }
+    let idempotencyKey = null;
+    if (runArgs['idempotency-key'] !== undefined) {
+      if (typeof runArgs['idempotency-key'] !== 'string' || !runArgs['idempotency-key'].trim()) {
+        outputSink('cmo run: --idempotency-key must be a non-empty string\n', 'stderr');
+        return 2;
+      }
+      idempotencyKey = runArgs['idempotency-key'].trim();
     }
     // Bad durations are refused before anything is read or spent.
     let watchdogArgs;
@@ -635,16 +670,23 @@ export async function main(
       };
     } catch (err) {
       if (!(err instanceof UsageError)) throw err;
-      process.stderr.write(`cmo run: ${err.message}\n`);
+      outputSink(`cmo run: ${err.message}\n`, 'stderr');
       return 2;
+    }
+    if (idempotencyKey) {
+      const replayed = await findIdempotentReplay(idempotencyKey, { cacheDir });
+      if (replayed) {
+        outputSink(`${JSON.stringify(replayed, null, 2)}\n`, 'stdout');
+        return 0;
+      }
     }
     const limits = injectedLimits !== undefined
       ? injectedLimits
       : await readLimitsFn({ refresh: Boolean(runArgs.refresh) });
-    const { timeoutMs, durations } = await timing(runArgs);
+    const { timeoutMs, durations } = await timing(runArgs, cacheDir);
     const decision = decide(taskFromArgs(runArgs), limits, { timeoutMs, durations });
     if (!decision.ok) {
-      process.stdout.write(`${JSON.stringify({ ok: false, deferred: true, ...decision }, null, 2)}\n`);
+      outputSink(`${JSON.stringify({ ok: false, deferred: true, ...decision }, null, 2)}\n`, 'stdout');
       return 3;
     }
 
@@ -662,9 +704,12 @@ export async function main(
       failover: !runArgs['no-failover'],
       fullAccess: Boolean(runArgs['full-access']),
       sandbox: runArgs.sandbox ? String(runArgs.sandbox) : 'workspace-write',
+      idempotencyKey,
+      cacheDir,
+      ...(spawnImpl ? { spawnImpl } : {}),
     });
 
-    process.stdout.write(`${JSON.stringify({ ...envelope, decision: { weight: decision.weight, tier: decision.tier, reason: decision.reason, notes: decision.notes } }, null, 2)}\n`);
+    outputSink(`${JSON.stringify(envelope, null, 2)}\n`, 'stdout');
     return envelope.ok ? 0 : 1;
   }
 

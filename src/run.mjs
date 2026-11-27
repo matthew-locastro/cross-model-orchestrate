@@ -48,13 +48,13 @@ import {
   markClaudeSignedOut, markExhausted, markGrokUnverified, readGrokLimits, recordCodexRateLimits,
   refreshClaudeLimits, refreshCodexLimits, refreshGrokLimits,
 } from './limits.mjs';
-import { loadConfig } from './config.mjs';
+import { CACHE_DIR, loadConfig } from './config.mjs';
 import { formatElapsed } from './durations.mjs';
 import {
   GROK_KEY_VARS, grokSessionActivity, lockGrokEnv, offSubscriptionReason, parseGrokStream, startedOffSubscription,
 } from './grok.mjs';
 import { MAX_LEASE_MS, mutate, recordSample, releaseReservation, reserve, snapshot } from './ledger.mjs';
-import { newDispatchId, record } from './audit.mjs';
+import { findIdempotentReplay, newDispatchId, record, saveDispatchArtifacts } from './audit.mjs';
 import { identity } from './remote.mjs';
 import {
   antigravityInput, antigravitySoftDenyWarning, classifyAntigravityFailure, isAntigravityModel,
@@ -897,7 +897,28 @@ export async function runAgent(decision, prompt, opts = {}) {
     spawnImpl = spawnWithTimeout,
     now = () => Date.now(),
     grokGate = currentGrokAuth,
+    idempotencyKey: rawIdempotencyKey = null,
+    cacheDir = CACHE_DIR,
   } = opts;
+
+  const idempotencyKey = typeof rawIdempotencyKey === 'string' && rawIdempotencyKey.trim()
+    ? rawIdempotencyKey.trim()
+    : null;
+  if (idempotencyKey) {
+    const replayed = await findIdempotentReplay(idempotencyKey, { cacheDir });
+    if (replayed) return replayed;
+  }
+
+  const decisionSummary = (
+    decision.weight !== undefined || decision.reason !== undefined || Array.isArray(decision.notes)
+  )
+    ? {
+      weight: decision.weight,
+      tier: decision.tier,
+      reason: decision.reason,
+      notes: decision.notes,
+    }
+    : undefined;
 
   // Every clock finite, positive and inside the longest lease a reservation
   // can hold: an infinite ceiling would never stop a run that keeps talking.
@@ -961,6 +982,8 @@ export async function runAgent(decision, prompt, opts = {}) {
   const ladder = [decision, ...(failover ? rungs : [])];
 
   let lastError = null;
+  let lastRawStdout = '';
+  let lastRawStderr = '';
 
   try {
     for (let rung = 0; rung < ladder.length; rung += 1) {
@@ -1055,6 +1078,8 @@ export async function runAgent(decision, prompt, opts = {}) {
             await releaseReservation(ticket).catch(() => {});
           }
         }
+        lastRawStdout = result.stdout ?? '';
+        lastRawStderr = result.stderr ?? '';
 
         let text = '';
         let usage = null;
@@ -1195,7 +1220,7 @@ export async function runAgent(decision, prompt, opts = {}) {
           ...(result.stopReason ? { stopReason: result.stopReason } : {}),
           failure: succeeded ? null : failure === 'none' ? 'empty-output' : failure,
           ...(warning ? { warning } : {}),
-          stderr: succeeded ? undefined : result.stderr.slice(-2_000),
+          ...(!succeeded ? { stderr: result.stderr.slice(-2_000) } : {}),
         });
 
         if (succeeded) {
@@ -1217,37 +1242,9 @@ export async function runAgent(decision, prompt, opts = {}) {
             }
             break;
           }
-          // Everything a later analysis might want, recorded once. A soak that
-          // ends with "something felt slow" and no numbers was wasted time.
-          await record({
-            at: now(), id: dispatchId, ok: true,
-            provider: target.provider, model: target.model, tier: target.tier,
-            role: decision.factors?.role ?? null,
-            weight: decision.weight ?? null,
-            complexity: decision.factors?.complexity ?? null,
-            length: decision.factors?.length ?? null,
-            independence: decision.independence ?? null,
-            degradedReview: Boolean(decision.degradedReview),
-            failedOver: rung > 0,
-            attempts: attempts.length,
-            retried: attempts.length > 1,
-            failures: attempts.map((a) => a.failure).filter(Boolean),
-            attemptLog: attemptLog(attempts),
-            durationMs: now() - startedAt,
-            tokens: usage ? {
-              in: totalInputTokens(usage),
-              out: usage.output_tokens ?? usage.outputTokens ?? null,
-            } : null,
-            ...(attempts.some((a) => a.warning)
-              ? { warnings: attempts.map((a) => a.warning).filter(Boolean) }
-              : {}),
-            // How the session authenticated, as the vendor's own stream said.
-            // For grok this is the per-dispatch proof of subscription billing.
-            ...(target.provider === 'grok' ? { auth: authSource ?? 'unknown' } : {}),
-            node: who.node, project: who.project,
-          }).catch(() => {});
-
-          return {
+          const durationMs = now() - startedAt;
+          const warnings = attempts.map((a) => a.warning).filter(Boolean);
+          const envelope = {
             ok: true,
             dispatchId,
             provider: target.provider,
@@ -1264,14 +1261,48 @@ export async function runAgent(decision, prompt, opts = {}) {
             ...(target.reasoning ? { reasoning: target.reasoning } : {}),
             failedOver: rung > 0,
             attempts,
-            durationMs: now() - startedAt,
+            durationMs,
             usage,
             result: text,
             resultJson,
-            ...(attempts.some((a) => a.warning)
-              ? { warnings: attempts.map((a) => a.warning).filter(Boolean) }
-              : {}),
+            ...(warnings.length ? { warnings } : {}),
+            ...(decisionSummary ? { decision: decisionSummary } : {}),
           };
+          await saveDispatchArtifacts(
+            dispatchId,
+            { envelope, stdout: lastRawStdout, stderr: lastRawStderr },
+            { cacheDir },
+          );
+          // Everything a later analysis might want, recorded once. A soak that
+          // ends with "something felt slow" and no numbers was wasted time.
+          await record({
+            at: now(), id: dispatchId, ok: true,
+            provider: target.provider, model: target.model, tier: target.tier,
+            role: decision.factors?.role ?? null,
+            weight: decision.weight ?? null,
+            complexity: decision.factors?.complexity ?? null,
+            length: decision.factors?.length ?? null,
+            independence: decision.independence ?? null,
+            degradedReview: Boolean(decision.degradedReview),
+            failedOver: rung > 0,
+            attempts: attempts.length,
+            retried: attempts.length > 1,
+            failures: attempts.map((a) => a.failure).filter(Boolean),
+            attemptLog: attemptLog(attempts),
+            durationMs,
+            tokens: usage ? {
+              in: totalInputTokens(usage),
+              out: usage.output_tokens ?? usage.outputTokens ?? null,
+            } : null,
+            ...(warnings.length ? { warnings } : {}),
+            // How the session authenticated, as the vendor's own stream said.
+            // For grok this is the per-dispatch proof of subscription billing.
+            ...(target.provider === 'grok' ? { auth: authSource ?? 'unknown' } : {}),
+            ...(idempotencyKey ? { idempotencyKey } : {}),
+            node: who.node, project: who.project,
+          }, { cacheDir }).catch(() => {});
+
+          return envelope;
         }
 
         const providerError = result.stderr.slice(-2_000) || `exit ${result.code}`;
@@ -1321,6 +1352,23 @@ export async function runAgent(decision, prompt, opts = {}) {
     }
 
     const failedOver = attempts.some((attempt) => attempt.provider !== decision.provider);
+    const durationMs = now() - startedAt;
+    const envelope = {
+      ok: false,
+      dispatchId,
+      provider: decision.provider,
+      model: decision.model,
+      failedOver,
+      attempts,
+      durationMs,
+      error: lastError ?? 'all providers failed',
+      ...(decisionSummary ? { decision: decisionSummary } : {}),
+    };
+    await saveDispatchArtifacts(
+      dispatchId,
+      { envelope, stdout: lastRawStdout, stderr: lastRawStderr },
+      { cacheDir },
+    );
     await record({
       at: now(), id: dispatchId, ok: false,
       provider: decision.provider, model: decision.model, tier: decision.tier ?? null,
@@ -1333,21 +1381,13 @@ export async function runAgent(decision, prompt, opts = {}) {
       failedOver,
       failures: attempts.map((a) => a.failure).filter(Boolean),
       attemptLog: attemptLog(attempts),
-      durationMs: now() - startedAt,
+      durationMs,
       error: (lastError ?? 'all providers failed').slice(0, 200),
+      ...(idempotencyKey ? { idempotencyKey } : {}),
       node: who.node, project: who.project,
-    }).catch(() => {});
+    }, { cacheDir }).catch(() => {});
 
-    return {
-      ok: false,
-      dispatchId,
-      provider: decision.provider,
-      model: decision.model,
-      failedOver,
-      attempts,
-      durationMs: now() - startedAt,
-      error: lastError ?? 'all providers failed',
-    };
+    return envelope;
   } finally {
     // 253 agents leaving a temp dir each is how a box runs out of inodes.
     await rm(workdir, { recursive: true, force: true }).catch(() => {});

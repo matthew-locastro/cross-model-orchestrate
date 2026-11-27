@@ -523,6 +523,7 @@ task to a file first, and give the shim only the path.**
 //   role: judge
 //   complexity: 4
 //   independent-of: codex
+//   idempotency-key: run-7-task-001-judge
 //   cwd: /repo
 //   schema: /repo/verdict.json
 //   timeout: 600
@@ -536,6 +537,17 @@ const verdict = await agent(
   { agentType: 'codex-runner', phase: 'Verify', schema: VERDICT },
 )
 ```
+
+Every dispatch saves its final envelope and the raw vendor stdout and stderr
+under `~/.cache/cross-model-orchestrate/dispatch/<dispatchId>/` (`envelope.json`,
+`stdout.log` and `stderr.log`, or under `CMO_CACHE_DIR` if set). Include an
+optional `idempotency-key: <key>` header line in the dispatch file (or pass
+`--idempotency-key <key>` to `cmo run`) when retrying or resuming a run so a
+finished unit never bills twice: `cmo` records the key in the dispatch receipt,
+and before running any vendor, if an earlier receipt with that key finished `ok`
+and its saved `envelope.json` exists, `cmo run` prints that envelope with
+`"replayed": true` and the original `dispatchId`, exits `0` and runs nothing.
+There is no locking — callers own concurrency across duplicate keys.
 
 This is not a style preference. Earlier versions put the task in the shim's
 prompt and told it not to do the work itself; on measured runs a third, then two
@@ -587,6 +599,7 @@ itself writes nothing.
 cmo audit --since 30 --expected <number of subagents you spawned> --human
 ```
 
+`--since` accepts plain minutes (`30`) or durations like `30m`, `2h` and `1d`.
 `undispatched` above zero means that many subagents lied. Treat their output as
 unverified: re-dispatch them, and say so in your report. Also read the other
 lines it prints — the `share` line answers whether the run balanced across

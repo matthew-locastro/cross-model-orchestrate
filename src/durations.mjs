@@ -132,3 +132,24 @@ export function formatElapsed(ms) {
   if (!Number.isFinite(ms)) return '?';
   return ms >= 90_000 ? `${(ms / 60_000).toFixed(1)} min` : `${Math.round(ms / 1000)}s`;
 }
+
+/**
+ * Parse a `--since` window into minutes: plain minutes (`30`) or unit-suffixed
+ * durations (`30m`, `2h`, `1d`, `1w`, `90s`). Returns `defaultMinutes` when
+ * omitted, or `null` when malformed or non-positive.
+ */
+export function parseSinceMinutes(spec, defaultMinutes = 60) {
+  if (spec === undefined || spec === null || spec === '') return defaultMinutes;
+  if (typeof spec === 'boolean') return null;
+  const match = String(spec).trim().match(/^(\d+(?:\.\d+)?|\.\d+)\s*([smhdw]?)$/i);
+  if (!match) return null;
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const unit = (match[2] || 'm').toLowerCase();
+  const factor = unit === 's' ? 1 / 60
+    : unit === 'm' ? 1
+    : unit === 'h' ? 60
+    : unit === 'd' ? 1440
+    : 10080;
+  return value * factor;
+}
