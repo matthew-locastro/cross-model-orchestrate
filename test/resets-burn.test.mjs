@@ -8,6 +8,7 @@ import { join } from 'node:path';
 
 import { loadConfig, resetConfigCache } from '../src/config.mjs';
 import { decide } from '../src/policy.mjs';
+import { runAgent } from '../src/run.mjs';
 import { main as cmoMain, renderLimits } from '../bin/cmo.mjs';
 
 const NOW = Date.parse('2026-11-27T20:00:00.000Z');
@@ -333,7 +334,7 @@ test('burn exhaustion (raw >=95%) falls back, prompts to redeem in limits --huma
     assert.ok(Array.isArray(envelope.notes) && envelope.notes.includes(expectedMsg));
     assert.ok(Array.isArray(envelope.decision?.notes) && envelope.decision.notes.includes(expectedMsg));
 
-    // Mid-run exhaustion: codex starts at 93%, hits a live rate limit, fails over to claude, and envelope notes still carry expectedMsg.
+    // Mid-run rate limit when codex started below 95%: envelope notes come from decide(), not a post-run rewrite.
     const midRunSpawn = fakeSpawn([
       { code: 1, stdout: '', stderr: 'You have hit your usage limit' },
       { code: 0, stdout: claudeJsonOut('recovered on claude'), stderr: '' },
@@ -353,8 +354,8 @@ test('burn exhaustion (raw >=95%) falls back, prompts to redeem in limits --huma
     const midEnv = JSON.parse(midRunOut.text());
     assert.equal(midEnv.provider, 'claude');
     assert.equal(midEnv.failedOver, true);
-    assert.ok(midEnv.notes.includes(expectedMsg));
-    assert.ok(midEnv.decision?.notes.includes(expectedMsg));
+    assert.ok(!midEnv.notes.includes(expectedMsg));
+    assert.deepEqual(midEnv.notes, midEnv.decision?.notes);
 
     // Once user redeems a reset in the vendor's app and usage drops (e.g. 2%), burning resumes automatically
     // and healthy cmo run envelopes no longer emit the exhausted redemption warning!
@@ -496,5 +497,75 @@ test('burn state expires at --until (duration or ISO datetime) and stops immedia
       0,
     );
     assert.equal(decide({ role: 'implement' }, limits, { now: NOW, cacheDir }).provider, 'antigravity');
+  });
+});
+
+test('cmo run idempotency replay returns the saved envelope unchanged and runAgent does not synthesize post-run burn notes', async () => {
+  await withSandbox(async ({ cacheDir, configFile }) => {
+    const codexOkSpawn = fakeSpawn([async (inv) => {
+      const idx = inv.args.indexOf('--output-last-message');
+      if (idx !== -1) writeFileSync(inv.args[idx + 1], 'first run answer', 'utf8');
+      return {
+        code: 0,
+        stdout: `${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 8, output_tokens: 4 } })}\n`,
+        stderr: '',
+      };
+    }]);
+
+    const firstOut = captureOutput();
+    assert.equal(
+      await cmoMain(['run', '--role', 'implement', '--prompt', 'cached work', '--idempotency-key', 'burn-replay-key'], {
+        cacheDir,
+        configFile,
+        now: NOW,
+        limits: { codex: codexWeekly(10), claude: claudeAt(30), antigravity: agyAt(30) },
+        spawnImpl: codexOkSpawn,
+        outputSink: firstOut.sink,
+      }),
+      0,
+    );
+    const originalEnv = JSON.parse(firstOut.text());
+    assert.equal(codexOkSpawn.calls.length, 1);
+
+    // Enable burn mode and exhaust codex afterwards: replay must still return the stored envelope untouched.
+    await cmoMain(['burn', 'codex', '--until', '24h'], { cacheDir, configFile, now: NOW, outputSink: () => {} });
+    const replayOut = captureOutput();
+    assert.equal(
+      await cmoMain(['run', '--role', 'implement', '--prompt', 'cached work', '--idempotency-key', 'burn-replay-key'], {
+        cacheDir,
+        configFile,
+        now: NOW,
+        limits: { codex: codexWeekly(98), claude: claudeAt(20), antigravity: agyAt(10) },
+        spawnImpl: codexOkSpawn,
+        outputSink: replayOut.sink,
+      }),
+      0,
+    );
+    const replayedEnv = JSON.parse(replayOut.text());
+    assert.equal(codexOkSpawn.calls.length, 1);
+    assert.deepEqual(replayedEnv, { ...originalEnv, replayed: true });
+
+    // Bare decision without notes stays clean even when burn is active and the primary hits a rate limit.
+    const bareSpawn = fakeSpawn([
+      { code: 1, stdout: '', stderr: '429 Too Many Requests' },
+      { code: 0, stdout: claudeJsonOut('fallback ok'), stderr: '' },
+    ]);
+    const bareEnv = await runAgent(
+      {
+        provider: 'codex',
+        model: 'gpt-5.4',
+        tier: 'balanced',
+        fallbacks: [{ provider: 'claude', model: 'claude-sonnet-4-6', tier: 'balanced' }],
+      },
+      'bare prompt',
+      { cacheDir, now: () => NOW, spawnImpl: bareSpawn, sleep: async () => {} },
+    );
+    assert.equal(bareEnv.ok, true);
+    assert.equal(bareEnv.notes, undefined);
+    assert.equal(bareEnv.decision, undefined);
+  }, {
+    resets: {
+      codex: ['2026-11-30', '2026-12-10'],
+    },
   });
 });

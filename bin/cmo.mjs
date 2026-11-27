@@ -33,7 +33,7 @@ import {
 import { readOutcomes, recordOutcome, VERDICTS } from '../src/outcomes.mjs';
 import { durationProfile, parseSinceMinutes } from '../src/durations.mjs';
 import { activeProviders, CACHE_DIR, loadConfig, PROVIDERS } from '../src/config.mjs';
-import { MAX_LEASE_MS, perAgentCost, snapshot } from '../src/ledger.mjs';
+import { MAX_LEASE_MS, perAgentCost } from '../src/ledger.mjs';
 import { update } from '../src/update.mjs';
 import {
   activeBurn, addReset, BURN_BANDS, burnExhaustedNote, classifyResets, clearBurn,
@@ -857,26 +857,6 @@ export async function main(
     if (idempotencyKey) {
       const replayed = await findIdempotentReplay(idempotencyKey, { cacheDir });
       if (replayed) {
-        const burn = activeBurn({ cacheDir, now: nowMs });
-        if (burn) {
-          let burnLimits = injectedLimits?.[burn.provider];
-          if (!burnLimits) {
-            const local = await snapshot({ local: true, now: () => nowMs }).catch(() => null);
-            burnLimits = local?.probes?.[burn.provider]?.value;
-          }
-          if (burnLimits && providerState(burnLimits, BURN_BANDS, nowMs, burn.provider).state === 'exhausted') {
-            const classified = classifyResets(burn.provider, burnLimits, loadConfig().resets?.[burn.provider] ?? [], nowMs);
-            const redeemNote = burnExhaustedNote(burn.provider, classified.remaining);
-            if (redeemNote) {
-              const nextNotes = [...(Array.isArray(replayed.notes) ? replayed.notes : (replayed.decision?.notes ?? []))];
-              if (!nextNotes.includes(redeemNote)) nextNotes.push(redeemNote);
-              replayed.notes = nextNotes;
-              if (replayed.decision && typeof replayed.decision === 'object') {
-                replayed.decision = { ...replayed.decision, notes: nextNotes };
-              }
-            }
-          }
-        }
         outputSink(`${JSON.stringify(replayed, null, 2)}\n`, 'stdout');
         return 0;
       }
