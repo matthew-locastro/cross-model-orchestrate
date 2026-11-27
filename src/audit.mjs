@@ -141,12 +141,7 @@ export async function readAudit({ sinceMs = null, tailBytes = null, cacheDir = d
     if (!line) continue;
     try {
       const row = JSON.parse(line);
-      const rowAt = typeof row.at === 'number'
-        ? row.at
-        : (typeof row.at === 'string' && row.at.trim()
-          ? (Number.isFinite(Number(row.at)) ? Number(row.at) : Date.parse(row.at))
-          : 0);
-      if (sinceMs == null || (Number.isFinite(rowAt) ? rowAt : 0) >= sinceMs) rows.push(row);
+      if (sinceMs == null || (row.at ?? 0) >= sinceMs) rows.push(row);
     } catch {
       /* a torn line is not worth failing the report over */
     }

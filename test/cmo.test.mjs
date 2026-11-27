@@ -1552,3 +1552,90 @@ test('CLI subprocess cmo run replays idempotency-key with exit 0 and runs nothin
   assert.equal(secondEnv.dispatchId, firstEnv.dispatchId);
   assert.equal((await readFile(callsFile, 'utf8')).trim().split('\n').length, 1);
 });
+
+test('retried and failed-over dispatches retain raw stdout and stderr from every attempt', async () => withEmptyPath(async () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-multi-attempt-streams-'));
+
+  // 1. Cross-vendor failover where fallback succeeds with empty stderr must still retain attempt 1 streams.
+  const codexAttemptOut = '{"type":"error","message":"usage limit"}\n';
+  const codexAttemptErr = 'You have hit your usage limit for this window\n';
+  const claudeAttemptOut = `${claudeOut('fallback answer')}\n`;
+  const failoverSpawn = fakeSpawn([
+    { code: 1, stdout: codexAttemptOut, stderr: codexAttemptErr },
+    { code: 0, stdout: claudeAttemptOut, stderr: '' },
+  ]);
+  const failoverOut = captureOutput();
+  const failoverCode = await cmoMain(
+    ['run', '--role', 'implement', '--complexity', '2', '--length', 's', '--prompt', 'ship it'],
+    {
+      cacheDir,
+      outputSink: failoverOut.sink,
+      limits: { codex: healthy(5), claude: healthy(20) },
+      spawnImpl: failoverSpawn,
+    },
+  );
+  assert.equal(failoverCode, 0);
+  const failoverEnv = JSON.parse(failoverOut.text('stdout'));
+  assert.equal(failoverEnv.failedOver, true);
+  assert.equal(failoverEnv.attempts.length, 2);
+  const failoverDir = join(cacheDir, 'dispatch', failoverEnv.dispatchId);
+  assert.equal(await readFile(join(failoverDir, 'stdout.log'), 'utf8'), `${codexAttemptOut}${claudeAttemptOut}`);
+  assert.equal(await readFile(join(failoverDir, 'stderr.log'), 'utf8'), codexAttemptErr);
+
+  // 2. Same-vendor retry separates newline-less chunks cleanly and retains both attempts.
+  const retrySpawn = fakeSpawn([
+    { code: 1, stdout: 'attempt-1-stdout', stderr: 'socket hang up' },
+    { code: 0, stdout: claudeOut('recovered'), stderr: 'attempt-2-warn\n' },
+  ]);
+  const retryEnv = await runAgent(
+    { provider: 'claude', model: 'sonnet', tier: 'balanced', effort: 'medium', fallback: null },
+    'retry me',
+    { spawnImpl: retrySpawn, sleep: async () => {}, cacheDir },
+  );
+  assert.equal(retryEnv.ok, true);
+  assert.equal(retryEnv.attempts.length, 2);
+  const retryDir = join(cacheDir, 'dispatch', retryEnv.dispatchId);
+  assert.equal(await readFile(join(retryDir, 'stdout.log'), 'utf8'), `attempt-1-stdout\n${claudeOut('recovered')}`);
+  assert.equal(await readFile(join(retryDir, 'stderr.log'), 'utf8'), 'socket hang up\nattempt-2-warn\n');
+
+  // 3. Multi-attempt failure retains every attempt's raw stdout and stderr.
+  const allFailSpawn = fakeSpawn([
+    { code: 1, stdout: 'primary-out\n', stderr: 'You have hit your usage limit\n' },
+    { code: 2, stdout: 'fallback-out\n', stderr: 'fatal flag error\n' },
+  ]);
+  const allFailEnv = await runAgent(
+    {
+      provider: 'codex',
+      model: 'gpt-5.6-terra',
+      tier: 'balanced',
+      fallback: { provider: 'claude', model: 'sonnet', tier: 'balanced', effort: 'medium' },
+    },
+    'both fail',
+    { spawnImpl: allFailSpawn, sleep: async () => {}, cacheDir },
+  );
+  assert.equal(allFailEnv.ok, false);
+  assert.equal(allFailEnv.attempts.length, 2);
+  const allFailDir = join(cacheDir, 'dispatch', allFailEnv.dispatchId);
+  assert.equal(await readFile(join(allFailDir, 'stdout.log'), 'utf8'), 'primary-out\nfallback-out\n');
+  assert.equal(await readFile(join(allFailDir, 'stderr.log'), 'utf8'), 'You have hit your usage limit\nfatal flag error\n');
+}));
+
+test('CLI flag parsing stays spaced and does not treat generic --flag=value as a valued option', async () => withEmptyPath(async () => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cmo-no-equals-flags-'));
+  const spawnImpl = fakeSpawn([{ code: 0, stdout: claudeOut('ok'), stderr: '' }]);
+  const out = captureOutput();
+
+  const code = await cmoMain(
+    ['run', '--idempotency-key=inline-value', '--prompt', 'spaced flags only'],
+    {
+      cacheDir,
+      outputSink: out.sink,
+      limits: { codex: spent(), claude: healthy(10) },
+      spawnImpl,
+    },
+  );
+  assert.equal(code, 0);
+  const receipts = await readAudit({ cacheDir });
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].idempotencyKey, undefined);
+}));

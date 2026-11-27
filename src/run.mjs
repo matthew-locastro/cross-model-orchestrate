@@ -867,6 +867,16 @@ function attemptLog(attempts) {
     .map((a) => ({ provider: a.provider, tier: a.tier, effort: a.effort, ms: a.ms, failure: a.failure ?? null }));
 }
 
+function concatRawStreams(chunks) {
+  let out = '';
+  for (const chunk of chunks) {
+    if (!chunk) continue;
+    if (out && !out.endsWith('\n')) out += '\n';
+    out += chunk;
+  }
+  return out;
+}
+
 // ── the runner ────────────────────────────────────────────────────────────
 
 /**
@@ -982,8 +992,8 @@ export async function runAgent(decision, prompt, opts = {}) {
   const ladder = [decision, ...(failover ? rungs : [])];
 
   let lastError = null;
-  let lastRawStdout = '';
-  let lastRawStderr = '';
+  const rawStdoutChunks = [];
+  const rawStderrChunks = [];
 
   try {
     for (let rung = 0; rung < ladder.length; rung += 1) {
@@ -1078,8 +1088,8 @@ export async function runAgent(decision, prompt, opts = {}) {
             await releaseReservation(ticket).catch(() => {});
           }
         }
-        lastRawStdout = result.stdout ?? '';
-        lastRawStderr = result.stderr ?? '';
+        if (result.stdout) rawStdoutChunks.push(result.stdout);
+        if (result.stderr) rawStderrChunks.push(result.stderr);
 
         let text = '';
         let usage = null;
@@ -1270,7 +1280,11 @@ export async function runAgent(decision, prompt, opts = {}) {
           };
           await saveDispatchArtifacts(
             dispatchId,
-            { envelope, stdout: lastRawStdout, stderr: lastRawStderr },
+            {
+              envelope,
+              stdout: concatRawStreams(rawStdoutChunks),
+              stderr: concatRawStreams(rawStderrChunks),
+            },
             { cacheDir },
           );
           // Everything a later analysis might want, recorded once. A soak that
@@ -1366,7 +1380,11 @@ export async function runAgent(decision, prompt, opts = {}) {
     };
     await saveDispatchArtifacts(
       dispatchId,
-      { envelope, stdout: lastRawStdout, stderr: lastRawStderr },
+      {
+        envelope,
+        stdout: concatRawStreams(rawStdoutChunks),
+        stderr: concatRawStreams(rawStderrChunks),
+      },
       { cacheDir },
     );
     await record({

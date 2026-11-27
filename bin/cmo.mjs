@@ -44,11 +44,6 @@ function parseArgs(argv) {
       out._.push(a);
       continue;
     }
-    const eq = a.indexOf('=');
-    if (eq !== -1) {
-      out[a.slice(2, eq)] = a.slice(eq + 1);
-      continue;
-    }
     const key = a.slice(2);
     const next = argv[i + 1];
     if (next === undefined || next.startsWith('--')) {
